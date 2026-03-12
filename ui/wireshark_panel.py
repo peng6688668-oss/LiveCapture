@@ -31,6 +31,8 @@ import time
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import mmap
+import select
 
 try:
     import cv2
@@ -38,6 +40,252 @@ try:
     CV2_AVAILABLE = True
 except ImportError:
     CV2_AVAILABLE = False
+
+
+# =============================================================================
+# PLP Counter Monitor — eigenstaendiger Prozess (kein GIL, eigener CPU-Kern)
+# =============================================================================
+# SharedMemory Layout pro Interface (5 x int64 = 40 Bytes):
+#   [0]  total     — empfangene Pakete
+#   [1]  gaps      — Anzahl Luecken
+#   [2]  lost      — verlorene Counter-Werte
+#   [3..10]  stream_ids  — bis zu 8 erkannte Stream-IDs (0 = leer)
+# Separates Array: since_hour, since_min, since_sec (3 x int, global)
+
+# Max Interfaces
+_CM_MAX_IFACES = 4
+# Felder pro Interface im shared array (Legacy Counter Monitor Prozess)
+_CM_FIELDS = 11  # total, gaps, lost, + 8 stream_id slots
+_CM_TOTAL = 0
+_CM_GAPS = 1
+_CM_LOST = 2
+_CM_STREAMS_START = 3  # stream_ids[0..7]
+
+# ── Inline Counter (in CaptureWorker, kein extra Socket) ──
+_ICT_FIELDS = 12  # total, gaps, lost, stream_id[0..7], timestamp
+_ICT_TOTAL = 0
+_ICT_GAPS = 1
+_ICT_LOST = 2
+_ICT_STREAMS_START = 3  # stream_ids[0..7]
+_ICT_TIMESTAMP = 11
+
+
+def _counter_monitor_worker(interfaces, stats_arr, since_arr,
+                             stop_event, reset_event, pause_event=None):
+    """Eigenstaendiger Prozess: TPACKET_V3 MMAP Counter-Check.
+
+    Laeuft auf eigenem CPU-Kern, beeinflusst Video-Pipeline nicht.
+    """
+    import select as _sel
+    # CPU-Affinitaet: auf CPU 15 pinnen (weg von NAPI CPU 4/5 und Video-CPUs)
+    try:
+        os.sched_setaffinity(0, {15})
+    except Exception:
+        pass
+
+    # TPACKET_V3 Konstanten
+    SOL_PACKET = 263
+    PACKET_VERSION = 10
+    PACKET_RX_RING = 5
+    TPACKET_V3 = 2
+    TP_STATUS_USER = 1
+    TP_STATUS_KERNEL = 0
+    BD_STATUS = 8
+    BD_NUM_PKTS = 12
+    BD_FIRST_PKT = 16
+    PH_NEXT = 0
+    PH_SNAPLEN = 12
+    PH_MAC = 24
+
+    _up_H = struct.Struct('>H').unpack_from
+    _up_I = struct.Struct('>I').unpack_from
+    _le_I = struct.Struct('<I').unpack_from
+    _le_H = struct.Struct('<H').unpack_from
+
+    BLOCK_SIZE = 1 << 20   # 1 MB
+    BLOCK_NR = 64           # 64 MB Ring pro Interface
+    FRAME_SIZE = 1 << 14    # 16 KB
+    FRAME_NR = (BLOCK_SIZE * BLOCK_NR) // FRAME_SIZE
+
+    # Pro Interface: Socket + MMAP
+    iface_data = []  # [(idx, sock, ring, block_idx)]
+    # Per-Interface + per-ProbeID Status: {iface_idx: {probe_id: state}}
+    probe_states = {}  # idx → {probe_id → {prev, total, gaps, lost, streams}}
+    # Haupt-ProbeID pro Interface (die mit den meisten Paketen)
+    probe_pkt_counts = {}  # idx → {probe_id → count}
+
+    for i, iface in enumerate(interfaces):
+        if i >= _CM_MAX_IFACES:
+            break
+        try:
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                                 socket.htons(0x2090))
+            sock.bind((iface, 0))
+            # Snaplen auf 64 Bytes begrenzen (nur Header noetig, spart DMA)
+            PACKET_COPY_THRESH = 7  # SOL_PACKET option
+            try:
+                sock.setsockopt(SOL_PACKET, PACKET_COPY_THRESH,
+                                struct.pack('i', 64))
+            except Exception:
+                pass
+            ver = struct.pack('i', TPACKET_V3)
+            sock.setsockopt(SOL_PACKET, PACKET_VERSION, ver)
+            req = struct.pack('IIIIIII',
+                              BLOCK_SIZE, BLOCK_NR, FRAME_SIZE, FRAME_NR,
+                              50, 0, 0)
+            sock.setsockopt(SOL_PACKET, PACKET_RX_RING, req)
+            ring = mmap.mmap(sock.fileno(), BLOCK_SIZE * BLOCK_NR,
+                             mmap.MAP_SHARED,
+                             mmap.PROT_READ | mmap.PROT_WRITE)
+            iface_data.append((i, sock, ring, 0))
+            probe_states[i] = {}
+            probe_pkt_counts[i] = {}
+        except Exception:
+            continue
+
+    if not iface_data:
+        return
+
+    poller = _sel.poll()
+    for _, sock, *_ in iface_data:
+        poller.register(sock, _sel.POLLIN)
+
+    # Seit-Zeitpunkt initial setzen
+    t = time.localtime()
+    since_arr[0] = t.tm_hour
+    since_arr[1] = t.tm_min
+    since_arr[2] = t.tm_sec
+
+    last_write = time.monotonic()
+
+    try:
+        while not stop_event.is_set():
+            # Reset-Check
+            if reset_event.is_set():
+                reset_event.clear()
+                t = time.localtime()
+                since_arr[0] = t.tm_hour
+                since_arr[1] = t.tm_min
+                since_arr[2] = t.tm_sec
+                for idx in probe_states:
+                    probe_states[idx] = {}
+                    probe_pkt_counts[idx] = {}
+                # Shared Array leeren
+                for k in range(len(stats_arr)):
+                    stats_arr[k] = 0
+
+            # Pause-Check: Socket offen lassen, aber Pakete nur durchlaufen lassen
+            if pause_event is not None and pause_event.is_set():
+                time.sleep(0.2)
+                # Ring-Bloecke zurueckgeben damit kein Backlog entsteht
+                for di in range(len(iface_data)):
+                    _a, _s, ring, bidx = iface_data[di]
+                    while True:
+                        offset = bidx * BLOCK_SIZE
+                        bstatus = _le_I(ring, offset + BD_STATUS)[0]
+                        if not (bstatus & TP_STATUS_USER):
+                            break
+                        struct.pack_into('<I', ring, offset + BD_STATUS,
+                                         TP_STATUS_KERNEL)
+                        bidx = (bidx + 1) % BLOCK_NR
+                    iface_data[di] = (_a, _s, ring, bidx)
+                continue
+
+            poller.poll(200)
+
+            # Alle Interfaces drainieren
+            for di in range(len(iface_data)):
+                arr_idx, sock, ring, bidx = iface_data[di]
+
+                while True:
+                    offset = bidx * BLOCK_SIZE
+                    bstatus = _le_I(ring, offset + BD_STATUS)[0]
+                    if not (bstatus & TP_STATUS_USER):
+                        break
+
+                    num_pkts = _le_I(ring, offset + BD_NUM_PKTS)[0]
+                    first_off = _le_I(ring, offset + BD_FIRST_PKT)[0]
+                    pkt_pos = offset + first_off
+
+                    for _ in range(num_pkts):
+                        tp_next = _le_I(ring, pkt_pos + PH_NEXT)[0]
+                        tp_snaplen = _le_I(ring, pkt_pos + PH_SNAPLEN)[0]
+                        tp_mac = _le_H(ring, pkt_pos + PH_MAC)[0]
+
+                        if tp_snaplen >= 30:
+                            eth_off = pkt_pos + tp_mac
+                            probe_id = _up_H(ring, eth_off + 14)[0]
+                            counter = _up_H(ring, eth_off + 16)[0]
+                            stream_id = _up_I(ring, eth_off + 26)[0]
+
+                            # Per-ProbeID Zustand
+                            ps = probe_states[arr_idx]
+                            if probe_id not in ps:
+                                ps[probe_id] = {
+                                    'prev': -1, 'total': 0,
+                                    'gaps': 0, 'lost': 0,
+                                    'streams': set(),
+                                }
+                                probe_pkt_counts[arr_idx][probe_id] = 0
+                            ls = ps[probe_id]
+                            ls['total'] += 1
+                            ls['streams'].add(stream_id)
+                            probe_pkt_counts[arr_idx][probe_id] += 1
+
+                            prev = ls['prev']
+                            if prev >= 0:
+                                expected = (prev + 1) & 0xFFFF
+                                if counter != expected:
+                                    if counter > prev:
+                                        gap = counter - prev
+                                    else:
+                                        gap = (65536 - prev) + counter
+                                    ls['gaps'] += 1
+                                    ls['lost'] += gap - 1
+                            ls['prev'] = counter
+
+                        pkt_pos += tp_next
+
+                    struct.pack_into('<I', ring,
+                                     offset + BD_STATUS,
+                                     TP_STATUS_KERNEL)
+                    bidx = (bidx + 1) % BLOCK_NR
+
+                iface_data[di] = (arr_idx, sock, ring, bidx)
+
+            # Shared Array jede Sekunde aktualisieren (nur Haupt-ProbeID)
+            now = time.monotonic()
+            if now - last_write >= 1.0:
+                last_write = now
+                for di in range(len(iface_data)):
+                    arr_idx = iface_data[di][0]
+                    ps = probe_states.get(arr_idx, {})
+                    pc = probe_pkt_counts.get(arr_idx, {})
+                    if not ps:
+                        continue
+                    # Haupt-ProbeID = die mit den meisten Paketen
+                    main_pid = max(pc, key=pc.get) if pc else None
+                    if main_pid is None:
+                        continue
+                    ls = ps[main_pid]
+                    base = arr_idx * _CM_FIELDS
+                    stats_arr[base + _CM_TOTAL] = ls['total']
+                    stats_arr[base + _CM_GAPS] = ls['gaps']
+                    stats_arr[base + _CM_LOST] = ls['lost']
+                    sids = sorted(ls['streams'])
+                    for si in range(8):
+                        stats_arr[base + _CM_STREAMS_START + si] = (
+                            sids[si] if si < len(sids) else 0)
+    finally:
+        for _, sock, ring, _ in iface_data:
+            try:
+                ring.close()
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -3214,6 +3462,44 @@ class LiveVideoDecoder(QObject):
             except Exception:
                 pass
 
+        # ── 帧抖动诊断 (帧间时间差检测) ──
+        try:
+            _jt_key = f'_jitter_{stream_id}'
+            _jt = isp_cache.get(_jt_key)
+            _now = _time.monotonic()
+            if _jt is None:
+                _jt = {'prev_time': _now, 'events': 0, 'total': 0,
+                       'log_f': open('/tmp/0x2090_jitter.log', 'a')}
+                isp_cache[_jt_key] = _jt
+                _jt['log_f'].write(
+                    f"\n=== Jitter-Diagnose gestartet S0x{stream_id:x} "
+                    f"{_time.strftime('%H:%M:%S')} ===\n")
+                _jt['log_f'].flush()
+            else:
+                _dt = (_now - _jt['prev_time']) * 1000  # ms
+                _jt['total'] += 1
+                # 正常帧间隔约 33ms (30fps) 或 66ms (15fps)
+                # 异常: dt > 100ms (丢帧/卡顿) 或 dt < 10ms (突发)
+                _is_anomaly = (_dt > 100) or (_dt < 10) or (_isp_ms > 80)
+                if _is_anomaly:
+                    _jt['events'] += 1
+                    _jt['log_f'].write(
+                        f"[JITTER] F{frame_num} S0x{stream_id:x} "
+                        f"t={_time.strftime('%H:%M:%S')} "
+                        f"dt={_dt:.0f}ms isp={_isp_ms:.0f}ms "
+                        f"events={_jt['events']}/{_jt['total']}\n")
+                    _jt['log_f'].flush()
+                elif frame_num % 300 == 0:
+                    _jt['log_f'].write(
+                        f"[OK]     F{frame_num} S0x{stream_id:x} "
+                        f"t={_time.strftime('%H:%M:%S')} "
+                        f"dt={_dt:.0f}ms isp={_isp_ms:.0f}ms "
+                        f"events={_jt['events']}/{_jt['total']}\n")
+                    _jt['log_f'].flush()
+            _jt['prev_time'] = _now
+        except Exception:
+            pass
+
         return bgr
 
     def _extract_0x2090_lines(self, state, force_last=False):
@@ -4615,16 +4901,16 @@ class WiresharkPanel(QWidget):
         # Gesamt-Zeile
         total_row = QHBoxLayout()
         total_name = QLabel("Gesamt:")
-        total_name.setFixedWidth(120)
-        total_name.setFont(QFont("Consolas", 10))
+        total_name.setFixedWidth(72)
+        total_name.setFont(QFont("Consolas", 9))
         self._net_speed_total_rx = QLabel("↓ 0 B/s")
-        self._net_speed_total_rx.setFont(QFont("Consolas", 10))
+        self._net_speed_total_rx.setFont(QFont("Consolas", 9))
         self._net_speed_total_rx.setStyleSheet("color: #2e7d32;")
-        self._net_speed_total_rx.setFixedWidth(140)
+        self._net_speed_total_rx.setFixedWidth(84)
         self._net_speed_total_tx = QLabel("↑ 0 B/s")
-        self._net_speed_total_tx.setFont(QFont("Consolas", 10))
+        self._net_speed_total_tx.setFont(QFont("Consolas", 9))
         self._net_speed_total_tx.setStyleSheet("color: #1565c0;")
-        self._net_speed_total_tx.setFixedWidth(140)
+        self._net_speed_total_tx.setFixedWidth(84)
         total_row.addWidget(total_name)
         total_row.addWidget(self._net_speed_total_rx)
         total_row.addWidget(self._net_speed_total_tx)
@@ -4675,6 +4961,7 @@ class WiresharkPanel(QWidget):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        header.resizeSection(6, 180)  # Info-Spalte schmaler
 
         # ── Video-Einstellungen-Panel (umschaltbar mit Paketliste) ──
         self._video_settings_widget = QWidget()
@@ -4704,9 +4991,67 @@ class WiresharkPanel(QWidget):
 
         self._video_settings_widget.hide()  # Initial versteckt
 
-        # Oberer Bereich: Horizontaler Splitter (Durchsatz | Paketliste/Video-Einstellungen)
+        # ── PLP Counter Monitor Panel ──
+        self._counter_widget = QWidget()
+        counter_main_layout = QVBoxLayout(self._counter_widget)
+        counter_main_layout.setContentsMargins(0, 0, 0, 0)
+        counter_main_layout.setSpacing(2)
+
+        self._counter_toggle_btn = QPushButton("🔢 PLP Counter ▼")
+        self._counter_toggle_btn.setStyleSheet(
+            "text-align: left; padding: 4px 8px; font-weight: bold;"
+        )
+        self._counter_toggle_btn.setFlat(True)
+        self._counter_toggle_btn.clicked.connect(self._toggle_counter_panel)
+        counter_main_layout.addWidget(self._counter_toggle_btn)
+
+        self._counter_content = QGroupBox()
+        self._counter_content.setStyleSheet("QGroupBox { padding: 4px; margin: 0px; }")
+        self._counter_content_layout = QVBoxLayout(self._counter_content)
+        self._counter_content_layout.setContentsMargins(4, 4, 4, 4)
+        self._counter_content_layout.setSpacing(3)
+
+        # Dynamisch erzeugte Interface-Zeilen (werden bei stats_updated befuellt)
+        self._counter_labels: Dict[str, Tuple[QLabel, QLabel]] = {}  # iface → (header, value)
+        self._counter_iface_container = QVBoxLayout()
+        self._counter_content_layout.addLayout(self._counter_iface_container)
+
+        # Seit-Zeile
+        self._counter_since_label = QLabel("Seit: —")
+        self._counter_since_label.setFont(QFont("Consolas", 8))
+        self._counter_since_label.setStyleSheet("color: #666;")
+        self._counter_content_layout.addWidget(self._counter_since_label)
+
+        # Reset-Button
+        self._counter_reset_btn = QPushButton("↺ Zurücksetzen")
+        self._counter_reset_btn.setFixedHeight(24)
+        self._counter_reset_btn.setFont(QFont("Consolas", 8))
+        self._counter_reset_btn.clicked.connect(self._reset_counter_monitor)
+        self._counter_content_layout.addWidget(self._counter_reset_btn)
+
+        # Stop/Start-Button
+        self._counter_stop_btn = QPushButton("⏹ Counter pausieren")
+        self._counter_stop_btn.setFixedHeight(24)
+        self._counter_stop_btn.setFont(QFont("Consolas", 8))
+        self._counter_stop_btn.setCheckable(True)
+        self._counter_stop_btn.setStyleSheet(
+            "QPushButton:checked { background-color: #d32f2f; color: white; }"
+        )
+        self._counter_stop_btn.toggled.connect(self._toggle_counter_monitor_running)
+        self._counter_content_layout.addWidget(self._counter_stop_btn)
+
+        counter_main_layout.addWidget(self._counter_content)
+        counter_main_layout.addStretch()
+
+        self._counter_expanded = True
+        self._cm_process = None
+        self._cm_timer = None
+        self._counter_widget.hide()
+
+        # Oberer Bereich: Horizontaler Splitter (Durchsatz | Counter | Paketliste/Video-Einstellungen)
         top_splitter = QSplitter(Qt.Orientation.Horizontal)
         top_splitter.addWidget(self.net_speed_widget)
+        top_splitter.addWidget(self._counter_widget)
         top_splitter.addWidget(self.packet_table)
         top_splitter.addWidget(self._video_settings_widget)
 
@@ -6351,7 +6696,8 @@ class WiresharkPanel(QWidget):
         self.live_capture_widget.show()
         self.open_btn.setEnabled(False)  # PCAP-Öffnen deaktivieren im Live-Modus
         self.net_speed_widget.show()
-        self._top_splitter.setSizes([350, 650])
+        self._counter_widget.show()
+        self._top_splitter.setSizes([220, 220, 560])
         self._prev_net_stats = self._read_net_dev()
         self._net_speed_timer.start(1000)
 
@@ -6439,10 +6785,38 @@ class WiresharkPanel(QWidget):
         iface_info = f" auf {', '.join(wsl_ifaces)}" if len(wsl_ifaces) > 1 else ""
         self.status_label.setText(f"Live-Capture läuft [{backend}]{iface_info}...{filter_info}")
 
+        # ── PLP Counter Monitor starten ──
+        # Auto-Erkennung wenn "Alle" gewaehlt (wsl_ifaces leer)
+        counter_ifaces = list(wsl_ifaces)
+        if not counter_ifaces:
+            _virtual_pfx = ('lo', 'docker', 'veth', 'br-', 'virbr')
+            try:
+                for entry in os.listdir('/sys/class/net'):
+                    if any(entry.startswith(p) for p in _virtual_pfx):
+                        continue
+                    try:
+                        with open(f'/sys/class/net/{entry}/carrier') as f:
+                            if f.read().strip() != '1':
+                                continue
+                        with open(f'/sys/class/net/{entry}/speed') as f:
+                            if int(f.read().strip()) < 5000:
+                                continue
+                    except (OSError, ValueError):
+                        continue
+                    counter_ifaces.append(entry)
+            except Exception:
+                pass
+        # Counter Monitor wird NACH _start_afpacket_workers gestartet,
+        # weil _inline_counter_stats erst dort erstellt wird.
+        self._pending_counter_ifaces = counter_ifaces if counter_ifaces else None
+
     def _stop_live_capture(self):
         """Stoppt die Live-Capture."""
         self._is_capturing = False
         self.progress_bar.hide()
+
+        # ── PLP Counter Monitor stoppen ──
+        self._stop_counter_monitor()
 
         # ── Assembly-Thread stoppen ──
         self._video_assembly_running = False
@@ -6661,6 +7035,12 @@ class WiresharkPanel(QWidget):
                     f"AF_PACKET fehlgeschlagen ({e}), Fallback auf LiveVideoDecoder")
                 self._cleanup_afpacket()
 
+        # ── PLP Counter Monitor starten (NACH Worker-Start) ──
+        _pci = getattr(self, '_pending_counter_ifaces', None)
+        if _pci:
+            self._start_counter_monitor(_pci)
+            self._pending_counter_ifaces = None
+
         # ── Render-Threads starten (4 Slots, je 1 Thread) ──
         self._render_threads: list = []
         for idx in range(4):
@@ -6798,6 +7178,13 @@ class WiresharkPanel(QWidget):
         # stream_id → worker_index Mapping (fuer Mode-Updates)
         self._afpacket_stream_worker_map: Dict[int, int] = {}
 
+        # ── Inline Counter Stats (alle Worker teilen ein Array) ──
+        self._inline_counter_stats = multiprocessing.Array(
+            'l', total_workers * _ICT_FIELDS, lock=False)
+        self._inline_counter_workers = total_workers
+        self._inline_counter_ifaces = list(interfaces)
+        self._inline_counter_pause = multiprocessing.Event()
+
         global_idx = 0
         for iface in interfaces:
             for local_i in range(WORKERS_PER_IFACE):
@@ -6815,7 +7202,9 @@ class WiresharkPanel(QWidget):
                 proc = multiprocessing.Process(
                     target=capture_worker_entry,
                     args=(iface, shm_name, writer_conn, stop_event,
-                          global_idx, total_workers, claimed, gain_mode),
+                          global_idx, total_workers, claimed, gain_mode,
+                          self._inline_counter_stats,
+                          self._inline_counter_pause),
                     daemon=True,
                     name=f"CaptureWorker-{iface}-{local_i}")
                 proc.start()
@@ -7038,10 +7427,11 @@ class WiresharkPanel(QWidget):
             # Paketanzeige anzeigen
             self._video_settings_widget.hide()
             self.packet_table.show()
-            # Splitter-Groessen wiederherstellen: [net_speed, packet_table, vs_widget]
+            # Splitter-Groessen wiederherstellen: [net_speed, counter, packet_table, vs_widget]
             sizes = self._top_splitter.sizes()
             total = sum(sizes)
-            self._top_splitter.setSizes([sizes[0], total - sizes[0], 0])
+            rest = total - sizes[0] - sizes[1]
+            self._top_splitter.setSizes([sizes[0], sizes[1], rest, 0])
         else:
             # Video-Einstellungen anzeigen
             self.packet_table.hide()
@@ -7049,7 +7439,8 @@ class WiresharkPanel(QWidget):
             # Splitter-Groessen setzen: Video-Einstellungen bekommt vollen Platz
             sizes = self._top_splitter.sizes()
             total = sum(sizes)
-            self._top_splitter.setSizes([sizes[0], 0, total - sizes[0]])
+            rest = total - sizes[0] - sizes[1]
+            self._top_splitter.setSizes([sizes[0], sizes[1], 0, rest])
 
     def _add_video_settings_stream(self, stream_id: int):
         """Fuegt einen Tab fuer einen neuen Video-Stream hinzu."""
@@ -7770,16 +8161,16 @@ class WiresharkPanel(QWidget):
                 if iface not in self._net_speed_labels:
                     row_layout = QHBoxLayout()
                     name_label = QLabel(f"{iface}:")
-                    name_label.setFixedWidth(120)
-                    name_label.setFont(QFont("Consolas", 10))
+                    name_label.setFixedWidth(72)
+                    name_label.setFont(QFont("Consolas", 9))
                     rx_label = QLabel("↓ 0 B/s")
-                    rx_label.setFont(QFont("Consolas", 10))
+                    rx_label.setFont(QFont("Consolas", 9))
                     rx_label.setStyleSheet("color: #2e7d32;")
-                    rx_label.setFixedWidth(140)
+                    rx_label.setFixedWidth(84)
                     tx_label = QLabel("↑ 0 B/s")
-                    tx_label.setFont(QFont("Consolas", 10))
+                    tx_label.setFont(QFont("Consolas", 9))
                     tx_label.setStyleSheet("color: #1565c0;")
-                    tx_label.setFixedWidth(140)
+                    tx_label.setFixedWidth(84)
                     row_layout.addWidget(name_label)
                     row_layout.addWidget(rx_label)
                     row_layout.addWidget(tx_label)
@@ -7814,3 +8205,243 @@ class WiresharkPanel(QWidget):
         else:
             self._net_speed_content.hide()
             self._net_speed_toggle_btn.setText("📊 Netzwerk-Durchsatz ▶")
+
+    # ── PLP Counter Monitor Methoden ──
+
+    def _toggle_counter_panel(self):
+        """Klappt das PLP Counter Panel ein/aus."""
+        self._counter_expanded = not self._counter_expanded
+        if self._counter_expanded:
+            self._counter_content.show()
+            self._counter_toggle_btn.setText("🔢 PLP Counter ▼")
+        else:
+            self._counter_content.hide()
+            self._counter_toggle_btn.setText("🔢 PLP Counter ▶")
+
+    def _start_counter_monitor(self, interfaces: list):
+        """Startet den PLP Counter Monitor (Inline-Modus).
+
+        Kein separater Prozess mehr — Counter werden direkt in den
+        CaptureWorker-Prozessen extrahiert (gleicher AF_PACKET Socket).
+        Vorteile: kein zweiter Socket → kein NAPI-Doubling → kein Jitter.
+        """
+        self._stop_counter_monitor()
+        logger = logging.getLogger(__name__)
+
+        # Inline-Modus: CaptureWorker schreiben direkt in
+        # self._inline_counter_stats (bereits beim Worker-Start erstellt)
+        ict = getattr(self, '_inline_counter_stats', None)
+        if ict is None:
+            logger.warning("Counter Monitor: kein inline_counter_stats, "
+                           "CaptureWorker noch nicht gestartet?")
+            return
+
+        self._cm_interfaces = list(interfaces)[:_CM_MAX_IFACES]
+        self._cm_inline_mode = True
+        self._cm_start_time = time.time()
+
+        logger.info(f"PLP Counter Monitor (INLINE): {interfaces}")
+
+        # QTimer liest jede Sekunde die Shared-Daten
+        self._cm_timer = QTimer()
+        self._cm_timer.timeout.connect(self._poll_counter_stats)
+        self._cm_timer.start(1000)
+
+    def _stop_counter_monitor(self):
+        """Stoppt den PLP Counter Monitor."""
+        if hasattr(self, '_cm_timer') and self._cm_timer:
+            self._cm_timer.stop()
+            self._cm_timer = None
+        # Legacy-Modus: separaten Prozess stoppen
+        if hasattr(self, '_cm_stop') and self._cm_stop:
+            self._cm_stop.set()
+        if hasattr(self, '_cm_process') and self._cm_process:
+            self._cm_process.join(timeout=2)
+            if self._cm_process.is_alive():
+                self._cm_process.terminate()
+            self._cm_process = None
+
+    def _toggle_counter_monitor_running(self, paused: bool):
+        """Pausiert oder setzt den Counter Monitor fort (Diagnose-Modus)."""
+        try:
+            if paused:
+                # Inline-Modus: CaptureWorker Counter-Extraktion stoppen
+                icp = getattr(self, '_inline_counter_pause', None)
+                if icp is not None:
+                    icp.set()
+                # Legacy-Modus
+                if hasattr(self, '_cm_pause'):
+                    self._cm_pause.set()
+                self._counter_stop_btn.setText("▶ Counter fortsetzen")
+                for _hdr, val in self._counter_labels.values():
+                    val.setText("—  (pausiert)")
+                self._counter_since_label.setText("Counter Monitor pausiert")
+                # Jitter-Log Marker
+                try:
+                    import time as _t
+                    with open('/tmp/0x2090_jitter.log', 'a') as _f:
+                        _f.write(f"\n{'='*60}\n"
+                                 f">>> COUNTER MONITOR PAUSIERT  {_t.strftime('%H:%M:%S')}\n"
+                                 f"{'='*60}\n")
+                except Exception:
+                    pass
+            else:
+                # Inline-Modus: Counter-Extraktion wieder aktivieren
+                icp = getattr(self, '_inline_counter_pause', None)
+                if icp is not None:
+                    icp.clear()
+                # Legacy-Modus
+                if hasattr(self, '_cm_reset'):
+                    self._cm_reset.set()
+                if hasattr(self, '_cm_pause'):
+                    self._cm_pause.clear()
+                self._counter_stop_btn.setText("⏹ Counter pausieren")
+                # Jitter-Log Marker
+                try:
+                    import time as _t
+                    with open('/tmp/0x2090_jitter.log', 'a') as _f:
+                        _f.write(f"\n{'='*60}\n"
+                                 f">>> COUNTER MONITOR FORTGESETZT  {_t.strftime('%H:%M:%S')}\n"
+                                 f"{'='*60}\n")
+                except Exception:
+                    pass
+                print("[DIAG] DONE (resumed)", flush=True)
+        except Exception as e:
+            print(f"[DIAG] EXCEPTION: {e}", flush=True)
+            traceback.print_exc()
+
+    def _reset_counter_monitor(self):
+        """Setzt Counter-Statistiken zurueck."""
+        if hasattr(self, '_cm_reset') and self._cm_reset:
+            self._cm_reset.set()
+        for _hdr, val in self._counter_labels.values():
+            val.setText("—  (zurückgesetzt)")
+        self._counter_since_label.setText(
+            f"Seit: {time.strftime('%H:%M:%S')}")
+
+    def _poll_counter_stats(self):
+        """Liest Counter-Statistiken aus Shared Array (QTimer, 1x/s)."""
+        inline = getattr(self, '_cm_inline_mode', False)
+        if inline:
+            return self._poll_counter_stats_inline()
+        # Legacy-Modus (separater Prozess)
+        if not hasattr(self, '_cm_stats') or not self._cm_stats:
+            return
+        ifaces = getattr(self, '_cm_interfaces', [])
+        since_h = self._cm_since[0]
+        since_m = self._cm_since[1]
+        since_s = self._cm_since[2]
+        since_str = f"{since_h:02d}:{since_m:02d}:{since_s:02d}"
+
+        stats = {}
+        for i, iface in enumerate(ifaces):
+            base = i * _CM_FIELDS
+            total = self._cm_stats[base + _CM_TOTAL]
+            gaps = self._cm_stats[base + _CM_GAPS]
+            lost = self._cm_stats[base + _CM_LOST]
+            sids = []
+            for si in range(8):
+                v = self._cm_stats[base + _CM_STREAMS_START + si]
+                if v != 0:
+                    sids.append(v)
+            total_exp = total + lost
+            rate = lost / total_exp if total_exp > 0 else 0.0
+            stats[iface] = {
+                'total': total, 'gaps': gaps, 'lost': lost,
+                'rate': rate, 'since': since_str, 'streams': sids,
+            }
+        self._on_counter_stats_updated(stats)
+
+    def _poll_counter_stats_inline(self):
+        """Liest Counter-Statistiken aus CaptureWorker Inline-Array."""
+        ict = getattr(self, '_inline_counter_stats', None)
+        if ict is None:
+            return
+        n_workers = getattr(self, '_inline_counter_workers', 0)
+        ifaces = getattr(self, '_inline_counter_ifaces', [])
+        start_time = getattr(self, '_cm_start_time', time.time())
+
+        # 启动时间 → "Seit" 格式
+        t = time.localtime(start_time)
+        since_str = f"{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}"
+
+        # 每个 interface 有 2 个 worker — 合并它们的统计
+        WORKERS_PER_IFACE = 2
+        stats = {}
+        for iface_idx, iface in enumerate(ifaces):
+            total = 0
+            gaps = 0
+            lost = 0
+            all_sids = set()
+            for w in range(WORKERS_PER_IFACE):
+                widx = iface_idx * WORKERS_PER_IFACE + w
+                if widx >= n_workers:
+                    break
+                base = widx * _ICT_FIELDS
+                try:
+                    total += ict[base + _ICT_TOTAL]
+                    gaps += ict[base + _ICT_GAPS]
+                    lost += ict[base + _ICT_LOST]
+                    for si in range(8):
+                        v = ict[base + _ICT_STREAMS_START + si]
+                        if v != 0:
+                            all_sids.add(v)
+                except (IndexError, Exception):
+                    pass
+
+            total_exp = total + lost
+            rate = lost / total_exp if total_exp > 0 else 0.0
+            stats[iface] = {
+                'total': total, 'gaps': gaps, 'lost': lost,
+                'rate': rate, 'since': since_str,
+                'streams': sorted(all_sids),
+            }
+        self._on_counter_stats_updated(stats)
+
+    def _on_counter_stats_updated(self, stats: dict):
+        """Aktualisiert die Counter-Anzeige mit neuen Statistiken."""
+        since_str = "—"
+        for iface, st in stats.items():
+            since_str = st['since']
+            rate = st['rate']
+            gaps = st['gaps']
+            lost = st['lost']
+            total = st['total']
+            streams = st.get('streams', [])
+
+            # Dynamisch Label erstellen falls noch nicht vorhanden
+            if iface not in self._counter_labels:
+                row = QVBoxLayout()
+                streams_str = "/".join(f"0x{s:02X}" for s in streams) if streams else "..."
+                hdr = QLabel(f"{iface} ({streams_str}):")
+                hdr.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+                row.addWidget(hdr)
+                val = QLabel("—  (wartend)")
+                val.setFont(QFont("Consolas", 9))
+                val.setWordWrap(True)
+                val.setTextFormat(Qt.TextFormat.RichText)
+                val.setStyleSheet("padding-left: 4px;")
+                row.addWidget(val)
+                self._counter_iface_container.addLayout(row)
+                self._counter_labels[iface] = (hdr, val)
+
+            hdr, val = self._counter_labels[iface]
+
+            # Header mit erkannten Stream-IDs aktualisieren
+            if streams:
+                streams_str = "/".join(f"0x{s:02X}" for s in streams)
+                hdr.setText(f"{iface} ({streams_str}):")
+
+            # Farben: Verlustrate/Verlust=rot, Empfangen=gruen, Luecken=orange
+            if gaps == 0:
+                val.setText(
+                    f'<span style="color:#2e7d32">Verlust 0%</span>, '
+                    f'<span style="color:#2e7d32">{total}</span> Pakete empfangen')
+            else:
+                val.setText(
+                    f'Verlust <span style="color:#d32f2f">{rate:.4%}</span>, '
+                    f'<span style="color:#d32f2f">{lost}</span> verloren, '
+                    f'<span style="color:#e6a117">{gaps}</span> Lücken, '
+                    f'<span style="color:#2e7d32">{total}</span> empfangen')
+
+        self._counter_since_label.setText(f"Seit: {since_str}")

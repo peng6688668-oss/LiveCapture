@@ -71,3 +71,12 @@ done
 
 echo 65536 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null
 logger "NIC-Tuning: Optimierung abgeschlossen (${#IFACES[@]} Interfaces)."
+
+# 5. Kernel netdev_budget erhöhen (verhindert port.rx_discards bei hohem pps)
+sysctl -w net.core.netdev_budget=4096
+sysctl -w net.core.netdev_budget_usecs=16000
+logger "NIC-Tuning: netdev_budget=4096, budget_usecs=16000"
+
+# 6. Backlog vergroessern (verhindert softnet drops bei single-queue non-IP traffic)
+sysctl -w net.core.netdev_max_backlog=200000
+logger "NIC-Tuning: netdev_max_backlog=200000"

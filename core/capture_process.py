@@ -55,7 +55,9 @@ PH_MAC = 24
 def capture_worker_entry(interface, shm_name, notify_conn, stop_event,
                          worker_index=0, num_workers=1,
                          claimed_streams=None,
-                         gain_mode=None):
+                         gain_mode=None,
+                         counter_stats=None,
+                         counter_pause=None):
     """Einstiegspunkt fuer den CaptureWorker-Prozess (spawn-kompatibel).
 
     Args:
@@ -64,6 +66,9 @@ def capture_worker_entry(interface, shm_name, notify_conn, stop_event,
         claimed_streams: multiprocessing.Array — jeder Worker schreibt
                          seine stream_id, andere pruefen auf Duplikate
         gain_mode: multiprocessing.Value('i') — 0=Auto/LCG, 1=HCG
+        counter_stats: multiprocessing.Array('l') — Counter-Statistik
+        counter_pause: multiprocessing.Event — wenn gesetzt, Counter-
+                       Extraktion wird uebersprungen (A/B-Test)
     """
     worker = CaptureWorker.__new__(CaptureWorker)
     worker.interface = interface
@@ -75,6 +80,8 @@ def capture_worker_entry(interface, shm_name, notify_conn, stop_event,
     worker.num_workers = num_workers
     worker.claimed_streams = claimed_streams
     worker.gain_mode = gain_mode
+    worker.counter_stats = counter_stats
+    worker.counter_pause = counter_pause
     worker._run_capture()
 
 
@@ -120,6 +127,7 @@ class CaptureWorker(multiprocessing.Process):
         self.notify_conn = notify_conn   # multiprocessing.Connection
         self.stop_event = stop_event
         self.target_stream_id = stream_id
+        self.counter_stats = None  # multiprocessing.Array (optional)
 
     # ════════════════════════════════════════════════════════════════
     #  Prozess-Einstiegspunkt
@@ -131,8 +139,31 @@ class CaptureWorker(multiprocessing.Process):
         except Exception as e:
             self._log(f"FATAL: {e}\n{traceback.format_exc()}")
 
+    # ── CPU-Affinity: NAPI-CPU je Interface ──
+    # i40e RSS fuer EtherType 0x2090 → alle Pakete in 1 Queue → 1 NAPI-CPU.
+    # CaptureWorker darf NICHT auf der NAPI-CPU laufen, sonst verhungert
+    # ksoftirqd und NIC-Ring laeuft ueber (rx_missed_errors).
+    _IFACE_CPU_AFFINITY = {
+        'eno7np2': list({0, 1, 2, 3, 5, 6, 7}),      # CPU 0-7 ohne NAPI-CPU 4
+        'eno8np3': list({8, 9, 10, 11, 13, 14, 15}),  # CPU 8-15 ohne NAPI-CPU 12
+    }
+
     def _run_capture(self):
         from multiprocessing.shared_memory import SharedMemory
+
+        # ── CPU-Affinity setzen (vor allem anderen) ──
+        iface = self.interface
+        affinity = self._IFACE_CPU_AFFINITY.get(iface)
+        if affinity:
+            try:
+                os.sched_setaffinity(0, affinity)
+                self._log(f"CPU affinity set: {sorted(affinity)} "
+                          f"(avoiding NAPI CPU for {iface})")
+            except OSError as e:
+                self._log(f"CPU affinity FAILED: {e}")
+        else:
+            self._log(f"No CPU affinity rule for {iface}, using default")
+
         shm = SharedMemory(name=self.shm_name)
 
         use_mmap = False
@@ -347,11 +378,27 @@ class CaptureWorker(multiprocessing.Process):
         _diag_pkts = 0
         _diag_blocks = 0
 
+        # ── PLP Counter 连续性检查 (内联, 零开销) ──
+        _ct_stats = self.counter_stats  # multiprocessing.Array or None
+        _ct_pause_ev = self.counter_pause  # multiprocessing.Event or None
+        _ct_active = (_ct_stats is not None)  # 本周期是否执行检查
+        _ct_prev = -1          # 上一个 counter 值
+        _ct_total = 0          # 总包数
+        _ct_gaps = 0           # 跳跃次数
+        _ct_lost = 0           # 丢失 counter 数
+        _ct_streams = set()    # 已见的 stream_id
+        _ct_last_write = time.monotonic()
+
         try:
             while not self.stop_event.is_set():
                 events = poller.poll(100)
                 if not events:
                     continue
+
+                # ── Counter Pause 状态更新 (每 poll 周期, ~100ms) ──
+                if _ct_pause_ev is not None:
+                    _ct_active = (_ct_stats is not None
+                                  and not _ct_pause_ev.is_set())
 
                 # ── Periodische Diagnose (alle 5s) ──
                 now = time.monotonic()
@@ -374,6 +421,24 @@ class CaptureWorker(multiprocessing.Process):
                     _diag_time = now
                     _diag_pkts = 0
                     _diag_blocks = 0
+
+                # ── Counter 统计写入 Shared Array (每秒) ──
+                if _ct_active and now - _ct_last_write >= 1.0:
+                    _ct_last_write = now
+                    widx = getattr(self, 'worker_index', 0)
+                    _CT_FIELDS = 12
+                    base = widx * _CT_FIELDS
+                    try:
+                        _ct_stats[base + 0] = _ct_total
+                        _ct_stats[base + 1] = _ct_gaps
+                        _ct_stats[base + 2] = _ct_lost
+                        sids = sorted(_ct_streams)
+                        for si in range(8):
+                            _ct_stats[base + 3 + si] = (
+                                sids[si] if si < len(sids) else 0)
+                        _ct_stats[base + 11] = int(now)
+                    except (IndexError, Exception):
+                        pass
 
                 while not self.stop_event.is_set():
                     offset = block_idx * block_size
@@ -400,6 +465,23 @@ class CaptureWorker(multiprocessing.Process):
                                 ring, eth_off + 22)[0]
                             stream_id = _up_I(
                                 ring, eth_off + 26)[0]
+
+                            # ── PLP Counter 内联提取 (~10ns) ──
+                            if _ct_active:
+                                _ct_val = _up_H(
+                                    ring, eth_off + 16)[0]
+                                _ct_total += 1
+                                _ct_streams.add(stream_id)
+                                if _ct_prev >= 0:
+                                    _ct_exp = (_ct_prev + 1) & 0xFFFF
+                                    if _ct_val != _ct_exp:
+                                        if _ct_val > _ct_prev:
+                                            _ct_g = _ct_val - _ct_prev
+                                        else:
+                                            _ct_g = (65536 - _ct_prev) + _ct_val
+                                        _ct_gaps += 1
+                                        _ct_lost += _ct_g - 1
+                                _ct_prev = _ct_val
 
                             if state['active_stream'] is None:
                                 if pkt_type == 0x06:
@@ -1032,6 +1114,45 @@ class CaptureWorker(multiprocessing.Process):
                              f"out B={_bm:.0f} G={_gm:.0f} R={_rm:.0f}\n")
             except Exception:
                 pass
+
+        # ── 帧抖动诊断 (帧间时间差 + coverage) ──
+        try:
+            import time as _time
+            _jt_key = f'_jitter_{stream_id}'
+            _jt = isp_cache.get(_jt_key)
+            _now = _time.monotonic()
+            if _jt is None:
+                _jt = {'prev_time': _now, 'events': 0, 'total': 0,
+                       'log_f': open('/tmp/0x2090_jitter.log', 'a')}
+                isp_cache[_jt_key] = _jt
+                _jt['log_f'].write(
+                    f"\n=== Jitter-Diagnose gestartet S0x{stream_id:x} "
+                    f"{_time.strftime('%H:%M:%S')} ===\n")
+                _jt['log_f'].flush()
+            else:
+                _dt = (_now - _jt['prev_time']) * 1000  # ms
+                _jt['total'] += 1
+                # 正常帧间隔约 33ms (30fps) 或 66ms (15fps)
+                # 异常: dt > 100ms (丢帧/卡顿) 或 dt < 10ms (突发)
+                _is_anomaly = (_dt > 100) or (_dt < 10)
+                if _is_anomaly:
+                    _jt['events'] += 1
+                    _jt['log_f'].write(
+                        f"[JITTER] F{frame_num} S0x{stream_id:x} "
+                        f"t={_time.strftime('%H:%M:%S')} "
+                        f"dt={_dt:.0f}ms "
+                        f"events={_jt['events']}/{_jt['total']}\n")
+                    _jt['log_f'].flush()
+                elif frame_num % 300 == 0:
+                    _jt['log_f'].write(
+                        f"[OK]     F{frame_num} S0x{stream_id:x} "
+                        f"t={_time.strftime('%H:%M:%S')} "
+                        f"dt={_dt:.0f}ms "
+                        f"events={_jt['events']}/{_jt['total']}\n")
+                    _jt['log_f'].flush()
+            _jt['prev_time'] = _now
+        except Exception:
+            pass
 
         return bgr
 
