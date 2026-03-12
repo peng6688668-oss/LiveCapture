@@ -379,15 +379,33 @@ class CaptureWorker(multiprocessing.Process):
         _diag_blocks = 0
 
         # ── PLP Counter 连续性检查 (内联, 零开销) ──
+        # PLP Counter 是 16-bit Probe 全局递增 (非 per-stream)。
+        # BPF-Filter 生效后只看到 1 个 stream, step = stream 数量。
+        #
+        # 周期统计法: 16-bit counter 的一个完整周期 = 65536。
+        # 在一个周期内, 期望收到 65536/step 个 stream 包。
+        # 实际收到的包数 < 期望 → 差额 = 真实丢失。
+        # 消除突发分布导致的虚假 gap (逐包 step 检测的问题)。
         _ct_stats = self.counter_stats  # multiprocessing.Array or None
         _ct_pause_ev = self.counter_pause  # multiprocessing.Event or None
-        _ct_active = (_ct_stats is not None)  # 本周期是否执行检查
+        _ct_active = (_ct_stats is not None)
         _ct_prev = -1          # 上一个 counter 值
-        _ct_total = 0          # 总包数
-        _ct_gaps = 0           # 跳跃次数
-        _ct_lost = 0           # 丢失 counter 数
+        _ct_total = 0          # 总包数 (累计)
+        _ct_gaps = 0           # 周期级 gap 次数 (累计)
+        _ct_lost = 0           # 丢失包数 (累计, 以 stream 包为单位)
         _ct_streams = set()    # 已见的 stream_id
+        _ct_step = 1           # BPF 前=1, BPF 后=stream 数量
         _ct_last_write = time.monotonic()
+        _ct_cycle_pkts = 0     # 当前周期内收到的包数
+        _ct_cycle_advance = 0  # 当前周期内 counter 前进量
+        _CT_CYCLE = 65536      # 一个完整的 16-bit counter 周期
+
+        # ── Gap-Analyse (nur bei step=1, Einzelkamera) ──
+        # Bei step=1 ist jeder delta>1 ein exakter Paketverlust.
+        # Fehlende Counter: prev+1 .. curr-1
+        _ct_gap_log = []          # [(prev, curr, n_missing), ...] max 200
+        _ct_gap_buckets = [0] * 256  # 256 Buckets à 256 Counter
+        _ct_gap_total_det = 0     # Gesamtzahl erkannter fehlender Counter
 
         try:
             while not self.stop_event.is_set():
@@ -439,6 +457,40 @@ class CaptureWorker(multiprocessing.Process):
                         _ct_stats[base + 11] = int(now)
                     except (IndexError, Exception):
                         pass
+                    # ── 诊断: Counter 状态日志 ──
+                    _ct_total_exp = _ct_total + _ct_lost
+                    _ct_rate = (_ct_lost / _ct_total_exp * 100
+                                ) if _ct_total_exp > 0 else 0.0
+                    self._log(
+                        f"[CT] w{widx} total={_ct_total} "
+                        f"gaps={_ct_gaps} lost={_ct_lost} "
+                        f"rate={_ct_rate:.2f}% "
+                        f"step={_ct_step} "
+                        f"cyc_pkts={_ct_cycle_pkts} "
+                        f"cyc_adv={_ct_cycle_advance} "
+                        f"streams={sorted(_ct_streams)}")
+                    # ── Gap-Datei schreiben (step=1) ──
+                    if _ct_step == 1 and _ct_gap_log:
+                        try:
+                            _gpath = (f'/tmp/plp_gaps_w'
+                                      f'{widx}.dat')
+                            with open(_gpath, 'w') as _gf:
+                                _gf.write(
+                                    f"S:{_ct_step},"
+                                    f"T:{_ct_gap_total_det}\n")
+                                for _gp, _gc, _gn in (
+                                        _ct_gap_log[-50:]):
+                                    _gf.write(
+                                        f"G:{_gp},{_gc},{_gn}\n")
+                                _gf.write("---\n")
+                                for _bi in range(256):
+                                    if _ct_gap_buckets[_bi] > 0:
+                                        _gf.write(
+                                            f"B:{_bi},"
+                                            f"{_ct_gap_buckets[_bi]}"
+                                            f"\n")
+                        except Exception:
+                            pass
 
                 while not self.stop_event.is_set():
                     offset = block_idx * block_size
@@ -466,22 +518,52 @@ class CaptureWorker(multiprocessing.Process):
                             stream_id = _up_I(
                                 ring, eth_off + 26)[0]
 
-                            # ── PLP Counter 内联提取 (~10ns) ──
+                            # ── PLP Counter 内联提取 (周期统计法) ──
+                            # 完整 16-bit 周期 (65536) 统计:
+                            #   累加 counter 前进量, 每满一个周期评估
+                            #   期望收到 = cycle_advance / step
+                            #   丢失 = 期望 - 实际
                             if _ct_active:
                                 _ct_val = _up_H(
                                     ring, eth_off + 16)[0]
                                 _ct_total += 1
                                 _ct_streams.add(stream_id)
+                                _ct_cycle_pkts += 1
                                 if _ct_prev >= 0:
-                                    _ct_exp = (_ct_prev + 1) & 0xFFFF
-                                    if _ct_val != _ct_exp:
-                                        if _ct_val > _ct_prev:
-                                            _ct_g = _ct_val - _ct_prev
-                                        else:
-                                            _ct_g = (65536 - _ct_prev) + _ct_val
-                                        _ct_gaps += 1
-                                        _ct_lost += _ct_g - 1
+                                    _ct_delta = _ct_val - _ct_prev
+                                    if _ct_delta < 0:
+                                        _ct_delta += 65536
+                                    # 安全检查: delta=0 或异常大 → 跳过
+                                    if 0 < _ct_delta < 32768:
+                                        _ct_cycle_advance += _ct_delta
+                                        # Gap-Analyse: step=1 →
+                                        # jeder delta>1 = exakter Verlust
+                                        if (_ct_step == 1
+                                                and _ct_delta > 1):
+                                            _nmiss = _ct_delta - 1
+                                            _ct_gap_total_det += _nmiss
+                                            _ct_gap_log.append((
+                                                _ct_prev, _ct_val,
+                                                _nmiss))
+                                            if len(_ct_gap_log) > 200:
+                                                _ct_gap_log = (
+                                                    _ct_gap_log[-100:])
+                                            _bkt = (
+                                                (_ct_prev + 1) >> 8)
+                                            _ct_gap_buckets[
+                                                _bkt & 0xFF] += _nmiss
                                 _ct_prev = _ct_val
+                                # 周期评估: 累积前进量 >= 65536
+                                if _ct_cycle_advance >= _CT_CYCLE:
+                                    _ct_expected = (
+                                        _ct_cycle_advance // _ct_step)
+                                    _ct_cycle_lost = (
+                                        _ct_expected - _ct_cycle_pkts)
+                                    if _ct_cycle_lost > 0:
+                                        _ct_gaps += 1
+                                        _ct_lost += _ct_cycle_lost
+                                    _ct_cycle_advance = 0
+                                    _ct_cycle_pkts = 0
 
                             if state['active_stream'] is None:
                                 if pkt_type == 0x06:
@@ -508,6 +590,23 @@ class CaptureWorker(multiprocessing.Process):
                                     # Pakete zustellen (kein Duplikat)
                                     self._attach_stream_filter(
                                         sock, stream_id)
+                                    # Counter-Schritt anpassen: nach BPF
+                                    # sieht dieser Worker nur 1 Stream,
+                                    # aber Counter ist Probe-global →
+                                    # Schritt = Anzahl Streams auf Probe
+                                    n_st = len(_ct_streams)
+                                    if n_st > 1:
+                                        _ct_step = n_st
+                                        # Bisherige Statistik zuruecksetzen
+                                        _ct_total = 0
+                                        _ct_gaps = 0
+                                        _ct_lost = 0
+                                        _ct_prev = -1
+                                        _ct_cycle_pkts = 0
+                                        _ct_cycle_advance = 0
+                                        self._log(
+                                            f"[CT] BPF aktiv, step={_ct_step} "
+                                            f"(streams={sorted(_ct_streams)})")
                                 else:
                                     pkt_pos += tp_next
                                     continue

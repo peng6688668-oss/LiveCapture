@@ -5022,6 +5022,20 @@ class WiresharkPanel(QWidget):
         self._counter_since_label.setStyleSheet("color: #666;")
         self._counter_content_layout.addWidget(self._counter_since_label)
 
+        # Gap-Analyse Anzeige (Einzelkamera-Modus, step=1)
+        self._counter_gap_label = QLabel("")
+        self._counter_gap_label.setFont(QFont("Consolas", 8))
+        self._counter_gap_label.setWordWrap(True)
+        self._counter_gap_label.setTextFormat(Qt.TextFormat.RichText)
+        self._counter_gap_label.setStyleSheet("padding-left: 4px;")
+        self._counter_gap_label.hide()  # nur bei step=1 sichtbar
+        self._counter_content_layout.addWidget(self._counter_gap_label)
+
+        # Gap-Datei Polling Timer (alle 2s)
+        self._gap_poll_timer = QTimer(self)
+        self._gap_poll_timer.timeout.connect(self._poll_gap_files)
+        self._gap_poll_timer.setInterval(2000)
+
         # Reset-Button
         self._counter_reset_btn = QPushButton("↺ Zurücksetzen")
         self._counter_reset_btn.setFixedHeight(24)
@@ -5040,8 +5054,12 @@ class WiresharkPanel(QWidget):
         self._counter_stop_btn.toggled.connect(self._toggle_counter_monitor_running)
         self._counter_content_layout.addWidget(self._counter_stop_btn)
 
-        counter_main_layout.addWidget(self._counter_content)
-        counter_main_layout.addStretch()
+        # ScrollArea fuer Counter-Inhalt (Gap-Analyse kann lang werden)
+        self._counter_scroll = QScrollArea()
+        self._counter_scroll.setWidgetResizable(True)
+        self._counter_scroll.setWidget(self._counter_content)
+        self._counter_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        counter_main_layout.addWidget(self._counter_scroll, 1)
 
         self._counter_expanded = True
         self._cm_process = None
@@ -6835,10 +6853,29 @@ class WiresharkPanel(QWidget):
         self.capture_filter_entry.setEnabled(True)
         self.packet_limit_btn.setEnabled(True)
 
-        # Video-Decode deaktivieren (letzter Frame bleibt stehen)
+        # Video-Decode: Backend stoppen, aber Anzeige beibehalten
+        # (letzter Frame + Layout bleiben stehen)
         self._video_decode_btn.setEnabled(False)
         if self._video_decode_active:
+            self._video_decode_active = False
+            # Render-Threads stoppen (kein neues Bild mehr)
+            for rt in getattr(self, '_render_threads', []):
+                try:
+                    rt.stop()
+                except Exception:
+                    pass
+            self._render_threads = []
+            # AF_PACKET Worker stoppen
+            self._cleanup_afpacket()
+            # Decoder aufräumen
+            if self._video_decoder:
+                self._video_decoder.cleanup()
+                self._video_decoder.deleteLater()
+                self._video_decoder = None
+            # Toggle-Button zuruecksetzen OHNE _stop_video_decode
+            self._video_decode_btn.blockSignals(True)
             self._video_decode_btn.setChecked(False)
+            self._video_decode_btn.blockSignals(False)
 
         self.status_label.setText(f"Live-Capture gestoppt. {len(self.packets)} Pakete erfasst.")
 
@@ -7801,25 +7838,11 @@ class WiresharkPanel(QWidget):
             self._video_grid_layout.removeWidget(panel)
             panel.setVisible(False)
 
-        if count == 1:
-            self._video_grid_layout.addWidget(self._video_panels[0], 0, 0, 2, 2)
-            self._video_panels[0].setVisible(True)
-        elif count == 2:
-            self._video_grid_layout.addWidget(self._video_panels[0], 0, 0)
-            self._video_grid_layout.addWidget(self._video_panels[1], 0, 1)
-            for i in range(2):
-                self._video_panels[i].setVisible(True)
-        elif count == 3:
-            self._video_grid_layout.addWidget(self._video_panels[0], 0, 0)
-            self._video_grid_layout.addWidget(self._video_panels[1], 0, 1)
-            self._video_grid_layout.addWidget(self._video_panels[2], 1, 0, 1, 2)
-            for i in range(3):
-                self._video_panels[i].setVisible(True)
-        elif count == 4:
-            # 1x4 horizontal: breiter Bildschirm optimal nutzen
-            for i in range(4):
-                self._video_grid_layout.addWidget(self._video_panels[i], 0, i)
-                self._video_panels[i].setVisible(True)
+        # Immer 1×N horizontal nebeneinander (eine Zeile)
+        for i in range(min(count, len(self._video_panels))):
+            self._video_grid_layout.addWidget(
+                self._video_panels[i], 0, i)
+            self._video_panels[i].setVisible(True)
 
     def _save_video_snapshot(self):
         """Speichert den aktuellen Video-Frame als PNG."""
@@ -8247,11 +8270,17 @@ class WiresharkPanel(QWidget):
         self._cm_timer.timeout.connect(self._poll_counter_stats)
         self._cm_timer.start(1000)
 
+        # Gap-Analyse Timer starten
+        self._gap_poll_timer.start()
+
     def _stop_counter_monitor(self):
         """Stoppt den PLP Counter Monitor."""
         if hasattr(self, '_cm_timer') and self._cm_timer:
             self._cm_timer.stop()
             self._cm_timer = None
+        if hasattr(self, '_gap_poll_timer'):
+            self._gap_poll_timer.stop()
+            self._counter_gap_label.hide()
         # Legacy-Modus: separaten Prozess stoppen
         if hasattr(self, '_cm_stop') and self._cm_stop:
             self._cm_stop.set()
@@ -8311,11 +8340,31 @@ class WiresharkPanel(QWidget):
             traceback.print_exc()
 
     def _reset_counter_monitor(self):
-        """Setzt Counter-Statistiken zurueck."""
+        """Setzt Counter-Statistiken zurueck.
+
+        Inline-Modus: Snapshot der aktuellen Werte speichern,
+        danach werden nur die Differenzen angezeigt.
+        """
+        # Legacy-Modus
         if hasattr(self, '_cm_reset') and self._cm_reset:
             self._cm_reset.set()
+        # Inline-Modus: Snapshot speichern
+        ict = getattr(self, '_inline_counter_stats', None)
+        if ict is not None:
+            n_workers = getattr(self, '_inline_counter_workers', 0)
+            snap = {}
+            for widx in range(n_workers):
+                base = widx * _ICT_FIELDS
+                try:
+                    snap[widx] = (ict[base + _ICT_TOTAL],
+                                  ict[base + _ICT_GAPS],
+                                  ict[base + _ICT_LOST])
+                except (IndexError, Exception):
+                    snap[widx] = (0, 0, 0)
+            self._inline_counter_snapshot = snap
         for _hdr, val in self._counter_labels.values():
             val.setText("—  (zurückgesetzt)")
+        self._cm_start_time = time.time()
         self._counter_since_label.setText(
             f"Seit: {time.strftime('%H:%M:%S')}")
 
@@ -8360,6 +8409,7 @@ class WiresharkPanel(QWidget):
         n_workers = getattr(self, '_inline_counter_workers', 0)
         ifaces = getattr(self, '_inline_counter_ifaces', [])
         start_time = getattr(self, '_cm_start_time', time.time())
+        snap = getattr(self, '_inline_counter_snapshot', None)
 
         # 启动时间 → "Seit" 格式
         t = time.localtime(start_time)
@@ -8379,9 +8429,18 @@ class WiresharkPanel(QWidget):
                     break
                 base = widx * _ICT_FIELDS
                 try:
-                    total += ict[base + _ICT_TOTAL]
-                    gaps += ict[base + _ICT_GAPS]
-                    lost += ict[base + _ICT_LOST]
+                    w_total = ict[base + _ICT_TOTAL]
+                    w_gaps = ict[base + _ICT_GAPS]
+                    w_lost = ict[base + _ICT_LOST]
+                    # Snapshot abziehen (Reset-Funktion)
+                    if snap and widx in snap:
+                        s_total, s_gaps, s_lost = snap[widx]
+                        w_total -= s_total
+                        w_gaps -= s_gaps
+                        w_lost -= s_lost
+                    total += w_total
+                    gaps += w_gaps
+                    lost += w_lost
                     for si in range(8):
                         v = ict[base + _ICT_STREAMS_START + si]
                         if v != 0:
@@ -8445,3 +8504,118 @@ class WiresharkPanel(QWidget):
                     f'<span style="color:#2e7d32">{total}</span> empfangen')
 
         self._counter_since_label.setText(f"Seit: {since_str}")
+
+    def _poll_gap_files(self):
+        """Liest Gap-Analyse-Dateien der Worker und zeigt Details an."""
+        n_workers = getattr(self, '_inline_counter_workers', 0)
+        if n_workers == 0:
+            return
+        all_gaps = []       # (worker, prev, curr, n_miss)
+        all_buckets = {}    # bucket_idx → total_count
+        total_det = 0
+        has_data = False
+
+        for widx in range(n_workers):
+            path = f'/tmp/plp_gaps_w{widx}.dat'
+            try:
+                with open(path, 'r') as f:
+                    lines = f.readlines()
+            except (FileNotFoundError, OSError):
+                continue
+            section = 'meta'
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if line == '---':
+                    section = 'buckets'
+                    continue
+                if line.startswith('S:'):
+                    # S:step=1,T:123
+                    parts = line.split(',')
+                    for p in parts:
+                        if p.startswith('T:'):
+                            try:
+                                total_det += int(p[2:])
+                            except ValueError:
+                                pass
+                    has_data = True
+                elif line.startswith('G:') and section != 'buckets':
+                    try:
+                        parts = line[2:].split(',')
+                        prev = int(parts[0])
+                        curr = int(parts[1])
+                        nmiss = int(parts[2])
+                        all_gaps.append((widx, prev, curr, nmiss))
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith('B:'):
+                    try:
+                        parts = line[2:].split(',')
+                        bi = int(parts[0])
+                        cnt = int(parts[1])
+                        all_buckets[bi] = (
+                            all_buckets.get(bi, 0) + cnt)
+                    except (ValueError, IndexError):
+                        pass
+
+        if not has_data:
+            self._counter_gap_label.hide()
+            return
+
+        # ── Anzeige aufbauen ──
+        html_parts = []
+        html_parts.append(
+            '<b style="color:#888">Gap-Analyse '
+            '(Einzelkamera):</b><br>')
+        html_parts.append(
+            f'Fehlende Counter gesamt: '
+            f'<b>{total_det}</b><br>')
+
+        # Letzte 10 Gaps
+        recent = all_gaps[-10:]
+        if recent:
+            html_parts.append(
+                '<span style="color:#888">'
+                'Letzte Lücken:</span><br>')
+            for widx, prev, curr, nmiss in reversed(recent):
+                # Fehlende Counter aufzaehlen (max 8)
+                miss_start = (prev + 1) & 0xFFFF
+                if nmiss <= 8:
+                    miss_vals = ", ".join(
+                        str((miss_start + i) & 0xFFFF)
+                        for i in range(nmiss))
+                else:
+                    miss_vals = (
+                        ", ".join(
+                            str((miss_start + i) & 0xFFFF)
+                            for i in range(4))
+                        + f" ... "
+                        + ", ".join(
+                            str((miss_start + nmiss - 2 + i)
+                                & 0xFFFF)
+                            for i in range(2)))
+                html_parts.append(
+                    f'&nbsp;&nbsp;w{widx}: '
+                    f'{prev}→{curr} '
+                    f'<span style="color:#d32f2f">'
+                    f'fehlt [{miss_vals}]</span> '
+                    f'({nmiss})<br>')
+
+        # Top-5 Bereiche
+        if all_buckets:
+            top = sorted(all_buckets.items(),
+                         key=lambda x: -x[1])[:5]
+            html_parts.append(
+                '<span style="color:#888">'
+                'Häufigste Bereiche:</span><br>')
+            for bi, cnt in top:
+                r_start = bi * 256
+                r_end = r_start + 255
+                html_parts.append(
+                    f'&nbsp;&nbsp;Counter '
+                    f'{r_start}-{r_end}: '
+                    f'<b>{cnt}</b>×<br>')
+
+        self._counter_gap_label.setText("".join(html_parts))
+        self._counter_gap_label.show()
