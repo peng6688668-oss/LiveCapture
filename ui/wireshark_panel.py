@@ -7235,6 +7235,7 @@ class WiresharkPanel(QWidget):
         self._inline_counter_workers = total_workers
         self._inline_counter_ifaces = list(interfaces)
         self._inline_counter_pause = multiprocessing.Event()
+        self._inline_counter_reset = multiprocessing.Value('i', 0)
 
         global_idx = 0
         for iface in interfaces:
@@ -7255,7 +7256,8 @@ class WiresharkPanel(QWidget):
                     args=(iface, shm_name, writer_conn, stop_event,
                           global_idx, total_workers, claimed, gain_mode,
                           self._inline_counter_stats,
-                          self._inline_counter_pause),
+                          self._inline_counter_pause,
+                          self._inline_counter_reset),
                     daemon=True,
                     name=f"CaptureWorker-{iface}-{local_i}")
                 proc.start()
@@ -8386,15 +8388,10 @@ class WiresharkPanel(QWidget):
                 except (IndexError, Exception):
                     snap[widx] = (0, 0, 0)
             self._inline_counter_snapshot = snap
-        # Gap-Dateien loeschen (sonst bleiben alte Daten nach Reset)
-        n_w = getattr(self, '_inline_counter_workers', 0)
-        for _widx in range(n_w):
-            _gpath = f'/tmp/plp_gaps_w{_widx}.dat'
-            try:
-                import os
-                os.remove(_gpath)
-            except OSError:
-                pass
+        # Worker-Prozesse anweisen, Gap/OOO-Daten zurueckzusetzen
+        icr = getattr(self, '_inline_counter_reset', None)
+        if icr is not None:
+            icr.value += 1
         for entry in self._counter_labels.values():
             entry[1].setText("—  (zurückgesetzt)")
             # OOO Label zuruecksetzen

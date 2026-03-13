@@ -57,7 +57,8 @@ def capture_worker_entry(interface, shm_name, notify_conn, stop_event,
                          claimed_streams=None,
                          gain_mode=None,
                          counter_stats=None,
-                         counter_pause=None):
+                         counter_pause=None,
+                         counter_reset=None):
     """Einstiegspunkt fuer den CaptureWorker-Prozess (spawn-kompatibel).
 
     Args:
@@ -69,6 +70,8 @@ def capture_worker_entry(interface, shm_name, notify_conn, stop_event,
         counter_stats: multiprocessing.Array('l') — Counter-Statistik
         counter_pause: multiprocessing.Event — wenn gesetzt, Counter-
                        Extraktion wird uebersprungen (A/B-Test)
+        counter_reset: multiprocessing.Value('i') — Generation-Counter,
+                       bei Aenderung Gap/OOO-Daten zuruecksetzen
     """
     worker = CaptureWorker.__new__(CaptureWorker)
     worker.interface = interface
@@ -82,6 +85,7 @@ def capture_worker_entry(interface, shm_name, notify_conn, stop_event,
     worker.gain_mode = gain_mode
     worker.counter_stats = counter_stats
     worker.counter_pause = counter_pause
+    worker.counter_reset = counter_reset
     worker._run_capture()
 
 
@@ -128,6 +132,7 @@ class CaptureWorker(multiprocessing.Process):
         self.stop_event = stop_event
         self.target_stream_id = stream_id
         self.counter_stats = None  # multiprocessing.Array (optional)
+        self.counter_reset = None  # multiprocessing.Event (optional)
 
     # ════════════════════════════════════════════════════════════════
     #  Prozess-Einstiegspunkt
@@ -388,6 +393,8 @@ class CaptureWorker(multiprocessing.Process):
         # 消除突发分布导致的虚假 gap (逐包 step 检测的问题)。
         _ct_stats = self.counter_stats  # multiprocessing.Array or None
         _ct_pause_ev = self.counter_pause  # multiprocessing.Event or None
+        _ct_reset_gen = self.counter_reset  # multiprocessing.Value('i') or None
+        _ct_last_reset_gen = _ct_reset_gen.value if _ct_reset_gen else 0
         _ct_active = (_ct_stats is not None)
         _ct_prev = -1          # 上一个 counter 值
         _ct_total = 0          # 总包数 (累计)
@@ -423,6 +430,26 @@ class CaptureWorker(multiprocessing.Process):
                 if _ct_pause_ev is not None:
                     _ct_active = (_ct_stats is not None
                                   and not _ct_pause_ev.is_set())
+
+                # ── Counter Reset (Zurücksetzen-Button) ──
+                if _ct_reset_gen is not None:
+                    _cur_gen = _ct_reset_gen.value
+                    if _cur_gen != _ct_last_reset_gen:
+                        _ct_last_reset_gen = _cur_gen
+                        _ct_gap_log.clear()
+                        _ct_gap_buckets = [0] * 256
+                        _ct_gap_total_det = 0
+                        _ct_ooo_count = 0
+                        _ct_ooo_log.clear()
+                        # Gap-Datei loeschen
+                        widx = getattr(self, 'worker_index', 0)
+                        try:
+                            import os as _os
+                            _os.remove(f'/tmp/plp_gaps_w{widx}.dat')
+                        except OSError:
+                            pass
+                        self._log(
+                            f"[CT] w{widx} Gap/OOO-Daten zurueckgesetzt")
 
                 # ── Periodische Diagnose (alle 5s) ──
                 now = time.monotonic()
