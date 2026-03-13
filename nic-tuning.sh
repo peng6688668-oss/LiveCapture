@@ -1,4 +1,4 @@
-#!/bin/bash
+#\!/bin/bash
 # NIC Performance Tuning for High-Throughput Capture
 # Optimiert alle i40e-Interfaces (>= 5 Gbps) automatisch:
 #   1. Ring Buffer auf Maximum
@@ -10,20 +10,31 @@ logger "NIC-Tuning: Starte Optimierung..."
 
 CPU_COUNT=$(nproc)
 
-# Alle i40e-Interfaces mit Link finden
-IFACES=()
-for iface in /sys/class/net/*/device/driver; do
-    driver=$(basename $(readlink -f "$iface"))
-    ifname=$(echo "$iface" | cut -d'/' -f5)
-    [ "$driver" \!= "i40e" ] && continue
-    # Nur Interfaces mit Link (carrier=1)
-    carrier=$(cat /sys/class/net/$ifname/carrier 2>/dev/null)
-    [ "$carrier" \!= "1" ] && continue
-    IFACES+=("$ifname")
+# Warte bis zu 60s auf mindestens ein aktives i40e-Interface (Boot Race Condition)
+find_i40e_ifaces() {
+    IFACES=()
+    for iface in /sys/class/net/*/device/driver; do
+        driver=$(basename $(readlink -f "$iface"))
+        ifname=$(echo "$iface" | cut -d'/' -f5)
+        [ "$driver" \!= "i40e" ] && continue
+        carrier=$(cat /sys/class/net/$ifname/carrier 2>/dev/null)
+        [ "$carrier" \!= "1" ] && continue
+        IFACES+=("$ifname")
+    done
+}
+
+WAIT_MAX=60
+WAIT=0
+find_i40e_ifaces
+while [ ${#IFACES[@]} -eq 0 ] && [ $WAIT -lt $WAIT_MAX ]; do
+    sleep 5
+    WAIT=$((WAIT + 5))
+    find_i40e_ifaces
+    logger "NIC-Tuning: Warte auf i40e-Interfaces... (${WAIT}s/${WAIT_MAX}s)"
 done
 
 if [ ${#IFACES[@]} -eq 0 ]; then
-    logger "NIC-Tuning: Keine aktiven i40e-Interfaces gefunden, ueberspringe."
+    logger "NIC-Tuning: Keine aktiven i40e-Interfaces nach ${WAIT_MAX}s gefunden, ueberspringe."
     exit 0
 fi
 
@@ -72,7 +83,7 @@ done
 echo 65536 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null
 logger "NIC-Tuning: Optimierung abgeschlossen (${#IFACES[@]} Interfaces)."
 
-# 5. Kernel netdev_budget erhöhen (verhindert port.rx_discards bei hohem pps)
+# 5. Kernel netdev_budget erhoehen (verhindert port.rx_discards bei hohem pps)
 sysctl -w net.core.netdev_budget=4096
 sysctl -w net.core.netdev_budget_usecs=16000
 logger "NIC-Tuning: netdev_budget=4096, budget_usecs=16000"

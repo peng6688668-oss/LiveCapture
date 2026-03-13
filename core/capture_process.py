@@ -407,6 +407,12 @@ class CaptureWorker(multiprocessing.Process):
         _ct_gap_buckets = [0] * 256  # 256 Buckets à 256 Counter
         _ct_gap_total_det = 0     # Gesamtzahl erkannter fehlender Counter
 
+        # ── Out-of-Order Erkennung ──
+        # Wenn curr < prev (delta negativ → >=32768 nach Wrap),
+        # ist das Paket ausser Reihenfolge angekommen.
+        _ct_ooo_count = 0         # Gesamtzahl OOO-Ereignisse
+        _ct_ooo_log = []          # [(prev, curr), ...] max 200
+
         try:
             while not self.stop_event.is_set():
                 events = poller.poll(100)
@@ -469,15 +475,17 @@ class CaptureWorker(multiprocessing.Process):
                         f"cyc_pkts={_ct_cycle_pkts} "
                         f"cyc_adv={_ct_cycle_advance} "
                         f"streams={sorted(_ct_streams)}")
-                    # ── Gap-Datei schreiben (step=1) ──
-                    if _ct_step == 1 and _ct_gap_log:
+                    # ── Gap/OOO-Datei schreiben ──
+                    if _ct_gap_log or _ct_ooo_log:
                         try:
                             _gpath = (f'/tmp/plp_gaps_w'
                                       f'{widx}.dat')
                             with open(_gpath, 'w') as _gf:
                                 _gf.write(
                                     f"S:{_ct_step},"
-                                    f"T:{_ct_gap_total_det}\n")
+                                    f"T:{_ct_gap_total_det},"
+                                    f"O:{_ct_ooo_count}\n")
+                                # Gap-Eintraege (step=1)
                                 for _gp, _gc, _gn in (
                                         _ct_gap_log[-50:]):
                                     _gf.write(
@@ -489,6 +497,12 @@ class CaptureWorker(multiprocessing.Process):
                                             f"B:{_bi},"
                                             f"{_ct_gap_buckets[_bi]}"
                                             f"\n")
+                                # OOO-Eintraege
+                                _gf.write("===\n")
+                                for _op, _oc in (
+                                        _ct_ooo_log[-50:]):
+                                    _gf.write(
+                                        f"OOO:{_op},{_oc}\n")
                         except Exception:
                             pass
 
@@ -552,6 +566,14 @@ class CaptureWorker(multiprocessing.Process):
                                                 (_ct_prev + 1) >> 8)
                                             _ct_gap_buckets[
                                                 _bkt & 0xFF] += _nmiss
+                                    elif _ct_delta >= 32768:
+                                        # Out-of-Order: curr < prev
+                                        _ct_ooo_count += 1
+                                        _ct_ooo_log.append((
+                                            _ct_prev, _ct_val))
+                                        if len(_ct_ooo_log) > 200:
+                                            _ct_ooo_log = (
+                                                _ct_ooo_log[-100:])
                                 _ct_prev = _ct_val
                                 # 周期评估: 累积前进量 >= 65536
                                 if _ct_cycle_advance >= _CT_CYCLE:
@@ -604,6 +626,8 @@ class CaptureWorker(multiprocessing.Process):
                                         _ct_prev = -1
                                         _ct_cycle_pkts = 0
                                         _ct_cycle_advance = 0
+                                        _ct_ooo_count = 0
+                                        _ct_ooo_log.clear()
                                         self._log(
                                             f"[CT] BPF aktiv, step={_ct_step} "
                                             f"(streams={sorted(_ct_streams)})")

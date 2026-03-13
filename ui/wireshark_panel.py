@@ -4696,6 +4696,7 @@ class WiresharkPanel(QWidget):
         self._default_capture_filter = default_capture_filter
         self._max_live_packets = 10000  # Limit um Abstürze zu verhindern
         self._total_trimmed = 0  # Zaehler fuer Ring-Buffer (fortlaufende Nr.-Spalte)
+        self._packet_display_paused = True  # Paketanzeige standardmaessig pausiert
 
         # Live-Video-Decoder
         self._video_decoder: Optional[LiveVideoDecoder] = None
@@ -4838,7 +4839,7 @@ class WiresharkPanel(QWidget):
         # Protokoll-Dropdown (QPushButton + QMenu — Wayland-kompatibel)
         live_capture_layout.addWidget(QLabel("Protokoll:"))
         self._video_protocol_btn = QPushButton("Auto")
-        self._video_protocol_btn.setMinimumWidth(130)
+        self._video_protocol_btn.setMinimumWidth(100)
         self._video_protocol_btn.setStyleSheet("text-align: left; padding: 3px 8px;")
         self._video_protocol_menu = QMenu(self)
         self._video_protocol_btn.setMenu(self._video_protocol_menu)
@@ -4853,6 +4854,18 @@ class WiresharkPanel(QWidget):
             action = self._video_protocol_menu.addAction(label)
             action.triggered.connect(lambda checked, idx=i, lbl=label: self._on_video_protocol_selected(idx, lbl))
         live_capture_layout.addWidget(self._video_protocol_btn)
+
+        # Daten-Anzeige Pause/Fortsetzen Button
+        self._packet_display_btn = QPushButton("▶ Daten")
+        self._packet_display_btn.setCheckable(True)
+        self._packet_display_btn.setChecked(False)  # Standard: pausiert
+        self._packet_display_btn.setToolTip("Paketanzeige starten/stoppen (spart CPU/RAM)")
+        self._packet_display_btn.setStyleSheet(
+            "QPushButton { background-color: #757575; color: white; padding: 3px 8px; }"
+            "QPushButton:checked { background-color: #2E7D32; color: white; font-weight: bold; }"
+        )
+        self._packet_display_btn.toggled.connect(self._toggle_packet_display)
+        live_capture_layout.addWidget(self._packet_display_btn)
 
         # Trennlinie
         sep2 = QFrame()
@@ -4922,6 +4935,7 @@ class WiresharkPanel(QWidget):
         self._net_speed_content_layout.addLayout(self._net_speed_iface_container)
 
         net_speed_main_layout.addWidget(self._net_speed_content)
+        net_speed_main_layout.addStretch(1)
 
         self._net_speed_expanded = True
         self._net_speed_labels: Dict[str, Tuple[QLabel, QLabel, QLabel]] = {}
@@ -6715,7 +6729,7 @@ class WiresharkPanel(QWidget):
         self.open_btn.setEnabled(False)  # PCAP-Öffnen deaktivieren im Live-Modus
         self.net_speed_widget.show()
         self._counter_widget.show()
-        self._top_splitter.setSizes([220, 220, 560])
+        self._top_splitter.setSizes([220, 400, 400])
         self._prev_net_stats = self._read_net_dev()
         self._net_speed_timer.start(1000)
 
@@ -7996,8 +8010,18 @@ class WiresharkPanel(QWidget):
                 "color: #2E7D32; font-weight: bold;" if self._detection_active else ""
             ))
 
+    def _toggle_packet_display(self, checked: bool):
+        """Paketanzeige ein-/ausschalten."""
+        self._packet_display_paused = not checked
+        if checked:
+            self._packet_display_btn.setText("⏸ Daten")
+        else:
+            self._packet_display_btn.setText("▶ Daten")
+
     def _add_packet_to_table(self, pkt, index: int):
         """Fügt ein einzelnes Paket zur Tabelle hinzu (für Live-Capture Performance)."""
+        if self._packet_display_paused:
+            return
         # Zeit (relative Zeit seit erstem Paket)
         zeit = ""
         if hasattr(pkt, 'time'):
@@ -8302,7 +8326,7 @@ class WiresharkPanel(QWidget):
                 if hasattr(self, '_cm_pause'):
                     self._cm_pause.set()
                 self._counter_stop_btn.setText("▶ Counter fortsetzen")
-                for _hdr, val in self._counter_labels.values():
+                for *_, val in [v[:2] for v in self._counter_labels.values()]:
                     val.setText("—  (pausiert)")
                 self._counter_since_label.setText("Counter Monitor pausiert")
                 # Jitter-Log Marker
@@ -8362,8 +8386,27 @@ class WiresharkPanel(QWidget):
                 except (IndexError, Exception):
                     snap[widx] = (0, 0, 0)
             self._inline_counter_snapshot = snap
-        for _hdr, val in self._counter_labels.values():
-            val.setText("—  (zurückgesetzt)")
+        # Gap-Dateien loeschen (sonst bleiben alte Daten nach Reset)
+        n_w = getattr(self, '_inline_counter_workers', 0)
+        for _widx in range(n_w):
+            _gpath = f'/tmp/plp_gaps_w{_widx}.dat'
+            try:
+                import os
+                os.remove(_gpath)
+            except OSError:
+                pass
+        for entry in self._counter_labels.values():
+            entry[1].setText("—  (zurückgesetzt)")
+            # OOO Label zuruecksetzen
+            if len(entry) > 2:
+                entry[2].setText(
+                    '<span style="color:#2e7d32">'
+                    'Out-of-Order: 0</span>')
+            # Gap Label zuruecksetzen
+            if len(entry) > 3:
+                entry[3].setText("")
+                entry[3].hide()
+        self._counter_gap_label.hide()
         self._cm_start_time = time.time()
         self._counter_since_label.setText(
             f"Seit: {time.strftime('%H:%M:%S')}")
@@ -8481,10 +8524,23 @@ class WiresharkPanel(QWidget):
                 val.setTextFormat(Qt.TextFormat.RichText)
                 val.setStyleSheet("padding-left: 4px;")
                 row.addWidget(val)
+                ooo = QLabel("")
+                ooo.setFont(QFont("Consolas", 9))
+                ooo.setWordWrap(True)
+                ooo.setTextFormat(Qt.TextFormat.RichText)
+                ooo.setStyleSheet("padding-left: 4px;")
+                row.addWidget(ooo)
+                gap = QLabel("")
+                gap.setFont(QFont("Consolas", 9))
+                gap.setWordWrap(True)
+                gap.setTextFormat(Qt.TextFormat.RichText)
+                gap.setStyleSheet("padding-left: 4px;")
+                gap.hide()
+                row.addWidget(gap)
                 self._counter_iface_container.addLayout(row)
-                self._counter_labels[iface] = (hdr, val)
+                self._counter_labels[iface] = (hdr, val, ooo, gap)
 
-            hdr, val = self._counter_labels[iface]
+            hdr, val = self._counter_labels[iface][:2]
 
             # Header mit erkannten Stream-IDs aktualisieren
             if streams:
@@ -8505,39 +8561,70 @@ class WiresharkPanel(QWidget):
 
         self._counter_since_label.setText(f"Seit: {since_str}")
 
+    def _get_iface_stream_label(self, widx, ifaces, workers_per_iface):
+        """Gibt Stream-ID-Label fuer einen Worker-Index zurueck (z.B. '0x64')."""
+        iface_idx = widx // workers_per_iface
+        if iface_idx < len(ifaces):
+            iface = ifaces[iface_idx]
+            if iface in self._counter_labels:
+                hdr = self._counter_labels[iface][0]
+                txt = hdr.text()  # z.B. "eno8np3 (0x64):"
+                start = txt.find('(')
+                end = txt.find(')')
+                if start != -1 and end != -1:
+                    return txt[start + 1:end]
+            return iface
+        return f"w{widx}"
+
     def _poll_gap_files(self):
-        """Liest Gap-Analyse-Dateien der Worker und zeigt Details an."""
+        """Liest Gap-Analyse-Dateien der Worker und zeigt Details an (per Interface)."""
         n_workers = getattr(self, '_inline_counter_workers', 0)
         if n_workers == 0:
             return
-        all_gaps = []       # (worker, prev, curr, n_miss)
-        all_buckets = {}    # bucket_idx → total_count
-        total_det = 0
+        ifaces = getattr(self, '_inline_counter_ifaces', [])
+        WORKERS_PER_IFACE = 2
         has_data = False
 
+        # Per-Interface Datenstrukturen
+        gaps_per_iface = {}
+        buckets_per_iface = {}
+        det_per_iface = {}
+        ooo_per_iface = {}
+        ooo_events = {}
+
         for widx in range(n_workers):
+            iface_idx = widx // WORKERS_PER_IFACE
+            iface_name = ifaces[iface_idx] if iface_idx < len(ifaces) else f"w{widx}"
+
             path = f'/tmp/plp_gaps_w{widx}.dat'
             try:
                 with open(path, 'r') as f:
-                    lines = f.readlines()
+                    file_lines = f.readlines()
             except (FileNotFoundError, OSError):
                 continue
             section = 'meta'
-            for line in lines:
+            for line in file_lines:
                 line = line.strip()
                 if not line:
                     continue
                 if line == '---':
                     section = 'buckets'
                     continue
+                if line == '===':
+                    section = 'ooo'
+                    continue
                 if line.startswith('S:'):
-                    # S:step=1,T:123
                     parts = line.split(',')
                     for p in parts:
                         if p.startswith('T:'):
                             try:
-                                total_det += int(p[2:])
+                                det_per_iface[iface_name] = det_per_iface.get(iface_name, 0) + int(p[2:])
                             except ValueError:
+                                pass
+                        if p.startswith('O:'):
+                            try:
+                                ooo_per_iface[iface_name] = ooo_per_iface.get(iface_name, 0) + int(p[2:])
+                            except (ValueError, IndexError):
                                 pass
                     has_data = True
                 elif line.startswith('G:') and section != 'buckets':
@@ -8546,7 +8633,7 @@ class WiresharkPanel(QWidget):
                         prev = int(parts[0])
                         curr = int(parts[1])
                         nmiss = int(parts[2])
-                        all_gaps.append((widx, prev, curr, nmiss))
+                        gaps_per_iface.setdefault(iface_name, []).append((prev, curr, nmiss))
                     except (ValueError, IndexError):
                         pass
                 elif line.startswith('B:'):
@@ -8554,68 +8641,124 @@ class WiresharkPanel(QWidget):
                         parts = line[2:].split(',')
                         bi = int(parts[0])
                         cnt = int(parts[1])
-                        all_buckets[bi] = (
-                            all_buckets.get(bi, 0) + cnt)
+                        bkt = buckets_per_iface.setdefault(iface_name, {})
+                        bkt[bi] = bkt.get(bi, 0) + cnt
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith('OOO:'):
+                    try:
+                        parts = line[4:].split(',')
+                        prev = int(parts[0])
+                        curr = int(parts[1])
+                        ooo_events.setdefault(iface_name, []).append((prev, curr))
                     except (ValueError, IndexError):
                         pass
 
         if not has_data:
             self._counter_gap_label.hide()
+            for iface_name in ifaces:
+                if iface_name in self._counter_labels and len(self._counter_labels[iface_name]) > 3:
+                    self._counter_labels[iface_name][3].hide()
             return
 
-        # ── Anzeige aufbauen ──
-        html_parts = []
-        html_parts.append(
-            '<b style="color:#888">Gap-Analyse '
-            '(Einzelkamera):</b><br>')
-        html_parts.append(
-            f'Fehlende Counter gesamt: '
-            f'<b>{total_det}</b><br>')
+        # OOO per Interface Label aktualisieren
+        for iface_name in (ifaces if ifaces else list(ooo_per_iface.keys())):
+            if iface_name not in self._counter_labels:
+                continue
+            entry = self._counter_labels[iface_name]
+            ooo_label = entry[2] if len(entry) > 2 else None
+            if ooo_label is None:
+                continue
+            ooo_count = ooo_per_iface.get(iface_name, 0)
+            if ooo_count == 0:
+                ooo_label.setText(
+                    '<span style="color:#2e7d32">'
+                    'Out-of-Order: 0</span>')
+            else:
+                ooo_parts = [
+                    f'<b style="color:#d32f2f">'
+                    f'Out-of-Order: {ooo_count}</b>']
+                for prev, curr in reversed(ooo_events.get(iface_name, [])[-5:]):
+                    ooo_parts.append(
+                        f'<br>&nbsp;&nbsp;{prev}\u2192{curr} '
+                        f'<span style="color:#d32f2f">'
+                        f'(R\u00fcckw\u00e4rts)</span>')
+                ooo_label.setText(''.join(ooo_parts))
 
-        # Letzte 10 Gaps
-        recent = all_gaps[-10:]
-        if recent:
-            html_parts.append(
-                '<span style="color:#888">'
-                'Letzte Lücken:</span><br>')
-            for widx, prev, curr, nmiss in reversed(recent):
-                # Fehlende Counter aufzaehlen (max 8)
-                miss_start = (prev + 1) & 0xFFFF
-                if nmiss <= 8:
-                    miss_vals = ", ".join(
-                        str((miss_start + i) & 0xFFFF)
-                        for i in range(nmiss))
-                else:
-                    miss_vals = (
-                        ", ".join(
+        # Gap-Analyse per Interface Label aktualisieren
+        for iface_name in ifaces:
+            if iface_name not in self._counter_labels:
+                continue
+            entry = self._counter_labels[iface_name]
+            gap_label = entry[3] if len(entry) > 3 else None
+            if gap_label is None:
+                continue
+
+            iface_det = det_per_iface.get(iface_name, 0)
+            iface_gaps = gaps_per_iface.get(iface_name, [])
+            iface_bkt = buckets_per_iface.get(iface_name, {})
+            # Stream-ID Label fuer diese Interface bestimmen
+            if iface_name in self._counter_labels:
+                _hdr_txt = self._counter_labels[iface_name][0].text()
+                _s = _hdr_txt.find('(')
+                _e = _hdr_txt.find(')')
+                iface_stream = _hdr_txt[_s+1:_e] if _s != -1 and _e != -1 else iface_name
+            else:
+                iface_stream = iface_name
+
+            if iface_det == 0 and not iface_gaps:
+                gap_label.hide()
+                continue
+
+            html = []
+            html.append(
+                f'Fehlende Counter gesamt: '
+                f'<b>{iface_det}</b><br>')
+
+            recent = iface_gaps[-8:]
+            if recent:
+                html.append(
+                    '<span style="color:#888">'
+                    'Letzte L\u00fccken:</span><br>')
+                for prev, curr, nmiss in reversed(recent):
+                    miss_start = (prev + 1) & 0xFFFF
+                    if nmiss <= 8:
+                        miss_vals = ", ".join(
                             str((miss_start + i) & 0xFFFF)
-                            for i in range(4))
-                        + f" ... "
-                        + ", ".join(
-                            str((miss_start + nmiss - 2 + i)
-                                & 0xFFFF)
-                            for i in range(2)))
-                html_parts.append(
-                    f'&nbsp;&nbsp;w{widx}: '
-                    f'{prev}→{curr} '
-                    f'<span style="color:#d32f2f">'
-                    f'fehlt [{miss_vals}]</span> '
-                    f'({nmiss})<br>')
+                            for i in range(nmiss))
+                    else:
+                        miss_vals = (
+                            ", ".join(
+                                str((miss_start + i) & 0xFFFF)
+                                for i in range(4))
+                            + " ... "
+                            + ", ".join(
+                                str((miss_start + nmiss - 2 + i)
+                                    & 0xFFFF)
+                                for i in range(2)))
+                    html.append(
+                        f'&nbsp;&nbsp;{iface_stream}: {prev}\u2192{curr} '
+                        f'<span style="color:#d32f2f">'
+                        f'fehlt [{miss_vals}]</span> '
+                        f'({nmiss})<br>')
 
-        # Top-5 Bereiche
-        if all_buckets:
-            top = sorted(all_buckets.items(),
-                         key=lambda x: -x[1])[:5]
-            html_parts.append(
-                '<span style="color:#888">'
-                'Häufigste Bereiche:</span><br>')
-            for bi, cnt in top:
-                r_start = bi * 256
-                r_end = r_start + 255
-                html_parts.append(
-                    f'&nbsp;&nbsp;Counter '
-                    f'{r_start}-{r_end}: '
-                    f'<b>{cnt}</b>×<br>')
+            if iface_bkt:
+                top = sorted(iface_bkt.items(),
+                             key=lambda x: -x[1])[:5]
+                html.append(
+                    '<span style="color:#888">'
+                    'H\u00e4ufigste Bereiche:</span><br>')
+                for bi, cnt in top:
+                    r_start = bi * 256
+                    r_end = r_start + 255
+                    html.append(
+                        f'&nbsp;&nbsp;Counter '
+                        f'{r_start}-{r_end}: '
+                        f'<b>{cnt}</b>\u00d7<br>')
 
-        self._counter_gap_label.setText("".join(html_parts))
-        self._counter_gap_label.show()
+            gap_label.setText(''.join(html))
+            gap_label.show()
+
+        # Globales gap_label nicht mehr benoetigt
+        self._counter_gap_label.hide()
+
