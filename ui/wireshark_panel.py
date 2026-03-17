@@ -5300,19 +5300,69 @@ class WiresharkPanel(QWidget):
         self._video_container.setMinimumWidth(300)
         video_layout = QVBoxLayout(self._video_container)
         video_layout.setContentsMargins(0, 0, 0, 0)
-        video_layout.setSpacing(2)
+        video_layout.setSpacing(0)
 
-        # Video-Header-Zeile
-        video_header = QHBoxLayout()
-        video_header.setContentsMargins(4, 2, 4, 2)
+        # ── Tab-Leiste: Live Video | Live CAN | Live LIN | Live Eth | Live FlexRay ──
+        tab_bar_widget = QWidget()
+        tab_bar_widget.setStyleSheet('background-color: #1a1a2e;')
+        tab_bar_layout = QHBoxLayout(tab_bar_widget)
+        tab_bar_layout.setContentsMargins(4, 2, 4, 0)
+        tab_bar_layout.setSpacing(2)
+
+        _TAB_STYLE_INACTIVE = (
+            'QPushButton { background: #2a2a3e; color: #8888aa;'
+            '  border: 1px solid #3a3a5e; border-bottom: none;'
+            '  border-radius: 4px 4px 0 0; padding: 4px 12px; font-size: 11px; }'
+            'QPushButton:hover { background: #3a3a5e; color: #bbbbdd; }'
+        )
+        _TAB_STYLE_ACTIVE = (
+            'QPushButton { background: #0d47a1; color: #ffffff;'
+            '  border: 1px solid #1565c0; border-bottom: none;'
+            '  border-radius: 4px 4px 0 0; padding: 4px 12px;'
+            '  font-size: 11px; font-weight: bold; }'
+        )
+
+        self._live_tab_buttons: List[QPushButton] = []
+        self._live_tab_active_style = _TAB_STYLE_ACTIVE
+        self._live_tab_inactive_style = _TAB_STYLE_INACTIVE
+        _tab_defs = [
+            ('🎬 Live Video', '#1976D2'),
+            ('🚗 Live CAN', '#4CAF50'),
+            ('🔗 Live LIN', '#FF9800'),
+            ('🌐 Live Eth', '#9C27B0'),
+            ('⚡ Live FlexRay', '#F44336'),
+        ]
+        for i, (label, _color) in enumerate(_tab_defs):
+            btn = QPushButton(label)
+            btn.setStyleSheet(_TAB_STYLE_ACTIVE if i == 0 else _TAB_STYLE_INACTIVE)
+            btn.clicked.connect(lambda checked, idx=i: self._switch_live_tab(idx))
+            tab_bar_layout.addWidget(btn)
+            self._live_tab_buttons.append(btn)
+
+        tab_bar_layout.addStretch()
+        video_layout.addWidget(tab_bar_widget)
+
+        # ── Toolbar-Stack: jeder Tab hat seine eigene Toolbar ──
+        self._live_toolbar_stack = QStackedWidget()
+        self._live_toolbar_stack.setFixedHeight(30)
+
+        # --- Toolbar 0: Live Video ---
+        video_toolbar = QWidget()
+        video_toolbar.setStyleSheet(
+            'QWidget { background-color: #1a1a2e; }'
+            'QLabel { color: #bbbbdd; background: transparent; border: none; }')
+        video_header = QHBoxLayout(video_toolbar)
+        video_header.setContentsMargins(4, 0, 4, 2)
+        video_header.setSpacing(4)
+
         self._video_info_label = QLabel("🎬 Live Video")
         self._video_info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self._video_info_label.setFont(QFont("Consolas", 9))
-        self._video_info_label.setStyleSheet("color: #1976D2; font-weight: bold;")
+        self._video_info_label.setStyleSheet("color: #1976D2; font-weight: bold; background: transparent;")
         video_header.addWidget(self._video_info_label)
         video_header.addStretch()
 
-        self._video_stream_count = 0  # Wird automatisch durch erkannte Streams gesetzt
+        self._video_stream_count = 0
 
         self._video_pause_btn = QPushButton("⏸ Pause")
         self._video_pause_btn.setCheckable(True)
@@ -5325,7 +5375,6 @@ class WiresharkPanel(QWidget):
         self._video_snapshot_btn.clicked.connect(self._save_video_snapshot)
         video_header.addWidget(self._video_snapshot_btn)
 
-        # --- Objekt-Erkennung UI ---
         _vsep = QFrame()
         _vsep.setFrameShape(QFrame.Shape.VLine)
         _vsep.setFrameShadow(QFrame.Shadow.Sunken)
@@ -5369,17 +5418,58 @@ class WiresharkPanel(QWidget):
         self._detect_status_label.setMinimumWidth(60)
         video_header.addWidget(self._detect_status_label)
 
-        video_layout.addLayout(video_header)
+        self._live_toolbar_stack.addWidget(video_toolbar)  # Index 0
 
-        # Video-Grid (bis zu 4 Panels, jeweils Stream-ID-Label + QLabel)
+        # --- Toolbars 1-4: Bus-Ansichten (CAN, LIN, Eth, FlexRay) ---
+        _bus_defs = [
+            ('CAN', '#4CAF50', '🚗'),
+            ('LIN', '#FF9800', '🔗'),
+            ('Ethernet', '#9C27B0', '🌐'),
+            ('FlexRay', '#F44336', '⚡'),
+        ]
+        self._bus_pause_btns: List[QPushButton] = []
+        for bus_name, bus_color, bus_icon in _bus_defs:
+            bus_tb = QWidget()
+            bus_tb.setStyleSheet(
+                'QWidget { background-color: #1a1a2e; }'
+                'QLabel { color: #bbbbdd; background: transparent; border: none; }')
+            bus_h = QHBoxLayout(bus_tb)
+            bus_h.setContentsMargins(4, 0, 4, 2)
+            bus_h.setSpacing(4)
+
+            bus_lbl = QLabel(f"{bus_icon} Live {bus_name}")
+            bus_lbl.setFont(QFont("Consolas", 9))
+            bus_lbl.setStyleSheet(
+                f"color: {bus_color}; font-weight: bold; background: transparent;")
+            bus_h.addWidget(bus_lbl)
+            bus_h.addStretch()
+
+            bus_pause = QPushButton("⏸ Pause")
+            bus_pause.setCheckable(True)
+            bus_pause.setFixedWidth(100)
+            bus_pause.setStyleSheet(
+                "QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;"
+                "  border-radius: 3px; padding: 3px 8px; }"
+                "QPushButton:checked { background: #2E7D32; color: white; font-weight: bold; }")
+            self._bus_pause_btns.append(bus_pause)
+            bus_h.addWidget(bus_pause)
+
+            self._live_toolbar_stack.addWidget(bus_tb)  # Index 1-4
+
+        video_layout.addWidget(self._live_toolbar_stack)
+
+        # ── Content-Stack: jeder Tab hat seinen eigenen Inhaltsbereich ──
+        self._live_content_stack = QStackedWidget()
+
+        # --- Page 0: Live Video (Video-Grid) ---
         self._video_grid_widget = QWidget()
         self._video_grid_layout = QGridLayout(self._video_grid_widget)
         self._video_grid_layout.setContentsMargins(0, 0, 0, 0)
         self._video_grid_layout.setSpacing(2)
 
-        self._video_displays: list = []       # QLabel für Video-Bild
-        self._video_id_labels: list = []      # QLabel für Stream-ID
-        self._video_panels: list = []         # Container-Widget pro Panel
+        self._video_displays: list = []
+        self._video_id_labels: list = []
+        self._video_panels: list = []
         for _i in range(4):
             panel = QWidget()
             panel_layout = QVBoxLayout(panel)
@@ -5391,16 +5481,14 @@ class WiresharkPanel(QWidget):
             id_lbl.setFixedHeight(20)
             id_lbl.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
             id_lbl.setStyleSheet(
-                "background-color: #1a1a2e; color: #4FC3F7; padding: 2px;"
-            )
+                "background-color: #1a1a2e; color: #4FC3F7; padding: 2px;")
             panel_layout.addWidget(id_lbl)
 
             vid_lbl = QLabel()
             vid_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             vid_lbl.setMinimumHeight(100)
             vid_lbl.setStyleSheet(
-                "background-color: #000000; color: #555555; font-size: 14px;"
-            )
+                "background-color: #000000; color: #555555; font-size: 14px;")
             vid_lbl.setFont(QFont("Consolas", 12))
             panel_layout.addWidget(vid_lbl, 1)
 
@@ -5409,15 +5497,48 @@ class WiresharkPanel(QWidget):
             self._video_id_labels.append(id_lbl)
             self._video_panels.append(panel)
 
-        # Initial: 1 Panel mit Platzhalter sichtbar
         self._video_panels[0].setVisible(True)
         self._video_displays[0].setText("Kein Video-Signal")
-
-        # Rückwärtskompatibilität: _video_display zeigt auf erstes Panel
         self._video_display = self._video_displays[0]
 
         self._video_grid_layout.addWidget(self._video_panels[0], 0, 0, 2, 2)
-        video_layout.addWidget(self._video_grid_widget, 1)
+        self._live_content_stack.addWidget(self._video_grid_widget)  # Index 0
+
+        # --- Pages 1-4: Bus-Ansichten (CAN, LIN, Eth, FlexRay) ---
+        self._bus_tables: List[QTableWidget] = []
+        _bus_columns = {
+            'CAN':      ['Zeit', 'Kanal', 'ID', 'Name', 'DLC', 'Daten', 'Info'],
+            'LIN':      ['Zeit', 'Kanal', 'ID', 'Name', 'DLC', 'Daten', 'Prüfsumme'],
+            'Ethernet': ['Zeit', 'Src MAC', 'Dst MAC', 'EtherType', 'Protokoll', 'Länge', 'Info'],
+            'FlexRay':  ['Zeit', 'Kanal', 'Slot', 'Zyklus', 'DLC', 'Daten', 'Info'],
+        }
+        for bus_name, _color, _icon in _bus_defs:
+            bus_table = QTableWidget()
+            bus_table.setColumnCount(7)
+            bus_table.setHorizontalHeaderLabels(_bus_columns[bus_name])
+            bus_table.setAlternatingRowColors(True)
+            bus_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            bus_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            bus_table.setFont(QFont("Consolas", 9))
+            bus_table.setStyleSheet(
+                "QTableWidget { background-color: #0a0a1a; color: #e0e0e0;"
+                "  gridline-color: #2a2a3e; }"
+                "QTableWidget::item:selected { background-color: #1565c0; }"
+                "QHeaderView::section { background: #1a1a2e; color: #8888aa;"
+                "  border: 1px solid #2a2a3e; padding: 3px; font-weight: bold; }")
+            header = bus_table.horizontalHeader()
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            for col in range(1, 6):
+                header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+            header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+            bus_table.verticalHeader().setVisible(False)
+            bus_table.verticalHeader().setDefaultSectionSize(22)
+
+            self._bus_tables.append(bus_table)
+            self._live_content_stack.addWidget(bus_table)  # Index 1-4
+
+        self._current_live_tab = 0
+        video_layout.addWidget(self._live_content_stack, 1)
 
         # Video-Container initial sichtbar (schwarzer Hintergrund)
 
@@ -9798,4 +9919,24 @@ class WiresharkPanel(QWidget):
             self._logger_status_label.setText('')
             self._logger_status_label.setStyleSheet(
                 'font-size: 11px; color: #666;')
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Live-Tab Umschaltung (Video / CAN / LIN / Eth / FlexRay)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _switch_live_tab(self, index: int):
+        """Wechselt zwischen Live-Ansichten (Video, CAN, LIN, Eth, FlexRay)."""
+        if index == self._current_live_tab:
+            return
+        self._current_live_tab = index
+
+        # Tab-Buttons aktualisieren
+        for i, btn in enumerate(self._live_tab_buttons):
+            btn.setStyleSheet(
+                self._live_tab_active_style if i == index
+                else self._live_tab_inactive_style)
+
+        # Toolbar + Content umschalten
+        self._live_toolbar_stack.setCurrentIndex(index)
+        self._live_content_stack.setCurrentIndex(index)
 
