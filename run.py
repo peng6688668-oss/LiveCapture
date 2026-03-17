@@ -12,6 +12,16 @@ from core.platform import setup_qt_platform
 # Qt-Plattform initialisieren BEVOR QApplication erstellt wird
 setup_qt_platform()
 
+# WebEngine MUSS vor QApplication importiert werden (Qt-Requirement)
+# Chromium verlangt --no-sandbox wenn als root (sudo) gestartet
+import os
+if os.geteuid() == 0:
+    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--no-sandbox'
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
+except ImportError:
+    pass
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QColor, QIcon, QImage, QPixmap
 from PyQt6.QtWidgets import (

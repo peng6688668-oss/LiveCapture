@@ -382,6 +382,7 @@ class CaptureWorker(multiprocessing.Process):
         _diag_time = time.monotonic()
         _diag_pkts = 0
         _diag_blocks = 0
+        _tp_drops_cumulative = 0  # NIC/Kernel Drops (kumulativ)
 
         # ── PLP Counter 连续性检查 (内联, 零开销) ──
         # PLP Counter 是 16-bit Probe 全局递增 (非 per-stream)。
@@ -460,6 +461,7 @@ class CaptureWorker(multiprocessing.Process):
                             SOL_PACKET, PACKET_STATISTICS, 12)
                         tp_pkts, tp_drops = struct.unpack('II',
                                                           stats_raw[:8])
+                        _tp_drops_cumulative = tp_drops
                         sid = state.get('active_stream', 0)
                         self._log(
                             f"[STATS] S0x{sid:04x} "
@@ -477,7 +479,7 @@ class CaptureWorker(multiprocessing.Process):
                 if _ct_active and now - _ct_last_write >= 1.0:
                     _ct_last_write = now
                     widx = getattr(self, 'worker_index', 0)
-                    _CT_FIELDS = 12
+                    _CT_FIELDS = 13
                     base = widx * _CT_FIELDS
                     try:
                         _ct_stats[base + 0] = _ct_total
@@ -488,6 +490,7 @@ class CaptureWorker(multiprocessing.Process):
                             _ct_stats[base + 3 + si] = (
                                 sids[si] if si < len(sids) else 0)
                         _ct_stats[base + 11] = int(now)
+                        _ct_stats[base + 12] = _tp_drops_cumulative
                     except (IndexError, Exception):
                         pass
                     # ── 诊断: Counter 状态日志 ──

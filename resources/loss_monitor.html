@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #ffffff; color: #333;
+  font-family: Consolas, 'Courier New', monospace; font-size: 12px;
+  overflow-y: auto; overflow-x: hidden;
+}
+#chart { width: 100%; height: 140px; }
+.sec { padding: 2px 6px 4px; }
+/* 接口标题行: 名称 + 吞吐量 */
+.iface-header {
+  display: flex; align-items: baseline; gap: 6px;
+  padding: 3px 0 1px; border-bottom: 1px solid #e0e0e0;
+}
+.iface-name { color: #1565c0; font-weight: bold; }
+.iface-throughput { color: #607d8b; font-size: 12px; margin-left: auto; }
+/* 丢包指标行 */
+.row {
+  display: flex; align-items: center; gap: 4px;
+  padding: 1px 0; padding-left: 8px;
+}
+.dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.dot.ok { background: #4CAF50; } .dot.warn { background: #FF9800; } .dot.err { background: #F44336; }
+.lbl { color: #666; white-space: nowrap; font-size: 12px; min-width: 85px; }
+.val { font-weight: bold; font-size: 12px; }
+.val.ok { color: #2e7d32; } .val.warn { color: #e65100; } .val.err { color: #c62828; }
+.note { color: #999; font-size: 11px; margin-left: 4px; }
+.sum { color: #888; font-size: 11px; margin-left: auto; text-align: right; min-width: 55px; }
+.sep { height: 1px; background: #ccc; margin: 3px 0; }
+.totals { padding: 3px 6px; }
+.total-row { display: flex; align-items: center; gap: 4px; padding: 1px 0; }
+.total-lbl { color: #555; flex: 1; }
+.total-val { font-weight: bold; font-size: 13px; }
+.total-val.ok { color: #2e7d32; } .total-val.err { color: #c62828; }
+.config { color: #999; font-size: 11px; padding: 2px 6px; text-align: center; border-top: 1px solid #e8e8e8; }
+</style>
+</head>
+<body>
+
+<div id="chart"></div>
+
+<div id="iface_container"></div>
+
+<div class="sep"></div>
+<div class="totals">
+  <div class="total-row">
+    <span class="total-lbl" style="color:#1565c0;">Σ Paketrate (alle Interfaces)</span>
+    <span class="total-val" id="v_total_rate" style="color:#1565c0;">—</span>
+  </div>
+</div>
+<div class="config" id="cfg">—</div>
+
+<script src="echarts.min.js"></script>
+<script>
+var MAX_POINTS = 120;
+var chart = null;
+var xData = [], nicData = [], kernData = [], plpData = [];
+for (var i = 0; i < MAX_POINTS; i++) { xData.push(''); nicData.push(0); kernData.push(0); plpData.push(0); }
+
+function initChart() {
+  if (typeof echarts === 'undefined') { setTimeout(initChart, 200); return; }
+  chart = echarts.init(document.getElementById('chart'), null, { renderer: 'canvas' });
+  chart.setOption({
+    animation: false,
+    grid: { top: 18, right: 6, bottom: 16, left: 32 },
+    tooltip: {
+      trigger: 'axis', backgroundColor: 'rgba(255,255,255,0.95)', borderColor: '#ccc',
+      textStyle: { color: '#333', fontSize: 11 }
+    },
+    legend: {
+      top: 0, right: 0, textStyle: { color: '#555', fontSize: 10 },
+      itemWidth: 10, itemHeight: 6,
+      data: ['NIC', 'Kern', 'PLP']
+    },
+    xAxis: {
+      type: 'category', data: xData, boundaryGap: false,
+      axisLine: { lineStyle: { color: '#bbb' } }, axisLabel: { show: false }, axisTick: { show: false }
+    },
+    yAxis: {
+      type: 'value', min: 0,
+      splitLine: { lineStyle: { color: '#eee' } },
+      axisLine: { lineStyle: { color: '#bbb' } },
+      axisLabel: { color: '#888', fontSize: 10 }
+    },
+    series: [
+      { name: 'NIC', type: 'line', data: nicData, symbol: 'none',
+        lineStyle: { width: 1.5, color: '#e53935' }, areaStyle: { color: 'rgba(229,57,53,0.08)' } },
+      { name: 'Kern', type: 'line', data: kernData, symbol: 'none',
+        lineStyle: { width: 1.5, color: '#fb8c00' }, areaStyle: { color: 'rgba(251,140,0,0.08)' } },
+      { name: 'PLP', type: 'line', data: plpData, symbol: 'none',
+        lineStyle: { width: 1.5, color: '#1e88e5' }, areaStyle: { color: 'rgba(30,136,229,0.08)' } }
+    ]
+  });
+  window.addEventListener('resize', function() { chart && chart.resize(); });
+}
+
+function fmtRate(pps) {
+  if (pps >= 1000000) return (pps/1000000).toFixed(1) + 'M pkt/s';
+  if (pps >= 1000) return (pps/1000).toFixed(1) + 'k pkt/s';
+  return pps + ' pkt/s';
+}
+
+function fmtNum(n) {
+  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+  if (n >= 10000) return (n/1000).toFixed(1) + 'k';
+  return '' + n;
+}
+
+function fmtBytes(b) {
+  if (b >= 1e9) return (b/1e9).toFixed(1) + ' GB/s';
+  if (b >= 1e6) return (b/1e6).toFixed(1) + ' MB/s';
+  if (b >= 1e3) return (b/1e3).toFixed(1) + ' KB/s';
+  return b + ' B/s';
+}
+
+function setDotVal(dotId, valId, val) {
+  var d = document.getElementById(dotId);
+  var v = document.getElementById(valId);
+  if (!d || !v) return;
+  v.textContent = val;
+  var cls = (val === 0 || val === '0') ? 'ok' : 'err';
+  d.className = 'dot ' + cls;
+  v.className = v.className.replace(/ok|warn|err/g, '').trim() + ' ' + cls;
+}
+
+// 动态创建 per-interface 区块
+var _iface_elems = {};
+function ensureIface(name) {
+  if (_iface_elems[name]) return;
+  var c = document.getElementById('iface_container');
+  var html =
+    '<div class="sec" id="sec_'+name+'">' +
+    // 标题行: 接口名 + 吞吐量（右对齐）
+    '<div class="iface-header">' +
+      '<span class="iface-name">'+name+'</span>' +
+      '<span class="iface-throughput" id="r_tp_'+name+'">— pkt/s | — MB/s</span>' +
+    '</div>' +
+    // 丢包指标: 指示灯 + 标签 + delta/2s + Σ累积
+    '<div class="row">' +
+      '<span class="dot ok" id="d_missed_'+name+'"></span>' +
+      '<span class="lbl">NIC rx_missed</span>' +
+      '<span class="val ok" id="v_missed_'+name+'">0</span>' +
+      '<span class="note">/2s</span>' +
+      '<span class="sum" id="s_missed_'+name+'">Σ 0</span>' +
+    '</div>' +
+    '<div class="row">' +
+      '<span class="dot ok" id="d_dropped_'+name+'"></span>' +
+      '<span class="lbl">Socket drops</span>' +
+      '<span class="val ok" id="v_dropped_'+name+'">0</span>' +
+      '<span class="note">/2s</span>' +
+      '<span class="sum" id="s_dropped_'+name+'">Σ 0</span>' +
+    '</div>' +
+    '<div class="row">' +
+      '<span class="dot ok" id="d_errors_'+name+'"></span>' +
+      '<span class="lbl">RX errors</span>' +
+      '<span class="val ok" id="v_errors_'+name+'">0</span>' +
+      '<span class="note">/2s</span>' +
+      '<span class="sum" id="s_errors_'+name+'">Σ 0</span>' +
+    '</div>' +
+    '</div>';
+  c.insertAdjacentHTML('beforeend', html);
+  _iface_elems[name] = true;
+}
+
+/**
+ * 由 Python 每 2 秒调用一次。
+ */
+window.pushData = function(json_str) {
+  var d;
+  try { d = JSON.parse(json_str); } catch(e) { return; }
+
+  var now = new Date();
+  var ts = ('0'+now.getHours()).slice(-2)+':'+('0'+now.getMinutes()).slice(-2)+':'+('0'+now.getSeconds()).slice(-2);
+  xData.push(ts);
+  nicData.push(d.nic_total || 0);
+  kernData.push(d.kern || 0);
+  plpData.push(d.plp || 0);
+  if (xData.length > MAX_POINTS) { xData.shift(); nicData.shift(); kernData.shift(); plpData.shift(); }
+  if (chart) {
+    chart.setOption({ xAxis: { data: xData }, series: [{ data: nicData }, { data: kernData }, { data: plpData }] });
+  }
+
+  // Per-interface 更新
+  var ifaces = d.ifaces || {};
+  for (var name in ifaces) {
+    ensureIface(name);
+    var s = ifaces[name];
+    // 丢包 delta + 累积
+    setDotVal('d_missed_'+name, 'v_missed_'+name, s.missed || 0);
+    setDotVal('d_dropped_'+name, 'v_dropped_'+name, s.dropped || 0);
+    setDotVal('d_errors_'+name, 'v_errors_'+name, s.errors || 0);
+    // Σ 累积值
+    var sm = document.getElementById('s_missed_'+name);
+    if (sm) sm.textContent = 'Σ ' + fmtNum(s.missed_sum || 0);
+    var sd = document.getElementById('s_dropped_'+name);
+    if (sd) sd.textContent = 'Σ ' + fmtNum(s.dropped_sum || 0);
+    var se = document.getElementById('s_errors_'+name);
+    var err_txt = 'Σ ' + fmtNum(s.errors_sum || 0);
+    if ((s.crc_sum || 0) > 0) err_txt += ' (CRC:' + s.crc_sum + ')';
+    if (se) se.textContent = err_txt;
+    // 吞吐量（在接口标题行右侧）
+    var tp = document.getElementById('r_tp_'+name);
+    if (tp) tp.textContent = fmtRate(s.pps || 0) + ' | ' + fmtBytes(s.bps || 0);
+  }
+
+  // Gesamt Paketrate
+  var tr = document.getElementById('v_total_rate');
+  if (tr) tr.textContent = fmtRate(d.total_pps || 0);
+};
+
+window.setConfig = function(text) {
+  var el = document.getElementById('cfg');
+  if (el) el.textContent = text;
+};
+
+window.resizeChart = function() { chart && chart.resize(); };
+
+initChart();
+</script>
+</body>
+</html>

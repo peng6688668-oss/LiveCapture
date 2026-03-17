@@ -41,6 +41,15 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtCore import QUrl
+    WEBENGINE_AVAILABLE = True
+except Exception as _we_err:
+    WEBENGINE_AVAILABLE = False
+    import logging as _welog
+    _welog.getLogger(__name__).warning("WebEngine import failed: %s", _we_err)
+
 
 # =============================================================================
 # PLP Counter Monitor — eigenstaendiger Prozess (kein GIL, eigener CPU-Kern)
@@ -62,12 +71,13 @@ _CM_LOST = 2
 _CM_STREAMS_START = 3  # stream_ids[0..7]
 
 # ── Inline Counter (in CaptureWorker, kein extra Socket) ──
-_ICT_FIELDS = 12  # total, gaps, lost, stream_id[0..7], timestamp
+_ICT_FIELDS = 13  # total, gaps, lost, stream_id[0..7], timestamp, kern_drops
 _ICT_TOTAL = 0
 _ICT_GAPS = 1
 _ICT_LOST = 2
 _ICT_STREAMS_START = 3  # stream_ids[0..7]
 _ICT_TIMESTAMP = 11
+_ICT_KERN_DROPS = 12
 
 
 def _counter_monitor_worker(interfaces, stats_arr, since_arr,
@@ -4670,6 +4680,125 @@ class _FrameDispatchThread(QThread):
             pass
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Logger-Fernsteuerung — Hilfsklassen (Ping + REST API Worker)
+# ═══════════════════════════════════════════════════════════════════════
+
+class _PingThread(QThread):
+    """Hintergrund-Thread für Ping-Prüfung mit Latenz-Messung."""
+
+    result = pyqtSignal(bool, str, float)  # (erreichbar, ip, latenz_ms)
+
+    def __init__(self, ip: str, parent=None):
+        super().__init__(parent)
+        self._ip = ip
+
+    def run(self):
+        import subprocess as _sp
+        import platform as _pf
+        import re as _re
+        param = '-n' if _pf.system().lower() == 'windows' else '-c'
+        try:
+            ret = _sp.run(
+                ['ping', param, '1', '-W', '2', self._ip],
+                capture_output=True, text=True, timeout=5,
+            )
+            if ret.returncode == 0:
+                m = _re.search(r'[Tt]ime?=(\d+\.?\d*)\s*ms', ret.stdout)
+                latency = float(m.group(1)) if m else 0.0
+                self.result.emit(True, self._ip, latency)
+            else:
+                self.result.emit(False, self._ip, 0.0)
+        except Exception:
+            self.result.emit(False, self._ip, 0.0)
+
+
+class _LoggerApiWorker(QThread):
+    """Hintergrund-Thread für REST API Kommunikation mit dem CCA Logger."""
+
+    data_loaded = pyqtSignal(dict)
+    action_done = pyqtSignal(str)
+    error = pyqtSignal(str)
+    auth_expired = pyqtSignal(str, str, dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._base_url = ''
+        self._access_token: Optional[str] = None
+        self._timeout = 5
+        self._lock = threading.Lock()
+        self._queue: list = []
+
+    def set_base_url(self, url: str):
+        self._base_url = url.rstrip('/')
+
+    def set_access_token(self, token: Optional[str]):
+        self._access_token = token
+
+    def _auth_headers(self) -> Dict[str, str]:
+        if self._access_token:
+            return {'Authorization': f'Bearer {self._access_token}'}
+        return {}
+
+    def _enqueue(self, task: str, endpoint: str, payload: Dict[str, Any]):
+        with self._lock:
+            if task == 'load':
+                self._queue = [
+                    (t, e, p) for t, e, p in self._queue if t != task
+                ]
+            self._queue.append((task, endpoint, payload))
+        if not self.isRunning():
+            self.start()
+
+    def load_properties(self, endpoint: str):
+        self._enqueue('load', endpoint, {})
+
+    def get_action(self, endpoint: str, action_name: str = ''):
+        self._enqueue('get_action', endpoint, {'action': action_name})
+
+    def run(self):
+        try:
+            import requests as req
+        except ImportError:
+            self.error.emit('Python-Paket "requests" nicht installiert.')
+            return
+
+        while True:
+            with self._lock:
+                if not self._queue:
+                    break
+                task, endpoint, payload = self._queue.pop(0)
+
+            url = f'{self._base_url}{endpoint}'
+            try:
+                hdrs = self._auth_headers()
+                if task == 'load':
+                    resp = req.get(url, headers=hdrs, timeout=self._timeout)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    self.data_loaded.emit(data if isinstance(data, dict) else {'_raw': data})
+                elif task == 'get_action':
+                    resp = req.get(url, headers=hdrs, timeout=self._timeout)
+                    resp.raise_for_status()
+                    action = payload.get('action', endpoint)
+                    self.action_done.emit(f'{action} — Erfolgreich')
+            except req.ConnectionError:
+                self.error.emit(
+                    f'Verbindung zu {self._base_url} fehlgeschlagen.\n'
+                    'Ist der Logger erreichbar?')
+            except req.Timeout:
+                self.error.emit(
+                    f'Zeitüberschreitung bei {url}\n'
+                    f'(Timeout: {self._timeout}s)')
+            except req.HTTPError as e:
+                if e.response is not None and e.response.status_code == 401 and self._access_token:
+                    self.auth_expired.emit(task, endpoint, payload)
+                else:
+                    self.error.emit(f'HTTP-Fehler: {e}')
+            except Exception as e:
+                self.error.emit(f'Fehler: {e}')
+
+
 class WiresharkPanel(QWidget):
     """Wireshark-ähnliches Panel für Paketanalyse."""
 
@@ -4713,6 +4842,19 @@ class WiresharkPanel(QWidget):
 
         # Farbregeln-Manager
         self._color_rules_manager = ColorRulesManager()
+
+        # ── Logger-Fernsteuerung (CCA REST API) ──
+        self._logger_connected = False
+        self._logger_recording_active = False
+        self._logger_access_token: Optional[str] = None
+        self._logger_refresh_token: Optional[str] = None
+        self._logger_token_lifetime = 3600
+        self._logger_token_acquired_at = 0.0
+        self._logger_worker = _LoggerApiWorker(self)
+        self._logger_worker.action_done.connect(self._logger_on_action_done)
+        self._logger_worker.error.connect(self._logger_on_error)
+        self._logger_worker.data_loaded.connect(self._logger_on_data_loaded)
+        self._logger_worker.auth_expired.connect(self._logger_on_auth_expired)
 
         self._init_ui()
 
@@ -4890,6 +5032,9 @@ class WiresharkPanel(QWidget):
 
         self.live_capture_widget.hide()  # Zunächst versteckt
         layout.addWidget(self.live_capture_widget)
+
+        # ── Logger-Fernsteuerung: Base-URL + OAuth2 ──
+        self._create_logger_control_rows(layout)
 
         # Netzwerk-Speed Widget (ein-/ausklappbar)
         self.net_speed_widget = QWidget()
@@ -5080,10 +5225,70 @@ class WiresharkPanel(QWidget):
         self._cm_timer = None
         self._counter_widget.hide()
 
-        # Oberer Bereich: Horizontaler Splitter (Durchsatz | Counter | Paketliste/Video-Einstellungen)
+        # ── Loss Monitor Panel (ECharts WebEngine) ──
+        self._loss_monitor_widget = QWidget()
+        loss_main_layout = QVBoxLayout(self._loss_monitor_widget)
+        loss_main_layout.setContentsMargins(0, 0, 0, 0)
+        loss_main_layout.setSpacing(2)
+
+        # Toggle-Button (wie PLP Counter)
+        self._loss_toggle_btn = QPushButton("📉 Loss Monitor ▼")
+        self._loss_toggle_btn.setStyleSheet(
+            "text-align: left; padding: 4px 8px; font-weight: bold;")
+        self._loss_toggle_btn.setFlat(True)
+        self._loss_toggle_btn.clicked.connect(self._toggle_loss_monitor)
+        loss_main_layout.addWidget(self._loss_toggle_btn)
+
+        self._loss_content = QWidget()
+        loss_content_layout = QVBoxLayout(self._loss_content)
+        loss_content_layout.setContentsMargins(0, 0, 0, 0)
+        loss_content_layout.setSpacing(0)
+
+        if WEBENGINE_AVAILABLE:
+            self._loss_webview = QWebEngineView()
+            self._loss_webview.setContextMenuPolicy(
+                Qt.ContextMenuPolicy.NoContextMenu)
+            html_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'resources', 'loss_monitor.html')
+            if os.path.exists(html_path):
+                self._loss_webview.load(QUrl.fromLocalFile(html_path))
+            else:
+                self._loss_webview.setHtml(
+                    '<body style="background:#1e1e1e;color:#e00;">'
+                    'loss_monitor.html nicht gefunden</body>')
+            loss_content_layout.addWidget(self._loss_webview)
+        else:
+            _fb = QLabel("WebEngine nicht verfügbar")
+            _fb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            _fb.setStyleSheet("color: #888;")
+            loss_content_layout.addWidget(_fb)
+            self._loss_webview = None
+
+        loss_main_layout.addWidget(self._loss_content, 1)
+
+        # Loss Monitor Daten-State
+        self._loss_expanded = True
+        self._loss_prev_rx_missed: Dict[str, int] = {}
+        self._loss_prev_rx_dropped: Dict[str, int] = {}
+        self._loss_prev_rx_errors: Dict[str, int] = {}
+        self._loss_prev_rx_crc: Dict[str, int] = {}
+        self._loss_prev_rx_packets: Dict[str, int] = {}
+        self._loss_prev_rx_bytes: Dict[str, int] = {}
+        self._loss_prev_kern_drops: Dict[int, int] = {}  # worker_idx → prev
+        self._loss_prev_plp_gaps: Dict[int, int] = {}    # worker_idx → prev
+        self._loss_monitor_timer = QTimer()
+        self._loss_monitor_timer.timeout.connect(self._update_loss_monitor)
+        self._loss_monitor_timer.setInterval(2000)
+        self._loss_config_sent = False
+
+        self._loss_monitor_widget.hide()
+
+        # Oberer Bereich: Horizontaler Splitter (Durchsatz | Counter | LossMonitor | Paketliste/Video)
         top_splitter = QSplitter(Qt.Orientation.Horizontal)
         top_splitter.addWidget(self.net_speed_widget)
         top_splitter.addWidget(self._counter_widget)
+        top_splitter.addWidget(self._loss_monitor_widget)
         top_splitter.addWidget(self.packet_table)
         top_splitter.addWidget(self._video_settings_widget)
 
@@ -6726,12 +6931,18 @@ class WiresharkPanel(QWidget):
     def _show_live_capture_ui(self):
         """Zeigt die Live-Capture UI an."""
         self.live_capture_widget.show()
+        self._logger_control_widget.show()
         self.open_btn.setEnabled(False)  # PCAP-Öffnen deaktivieren im Live-Modus
         self.net_speed_widget.show()
         self._counter_widget.show()
-        self._top_splitter.setSizes([220, 400, 400])
+        self._loss_monitor_widget.show()
+        self._top_splitter.setSizes([140, 420, 250, 430])
+        # Vertikale Aufteilung: Panels oben ~50%, Video unten ~50%
+        # (gleich wie nach Video-Decode, damit Layout stabil bleibt)
+        self._main_splitter.setSizes([450, 450, 0])
         self._prev_net_stats = self._read_net_dev()
         self._net_speed_timer.start(1000)
+        self._loss_monitor_timer.start(2000)
 
     def _start_live_capture(self):
         """Startet die Live-Capture."""
@@ -6847,8 +7058,9 @@ class WiresharkPanel(QWidget):
         self._is_capturing = False
         self.progress_bar.hide()
 
-        # ── PLP Counter Monitor stoppen ──
+        # ── PLP Counter Monitor + Loss Monitor stoppen ──
         self._stop_counter_monitor()
+        self._stop_loss_monitor()
 
         # ── Assembly-Thread stoppen ──
         self._video_assembly_running = False
@@ -7141,7 +7353,7 @@ class WiresharkPanel(QWidget):
         # Video-Container anzeigen (volle Breite unterhalb)
         self._video_container.show()
         self._bottom_splitter.hide()
-        self._main_splitter.setSizes([105, 595, 0])
+        self._main_splitter.setSizes([450, 450, 0])
         self._video_display.setText("Warte auf Video-Signal...")
         backend = "AF_PACKET/MMAP" if self._afpacket_workers else "Software"
         self._video_info_label.setText(f"Live Video [{backend}]  —  Warte auf Signal...")
@@ -7480,20 +7692,20 @@ class WiresharkPanel(QWidget):
             # Paketanzeige anzeigen
             self._video_settings_widget.hide()
             self.packet_table.show()
-            # Splitter-Groessen wiederherstellen: [net_speed, counter, packet_table, vs_widget]
+            # Splitter: [net_speed, counter, loss_monitor, packet_table, vs_widget]
             sizes = self._top_splitter.sizes()
             total = sum(sizes)
-            rest = total - sizes[0] - sizes[1]
-            self._top_splitter.setSizes([sizes[0], sizes[1], rest, 0])
+            rest = total - sizes[0] - sizes[1] - sizes[2]
+            self._top_splitter.setSizes([sizes[0], sizes[1], sizes[2], rest, 0])
         else:
             # Video-Einstellungen anzeigen
             self.packet_table.hide()
             self._video_settings_widget.show()
-            # Splitter-Groessen setzen: Video-Einstellungen bekommt vollen Platz
+            # Splitter: Video-Einstellungen bekommt Paketlisten-Platz
             sizes = self._top_splitter.sizes()
             total = sum(sizes)
-            rest = total - sizes[0] - sizes[1]
-            self._top_splitter.setSizes([sizes[0], sizes[1], 0, rest])
+            rest = total - sizes[0] - sizes[1] - sizes[2]
+            self._top_splitter.setSizes([sizes[0], sizes[1], sizes[2], 0, rest])
 
     def _add_video_settings_stream(self, stream_id: int):
         """Fuegt einen Tab fuer einen neuen Video-Stream hinzu."""
@@ -8255,6 +8467,180 @@ class WiresharkPanel(QWidget):
             self._net_speed_content.hide()
             self._net_speed_toggle_btn.setText("📊 Netzwerk-Durchsatz ▶")
 
+    # ── Loss Monitor (ECharts WebEngine) ──
+
+    def _read_nic_stats(self) -> Dict[str, Dict[str, int]]:
+        """Liest NIC-Statistiken pro Interface aus sysfs (~5µs Overhead).
+
+        Returns: {iface: {missed, dropped, errors, crc, packets, bytes}}
+        """
+        result = {}
+        ifaces = getattr(self, '_inline_counter_ifaces', [])
+        stats_names = ['rx_missed_errors', 'rx_dropped', 'rx_errors',
+                       'rx_crc_errors', 'rx_packets', 'rx_bytes']
+        keys = ['missed', 'dropped', 'errors', 'crc', 'packets', 'bytes']
+        for iface in ifaces:
+            d = {}
+            for sname, key in zip(stats_names, keys):
+                try:
+                    with open(f'/sys/class/net/{iface}/statistics/{sname}') as f:
+                        d[key] = int(f.read().strip())
+                except (OSError, ValueError):
+                    d[key] = 0
+            result[iface] = d
+        return result
+
+    def _toggle_loss_monitor(self):
+        """Klappt das Loss-Monitor Panel ein/aus."""
+        self._loss_expanded = not self._loss_expanded
+        if self._loss_expanded:
+            self._loss_content.show()
+            self._loss_toggle_btn.setText("📉 Loss Monitor ▼")
+        else:
+            self._loss_content.hide()
+            self._loss_toggle_btn.setText("📉 Loss Monitor ▶")
+
+    def _update_loss_monitor(self):
+        """Aktualisiert das Loss-Monitor Panel (alle 2 Sekunden).
+
+        Sammelt Daten aus 3 Ebenen und pusht per-Interface JSON an ECharts:
+          1. NIC-Level: rx_missed, rx_dropped, rx_errors, rx_crc (sysfs)
+          2. Kernel-Level: kern_drops (AF_PACKET PACKET_STATISTICS, Shared Array)
+          3. PLP-Level: Counter Gaps (Shared Array)
+        """
+        if self._loss_webview is None:
+            return
+
+        # ── 1. NIC Stats pro Interface (sysfs) ──
+        curr = self._read_nic_stats()
+        iface_data = {}
+        nic_total_delta = 0
+        total_pps = 0
+
+        for iface, stats in curr.items():
+            prev_missed = self._loss_prev_rx_missed.get(iface, stats['missed'])
+            prev_dropped = self._loss_prev_rx_dropped.get(iface, stats['dropped'])
+            prev_errors = self._loss_prev_rx_errors.get(iface, stats['errors'])
+            prev_crc = self._loss_prev_rx_crc.get(iface, stats['crc'])
+            prev_pkts = self._loss_prev_rx_packets.get(iface, stats['packets'])
+            prev_bytes = self._loss_prev_rx_bytes.get(iface, stats['bytes'])
+
+            d_missed = max(0, stats['missed'] - prev_missed)
+            d_dropped = max(0, stats['dropped'] - prev_dropped)
+            d_errors = max(0, stats['errors'] - prev_errors)
+            d_crc = max(0, stats['crc'] - prev_crc)
+            d_pkts = max(0, stats['packets'] - prev_pkts)
+            d_bytes = max(0, stats['bytes'] - prev_bytes)
+            pps = d_pkts // 2  # 2s Intervall
+            bps = d_bytes // 2
+
+            nic_total_delta += d_missed
+            total_pps += pps
+
+            iface_data[iface] = {
+                'missed': d_missed,
+                'dropped': d_dropped,
+                'errors': d_errors,
+                'crc': d_crc,
+                'pps': pps,
+                'bps': bps,
+                # Kumulative Werte (Σ)
+                'missed_sum': stats['missed'],
+                'dropped_sum': stats['dropped'],
+                'errors_sum': stats['errors'],
+                'crc_sum': stats['crc'],
+            }
+
+            self._loss_prev_rx_missed[iface] = stats['missed']
+            self._loss_prev_rx_dropped[iface] = stats['dropped']
+            self._loss_prev_rx_errors[iface] = stats['errors']
+            self._loss_prev_rx_crc[iface] = stats['crc']
+            self._loss_prev_rx_packets[iface] = stats['packets']
+            self._loss_prev_rx_bytes[iface] = stats['bytes']
+
+        # ── 2+3. kern_drops + plp_gaps aus Shared Array ──
+        kern_delta = 0
+        kern_sum = 0
+        plp_delta = 0
+        plp_sum = 0
+        ict = getattr(self, '_inline_counter_stats', None)
+        n_workers = getattr(self, '_inline_counter_workers', 0)
+        if ict and n_workers > 0:
+            for widx in range(n_workers):
+                base = widx * _ICT_FIELDS
+                try:
+                    w_gaps = ict[base + _ICT_GAPS]
+                    w_kern = ict[base + _ICT_KERN_DROPS]
+                except (IndexError, Exception):
+                    continue
+
+                kern_sum += w_kern
+                plp_sum += w_gaps
+
+                prev_k = self._loss_prev_kern_drops.get(widx, w_kern)
+                kern_delta += max(0, w_kern - prev_k)
+                self._loss_prev_kern_drops[widx] = w_kern
+
+                prev_g = self._loss_prev_plp_gaps.get(widx, w_gaps)
+                plp_delta += max(0, w_gaps - prev_g)
+                self._loss_prev_plp_gaps[widx] = w_gaps
+
+        # ── JSON zusammenbauen und an ECharts pushen ──
+        import json
+        payload = json.dumps({
+            'ifaces': iface_data,
+            'kern': kern_delta,
+            'kern_sum': kern_sum,
+            'plp': plp_delta,
+            'plp_sum': plp_sum,
+            'total_pps': total_pps,
+            'nic_total': nic_total_delta,
+        }, separators=(',', ':'))
+
+        js = f"window.pushData('{payload}');"
+        try:
+            self._loss_webview.page().runJavaScript(js)
+        except Exception:
+            pass
+
+        # ── NIC-Konfiguration einmalig senden ──
+        if not self._loss_config_sent and curr:
+            iface0 = list(curr.keys())[0]
+            try:
+                import subprocess
+                r = subprocess.run(
+                    ['ethtool', '-c', iface0],
+                    capture_output=True, text=True, timeout=2)
+                adaptive = 'on'
+                usecs = '50'
+                for line in r.stdout.splitlines():
+                    if 'Adaptive RX:' in line:
+                        adaptive = line.split()[-3]
+                    if line.startswith('rx-usecs:'):
+                        usecs = line.split()[-1]
+                cfg = f"adaptive-rx {adaptive} | rx-usecs {usecs}"
+            except Exception:
+                cfg = "—"
+            js_cfg = f"window.setConfig('{cfg}');"
+            try:
+                self._loss_webview.page().runJavaScript(js_cfg)
+            except Exception:
+                pass
+            self._loss_config_sent = True
+
+    def _stop_loss_monitor(self):
+        """Stoppt den Loss-Monitor Timer."""
+        self._loss_monitor_timer.stop()
+        self._loss_prev_rx_missed.clear()
+        self._loss_prev_rx_dropped.clear()
+        self._loss_prev_rx_errors.clear()
+        self._loss_prev_rx_crc.clear()
+        self._loss_prev_rx_packets.clear()
+        self._loss_prev_rx_bytes.clear()
+        self._loss_prev_kern_drops.clear()
+        self._loss_prev_plp_gaps.clear()
+        self._loss_config_sent = False
+
     # ── PLP Counter Monitor Methoden ──
 
     def _toggle_counter_panel(self):
@@ -8758,4 +9144,646 @@ class WiresharkPanel(QWidget):
 
         # Globales gap_label nicht mehr benoetigt
         self._counter_gap_label.hide()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Logger-Fernsteuerung (CCA REST API) — UI-Aufbau
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _create_logger_control_rows(self, parent_layout: QVBoxLayout):
+        """Erstellt Base-URL + OAuth2 Zeilen für Logger-Fernsteuerung."""
+        self._logger_control_widget = QWidget()
+        container = QVBoxLayout(self._logger_control_widget)
+        container.setContentsMargins(0, 0, 0, 0)
+        container.setSpacing(0)
+
+        # ── Zeile 1: Base-URL ──
+        url_row = QWidget()
+        url_row.setFixedHeight(30)
+        url_row.setStyleSheet(
+            'QWidget { background-color: #ffffff; border-bottom: 1px solid #e0e0e0; }'
+            'QLabel { color: #636e72; background: transparent; border: none; }'
+            'QLineEdit, QComboBox { background-color: #ffffff; color: #2d3436;'
+            '  border: 1px solid #d0d4dc; border-radius: 3px;'
+            '  padding: 2px 4px; font-size: 11px; }'
+            'QLineEdit:focus, QComboBox:focus { border: 1px solid #0984e3; }'
+        )
+        r1 = QHBoxLayout(url_row)
+        r1.setContentsMargins(8, 2, 8, 2)
+        r1.setSpacing(4)
+
+        lbl = QLabel('Logger:')
+        lbl.setStyleSheet('font-weight: bold; font-size: 11px;')
+        r1.addWidget(lbl)
+
+        self._logger_protocol_combo = QComboBox()
+        self._logger_protocol_combo.addItems(['http://', 'https://'])
+        self._logger_protocol_combo.setFixedWidth(78)
+        r1.addWidget(self._logger_protocol_combo)
+
+        self._logger_ip_input = QComboBox()
+        self._logger_ip_input.setEditable(True)
+        self._logger_ip_input.setFixedWidth(180)
+        self._logger_ip_input.lineEdit().setPlaceholderText('Logger-IP')
+        self._logger_ip_input.addItem('192.168.178.254')
+        r1.addWidget(self._logger_ip_input)
+
+        self._logger_ping_label = QLabel('\u2298 Getrennt')
+        self._logger_ping_label.setFixedWidth(110)
+        self._logger_ping_label.setStyleSheet('font-size: 11px; color: #888;')
+        r1.addWidget(self._logger_ping_label)
+
+        self._logger_ping_timer = QTimer(self)
+        self._logger_ping_timer.setSingleShot(True)
+        self._logger_ping_timer.timeout.connect(self._logger_start_ping)
+        self._logger_ip_input.lineEdit().textChanged.connect(
+            self._logger_on_ip_changed_ping)
+
+        self._logger_connect_btn = QPushButton('Verbinden')
+        self._logger_connect_btn.setStyleSheet(
+            'QPushButton { background: #F44336; color: white; border: none;'
+            '  padding: 3px 10px; border-radius: 3px; font-size: 11px; }'
+            'QPushButton:hover { background: #E53935; }')
+        self._logger_connect_btn.clicked.connect(self._logger_on_connect)
+        r1.addWidget(self._logger_connect_btn)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        sep.setFixedHeight(18)
+        r1.addWidget(sep)
+
+        _tb_style = (
+            'QPushButton { background: #ffffff; color: #2d3436;'
+            '  border: 1px solid #d0d4dc; border-radius: 3px;'
+            '  padding: 3px 10px; font-size: 11px; }'
+            'QPushButton:hover { background: #f0f4ff; color: #1565c0; }'
+            'QPushButton:disabled { background: #f5f5f5; color: #b0b0b0; }'
+        )
+
+        self._logger_rec_start_btn = QPushButton('\u25B6 Aufzeichnung starten')
+        self._logger_rec_start_btn.setStyleSheet(_tb_style)
+        self._logger_rec_start_btn.clicked.connect(self._logger_on_rec_start)
+        r1.addWidget(self._logger_rec_start_btn)
+
+        self._logger_rec_stop_btn = QPushButton('\u23F9 Stoppen')
+        self._logger_rec_stop_btn.setStyleSheet(_tb_style)
+        self._logger_rec_stop_btn.clicked.connect(self._logger_on_rec_stop)
+        r1.addWidget(self._logger_rec_stop_btn)
+
+        # Recording-LED + Timer
+        self._logger_rec_led = QLabel('\u25CF')
+        self._logger_rec_led.setStyleSheet('color: #888888; font-size: 12px;')
+        r1.addWidget(self._logger_rec_led)
+
+        self._logger_rec_timer_label = QLabel('')
+        self._logger_rec_timer_label.setStyleSheet(
+            'font-size: 11px; font-weight: bold; color: #F44336;')
+        self._logger_rec_timer_label.hide()
+        r1.addWidget(self._logger_rec_timer_label)
+
+        # Status
+        self._logger_status_label = QLabel('')
+        self._logger_status_label.setStyleSheet('font-size: 11px; color: #666;')
+        r1.addWidget(self._logger_status_label)
+
+        r1.addStretch()
+        container.addWidget(url_row)
+
+        # ── Zeile 2: OAuth2 ──
+        auth_row = QWidget()
+        auth_row.setFixedHeight(30)
+        auth_row.setStyleSheet(
+            'QWidget { background-color: #fafbfc; border-bottom: 1px solid #e0e0e0; }'
+            'QLabel { color: #636e72; background: transparent; border: none; }')
+        r2 = QHBoxLayout(auth_row)
+        r2.setContentsMargins(8, 0, 8, 2)
+        r2.setSpacing(6)
+
+        lbl_auth = QLabel('OAuth2:')
+        lbl_auth.setStyleSheet(
+            'font-size: 11px; font-weight: bold; color: #0984e3;'
+            ' background: transparent; border: none;')
+        r2.addWidget(lbl_auth)
+
+        _input_style = (
+            'font-size: 11px; color: #2d3436; background: #ffffff;'
+            ' border: 1px solid #d0d4dc; border-radius: 3px; padding: 2px 6px;')
+
+        self._logger_auth_user = QLineEdit()
+        self._logger_auth_user.setFixedWidth(120)
+        self._logger_auth_user.setPlaceholderText('Benutzername')
+        self._logger_auth_user.setStyleSheet(_input_style)
+        r2.addWidget(self._logger_auth_user)
+
+        self._logger_auth_pass = QLineEdit()
+        self._logger_auth_pass.setFixedWidth(120)
+        self._logger_auth_pass.setPlaceholderText('Passwort')
+        self._logger_auth_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self._logger_auth_pass.setStyleSheet(_input_style)
+        r2.addWidget(self._logger_auth_pass)
+
+        self._logger_login_btn = QPushButton('Anmelden')
+        self._logger_login_btn.setStyleSheet(
+            'QPushButton { background: #0277BD; color: white; font-weight: bold;'
+            '  border: none; padding: 5px 10px; border-radius: 6px; font-size: 11px; }'
+            'QPushButton:hover { background: #0288D1; }'
+            'QPushButton:disabled { background: #555; }')
+        self._logger_login_btn.clicked.connect(self._logger_oauth2_login)
+        r2.addWidget(self._logger_login_btn)
+
+        self._logger_logout_btn = QPushButton('Abmelden')
+        self._logger_logout_btn.setStyleSheet(
+            'QPushButton { background: #6D4C41; color: white; font-weight: bold;'
+            '  border: none; padding: 5px 10px; border-radius: 6px; font-size: 11px; }'
+            'QPushButton:hover { background: #9B8076; }')
+        self._logger_logout_btn.setEnabled(False)
+        self._logger_logout_btn.clicked.connect(self._logger_oauth2_logout)
+        r2.addWidget(self._logger_logout_btn)
+
+        self._logger_auth_status = QLabel('Nicht angemeldet')
+        self._logger_auth_status.setStyleSheet(
+            'font-size: 11px; color: #999; padding-left: 4px;'
+            ' background: transparent; border: none;')
+        r2.addWidget(self._logger_auth_status)
+
+        self._logger_token_bar = QProgressBar()
+        self._logger_token_bar.setFixedWidth(160)
+        self._logger_token_bar.setFixedHeight(18)
+        self._logger_token_bar.setRange(0, 3600)
+        self._logger_token_bar.setValue(0)
+        self._logger_token_bar.setFormat('%v min')
+        self._logger_token_bar.setVisible(False)
+        self._logger_token_bar.setStyleSheet('''
+            QProgressBar {
+                border: 1px solid #555; border-radius: 4px;
+                background: #2b2b2b; font-size: 10px; color: #ddd;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                border-radius: 3px;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 #43A047,stop:1 #66BB6A);
+            }
+        ''')
+        r2.addWidget(self._logger_token_bar)
+
+        self._logger_token_timer = QTimer(self)
+        self._logger_token_timer.setInterval(60_000)
+        self._logger_token_timer.timeout.connect(self._logger_update_token_bar)
+
+        r2.addStretch()
+        container.addWidget(auth_row)
+
+        # Timer
+        self._logger_heartbeat_timer = QTimer(self)
+        self._logger_heartbeat_timer.setInterval(30_000)
+        self._logger_heartbeat_timer.timeout.connect(self._logger_on_heartbeat)
+
+        self._logger_rec_blink_timer = QTimer(self)
+        self._logger_rec_blink_timer.setInterval(50)
+        self._logger_rec_blink_timer.timeout.connect(self._logger_on_rec_blink)
+        self._logger_rec_start_time = 0.0
+
+        self._logger_control_widget.hide()
+        parent_layout.addWidget(self._logger_control_widget)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Logger-Fernsteuerung — Verbindung & Ping
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _logger_get_base_url(self) -> str:
+        """Gibt die aktuelle Logger Base-URL zurück."""
+        return f'{self._logger_protocol_combo.currentText()}{self._logger_ip_input.currentText()}'.rstrip('/')
+
+    def _logger_on_ip_changed_ping(self, text: str):
+        """IP geändert — Ping mit 800ms Debounce starten."""
+        if self._logger_connected:
+            return
+        self._logger_ping_timer.stop()
+        ip = text.strip()
+        if not ip:
+            self._logger_ping_label.setText('\u2298 Getrennt')
+            self._logger_ping_label.setStyleSheet('font-size: 11px; color: #888;')
+            return
+        self._logger_ping_label.setText('\u25CB Ping...')
+        self._logger_ping_label.setStyleSheet('font-size: 11px; color: #FFB74D;')
+        self._logger_ping_timer.start(800)
+
+    def _logger_start_ping(self):
+        """Startet den Ping in einem Hintergrund-Thread."""
+        if self._logger_connected:
+            return
+        ip = self._logger_ip_input.currentText().strip()
+        if not ip:
+            return
+        thread = _PingThread(ip, self)
+        thread.result.connect(self._logger_on_ping_result)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _logger_on_ping_result(self, ok: bool, ip: str, latency_ms: float):
+        """Ping-Ergebnis anzeigen."""
+        if self._logger_connected:
+            return
+        current_ip = self._logger_ip_input.currentText().strip()
+        if ip != current_ip:
+            return
+        if ok:
+            ms = f'{latency_ms:.0f}' if latency_ms >= 1 else f'{latency_ms:.1f}'
+            self._logger_ping_label.setText(f'\u25CF Ping OK ({ms}ms)')
+            self._logger_ping_label.setStyleSheet(
+                'font-size: 11px; color: #4CAF50; font-weight: bold;')
+        else:
+            self._logger_ping_label.setText('\u25CF Ping NOK')
+            self._logger_ping_label.setStyleSheet(
+                'font-size: 11px; color: #F44336; font-weight: bold;')
+
+    def _logger_on_connect(self):
+        """Verbindung zum Logger herstellen / trennen."""
+        if self._logger_connected:
+            if self._logger_access_token:
+                self._logger_oauth2_logout()
+            self._logger_connected = False
+            self._logger_recording_active = False
+            self._logger_heartbeat_timer.stop()
+            self._logger_rec_blink_timer.stop()
+            self._logger_connect_btn.setText('Verbinden')
+            self._logger_connect_btn.setStyleSheet(
+                'QPushButton { background: #F44336; color: white; border: none;'
+                '  padding: 3px 10px; border-radius: 3px; font-size: 11px; }'
+                'QPushButton:hover { background: #E53935; }')
+            self._logger_rec_start_btn.setEnabled(True)
+            self._logger_rec_stop_btn.setEnabled(True)
+            self._logger_status_label.setText('')
+            self._logger_ping_label.setText('\u2298 Getrennt')
+            self._logger_ping_label.setStyleSheet('font-size: 11px; color: #888;')
+            self._logger_rec_led.setStyleSheet('color: #888888; font-size: 12px;')
+            self._logger_rec_timer_label.setText('')
+            self._logger_rec_timer_label.hide()
+            self._logger_on_ip_changed_ping(self._logger_ip_input.currentText())
+            logging.getLogger(__name__).info('Logger-Verbindung getrennt')
+            return
+
+        ip = self._logger_ip_input.currentText().strip()
+        if not ip:
+            return
+
+        # IP in Historie speichern
+        if self._logger_ip_input.findText(ip) == -1:
+            self._logger_ip_input.addItem(ip)
+
+        protocol = self._logger_protocol_combo.currentText()
+        base_url = f'{protocol}{ip}'
+        self._logger_worker.set_base_url(base_url)
+        self._logger_worker.load_properties('/api/v1/system/cca_basic_info')
+
+        self._logger_connected = True
+        self._logger_connect_btn.setText('Trennen')
+        self._logger_connect_btn.setStyleSheet(
+            'QPushButton { background: #4CAF50; color: white; border: none;'
+            '  padding: 3px 10px; border-radius: 3px; font-size: 11px; }'
+            'QPushButton:hover { background: #388E3C; }')
+        self._logger_status_label.setText(f'Verbunden mit {ip}')
+        self._logger_status_label.setStyleSheet('font-size: 11px; color: #4CAF50;')
+        self._logger_ping_label.setText('\u25CF Verbunden')
+        self._logger_ping_label.setStyleSheet(
+            'font-size: 11px; color: #4CAF50; font-weight: bold;')
+        self._logger_heartbeat_timer.start()
+        self._logger_ping_timer.stop()
+
+        if not self._logger_access_token:
+            self._logger_auth_status.setText('Bitte anmelden \u2192')
+            self._logger_auth_status.setStyleSheet(
+                'font-size: 11px; color: #FFB74D; font-weight: bold;'
+                ' background: transparent; border: none;')
+        logging.getLogger(__name__).info('Verbinde mit Logger: %s', base_url)
+
+    def _logger_on_heartbeat(self):
+        """Heartbeat: Prüft ob der Logger noch erreichbar ist."""
+        if not self._logger_connected:
+            return
+        self._logger_worker.load_properties('/api/v1/system/cca_basic_info')
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Logger-Fernsteuerung — OAuth2
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _logger_oauth2_login(self):
+        """Meldet sich am CCA-Gerät an und speichert Access/Refresh-Token."""
+        base = self._logger_get_base_url()
+        user = self._logger_auth_user.text().strip()
+        pwd = self._logger_auth_pass.text()
+        if not base or not user or not pwd:
+            QMessageBox.warning(
+                self, 'Anmeldung',
+                'Bitte Base-URL, Benutzername und Passwort eingeben.')
+            return
+
+        self._logger_login_btn.setEnabled(False)
+        self._logger_auth_status.setText('Anmeldung läuft \u2026')
+        self._logger_auth_status.setStyleSheet(
+            'font-size: 11px; color: #FFB74D; padding-left: 6px;'
+            ' background: transparent; border: none;')
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        import requests
+        try:
+            resp = requests.post(
+                f'{base}/api/v1/oauth2/token',
+                json={'username': user, 'password': pwd},
+                headers={'Content-Type': 'application/json'},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                self._logger_access_token = data.get('access_token')
+                self._logger_refresh_token = data.get('refresh_token')
+                self._logger_auth_status.setText(f'Angemeldet als {user}')
+                self._logger_auth_status.setStyleSheet(
+                    'font-size: 11px; color: #4CBB17; font-weight: bold;'
+                    ' padding-left: 6px; background: transparent; border: none;')
+                self._logger_logout_btn.setEnabled(True)
+                self._logger_auth_pass.clear()
+                self._logger_token_acquired_at = time.time()
+                self._logger_worker.set_access_token(self._logger_access_token)
+                self._logger_start_token_bar()
+            else:
+                try:
+                    detail = resp.json().get('msg', resp.text[:200])
+                except Exception:
+                    detail = resp.text[:200]
+                self._logger_auth_status.setText(f'Fehler ({resp.status_code})')
+                self._logger_auth_status.setStyleSheet(
+                    'font-size: 11px; color: #FF6680; padding-left: 6px;'
+                    ' background: transparent; border: none;')
+                QMessageBox.warning(
+                    self, 'Anmeldung fehlgeschlagen',
+                    f'Status {resp.status_code}: {detail}')
+        except Exception as exc:
+            self._logger_auth_status.setText('Verbindungsfehler')
+            self._logger_auth_status.setStyleSheet(
+                'font-size: 11px; color: #FF6680; padding-left: 6px;'
+                ' background: transparent; border: none;')
+            QMessageBox.warning(self, 'Verbindungsfehler', str(exc))
+        finally:
+            self._logger_login_btn.setEnabled(True)
+
+    def _logger_oauth2_logout(self):
+        """Meldet sich ab und löscht die Tokens."""
+        base = self._logger_get_base_url()
+        import requests
+        if base and self._logger_access_token:
+            try:
+                requests.delete(
+                    f'{base}/api/v1/oauth2/token',
+                    headers={
+                        'Authorization': f'Bearer {self._logger_access_token}',
+                        'Content-Type': 'application/json',
+                    },
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+        self._logger_access_token = None
+        self._logger_refresh_token = None
+        self._logger_worker.set_access_token(None)
+        self._logger_token_timer.stop()
+        self._logger_token_bar.setVisible(False)
+        self._logger_auth_status.setText('Nicht angemeldet')
+        self._logger_auth_status.setStyleSheet(
+            'font-size: 11px; color: #999; padding-left: 6px;'
+            ' background: transparent; border: none;')
+        self._logger_logout_btn.setEnabled(False)
+
+    def _logger_oauth2_refresh(self) -> bool:
+        """Erneuert den Access-Token mit dem Refresh-Token."""
+        base = self._logger_get_base_url()
+        if not base or not self._logger_refresh_token:
+            return False
+        import requests
+        try:
+            resp = requests.post(
+                f'{base}/api/v1/oauth2/refresh',
+                json={'refresh_token': self._logger_refresh_token},
+                headers={'Content-Type': 'application/json'},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                self._logger_access_token = data.get('access_token')
+                new_refresh = data.get('refresh_token')
+                if new_refresh:
+                    self._logger_refresh_token = new_refresh
+                self._logger_token_acquired_at = time.time()
+                self._logger_worker.set_access_token(self._logger_access_token)
+                self._logger_start_token_bar()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _logger_on_auth_expired(self, task: str, endpoint: str,
+                                payload: Dict[str, Any]):
+        """401 erhalten — Token automatisch erneuern."""
+        log = logging.getLogger(__name__)
+        log.warning('Logger-Token abgelaufen (401), versuche Refresh …')
+        if self._logger_oauth2_refresh():
+            log.info('Logger-Token erneuert, Anfrage wird wiederholt')
+            self._logger_worker._enqueue(task, endpoint, payload)
+        else:
+            self._logger_auth_status.setText('Token abgelaufen — bitte neu anmelden')
+            self._logger_auth_status.setStyleSheet(
+                'font-size: 11px; color: #FF6680; padding-left: 6px;'
+                ' background: transparent; border: none;')
+
+    def _logger_start_token_bar(self):
+        """Zeigt den Token-Fortschrittsbalken und startet den Timer."""
+        self._logger_token_bar.setRange(0, self._logger_token_lifetime)
+        self._logger_token_bar.setValue(self._logger_token_lifetime)
+        self._logger_update_token_bar()
+        self._logger_token_bar.setVisible(True)
+        self._logger_token_timer.start()
+
+    def _logger_update_token_bar(self):
+        """Aktualisiert den Token-Fortschrittsbalken (jede Minute)."""
+        elapsed = time.time() - self._logger_token_acquired_at
+        remaining = max(0, self._logger_token_lifetime - int(elapsed))
+        self._logger_token_bar.setValue(remaining)
+        mins = remaining // 60
+        self._logger_token_bar.setFormat(f'Token: {mins} min')
+
+        if remaining > 600:
+            chunk_bg = ('background: qlineargradient(x1:0,y1:0,x2:1,y2:0,'
+                        'stop:0 #43A047,stop:1 #66BB6A);')
+        elif remaining > 180:
+            chunk_bg = ('background: qlineargradient(x1:0,y1:0,x2:1,y2:0,'
+                        'stop:0 #F9A825,stop:1 #FDD835);')
+        else:
+            chunk_bg = ('background: qlineargradient(x1:0,y1:0,x2:1,y2:0,'
+                        'stop:0 #E53935,stop:1 #EF5350);')
+
+        self._logger_token_bar.setStyleSheet(f'''
+            QProgressBar {{
+                border: 1px solid #555; border-radius: 4px;
+                background: #2b2b2b; font-size: 10px; color: #ddd;
+                text-align: center;
+            }}
+            QProgressBar::chunk {{
+                border-radius: 3px;
+                {chunk_bg}
+            }}
+        ''')
+
+        if remaining == 0 and self._logger_refresh_token:
+            self._logger_token_timer.stop()
+            if self._logger_oauth2_refresh():
+                self._logger_auth_status.setText(
+                    self._logger_auth_status.text().replace(
+                        'Angemeldet', 'Erneuert'))
+            else:
+                self._logger_auth_status.setText('Token abgelaufen')
+                self._logger_auth_status.setStyleSheet(
+                    'font-size: 11px; color: #FF6680; padding-left: 4px;'
+                    ' background: transparent; border: none;')
+                self._logger_token_bar.setFormat('Abgelaufen!')
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Logger-Fernsteuerung — Aufzeichnung Start / Stop
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _logger_on_rec_start(self):
+        """Aufzeichnung auf dem Logger starten."""
+        if not self._logger_connected:
+            QMessageBox.warning(self, 'Logger', 'Bitte zuerst mit dem Logger verbinden.')
+            return
+        if not self._logger_access_token:
+            QMessageBox.warning(self, 'Logger', 'Bitte zuerst anmelden (OAuth2).')
+            return
+        self._logger_worker.get_action('/api/v1/recording/start',
+                                       'Aufzeichnung starten')
+        self._logger_recording_active = True
+        self._logger_rec_start_btn.setEnabled(False)
+        self._logger_rec_start_btn.setStyleSheet(
+            'QPushButton { background: #4CAF50; color: white; }'
+            'QPushButton:disabled { background: #4CAF50; color: #cccccc; }')
+        self._logger_rec_stop_btn.setEnabled(True)
+        self._logger_rec_stop_btn.setStyleSheet(
+            'QPushButton { background: #F44336; color: white; border: none; }'
+            'QPushButton:hover { background: #E53935; }')
+        self._logger_rec_start_time = time.monotonic()
+        self._logger_rec_led.setStyleSheet('color: #F44336; font-size: 12px;')
+        self._logger_rec_timer_label.setText('REC 00:00')
+        self._logger_rec_timer_label.show()
+        self._logger_rec_blink_timer.start()
+
+    def _logger_on_rec_stop(self):
+        """Aufzeichnung auf dem Logger stoppen."""
+        if not self._logger_connected:
+            QMessageBox.warning(self, 'Logger', 'Bitte zuerst mit dem Logger verbinden.')
+            return
+        self._logger_worker.get_action('/api/v1/recording/stop',
+                                       'Aufzeichnung stoppen')
+        self._logger_recording_active = False
+        self._logger_rec_start_btn.setEnabled(True)
+        _tb_style = (
+            'QPushButton { background: #ffffff; color: #2d3436;'
+            '  border: 1px solid #d0d4dc; border-radius: 3px;'
+            '  padding: 3px 10px; font-size: 11px; }'
+            'QPushButton:hover { background: #f0f4ff; color: #1565c0; }'
+            'QPushButton:disabled { background: #f5f5f5; color: #b0b0b0; }'
+        )
+        self._logger_rec_start_btn.setStyleSheet(_tb_style)
+        self._logger_rec_stop_btn.setEnabled(False)
+        self._logger_rec_stop_btn.setStyleSheet(
+            'QPushButton { background: #a04040; color: white; }'
+            'QPushButton:disabled { background: #a04040; color: #cccccc; }')
+        self._logger_rec_blink_timer.stop()
+        self._logger_rec_led.setStyleSheet('color: #888888; font-size: 12px;')
+        self._logger_rec_timer_label.setText('')
+        self._logger_rec_timer_label.hide()
+
+    def _logger_on_rec_blink(self):
+        """Pulsiert die Recording-LED und aktualisiert den Timer."""
+        import math
+        elapsed_blink = time.monotonic() - self._logger_rec_start_time
+        brightness = 0.4 + 0.6 * (0.5 + 0.5 * math.sin(
+            2 * math.pi * elapsed_blink / 1.5))
+        r = int(244 * brightness)
+        g = int(67 * brightness * 0.3)
+        b = int(54 * brightness * 0.3)
+        self._logger_rec_led.setStyleSheet(
+            f'color: rgb({r},{g},{b}); font-size: 12px;'
+            ' background: transparent; border: none;')
+        secs = int(elapsed_blink)
+        m, s = divmod(secs, 60)
+        self._logger_rec_timer_label.setText(f'REC {m:02d}:{s:02d}')
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Logger-Fernsteuerung — Worker-Callbacks
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _logger_on_action_done(self, message: str):
+        """Erfolgsmeldung vom Logger-Worker."""
+        self._logger_status_label.setText(message)
+        self._logger_status_label.setStyleSheet('font-size: 11px; color: #4CAF50;')
+        QTimer.singleShot(5000, self._logger_restore_status)
+
+    def _logger_on_error(self, message: str):
+        """Fehlermeldung vom Logger-Worker."""
+        short = message.split('\n')[0][:60]
+        self._logger_status_label.setText(f'Fehler: {short}')
+        self._logger_status_label.setStyleSheet('font-size: 11px; color: #E53935;')
+        logging.getLogger(__name__).warning('Logger-API-Fehler: %s', message)
+
+        if 'fehlgeschlagen' in message or 'Zeitüberschreitung' in message:
+            if self._logger_connected:
+                self._logger_connected = False
+                self._logger_recording_active = False
+                self._logger_heartbeat_timer.stop()
+                self._logger_rec_blink_timer.stop()
+                self._logger_connect_btn.setText('Verbinden')
+                self._logger_connect_btn.setStyleSheet(
+                    'QPushButton { background: #F44336; color: white; border: none;'
+                    '  padding: 3px 10px; border-radius: 3px; font-size: 11px; }'
+                    'QPushButton:hover { background: #E53935; }')
+                self._logger_status_label.setText('Verbindung verloren')
+                self._logger_status_label.setStyleSheet(
+                    'font-size: 11px; color: #E53935;')
+                logging.getLogger(__name__).warning('Logger-Verbindung verloren')
+
+    def _logger_on_data_loaded(self, data: Dict[str, Any]):
+        """Daten vom Logger empfangen (z.B. Geräte-Info bei Heartbeat)."""
+        if not self._logger_connected:
+            return
+        model = data.get('model', '')
+        sn = data.get('serial_number', '')
+        fw = data.get('firmware_version', '')
+        if model or sn or fw:
+            parts = []
+            if model:
+                parts.append(model)
+            if sn:
+                parts.append(f'SN:{sn}')
+            if fw:
+                parts.append(f'FW:{fw}')
+            ip = self._logger_ip_input.currentText().strip()
+            self._logger_status_label.setText(
+                f'Verbunden mit {ip} — {" | ".join(parts)}')
+            self._logger_status_label.setStyleSheet(
+                'font-size: 11px; color: #4CAF50;')
+
+    def _logger_restore_status(self):
+        """Setzt Logger-Statusleiste auf Normalzustand zurück."""
+        if self._logger_connected:
+            ip = self._logger_ip_input.currentText().strip()
+            self._logger_status_label.setText(f'Verbunden mit {ip}')
+            self._logger_status_label.setStyleSheet(
+                'font-size: 11px; color: #4CAF50;')
+        else:
+            self._logger_status_label.setText('')
+            self._logger_status_label.setStyleSheet(
+                'font-size: 11px; color: #666;')
 
