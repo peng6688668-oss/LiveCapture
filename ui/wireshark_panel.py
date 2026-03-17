@@ -34,6 +34,9 @@ from concurrent.futures import ThreadPoolExecutor
 import mmap
 import select
 
+from ui.widgets.native_combo_box import NativeComboBox
+from ui.ip_history_combo import IpHistoryCombo
+
 try:
     import cv2
     import numpy as np
@@ -9175,16 +9178,17 @@ class WiresharkPanel(QWidget):
         lbl.setStyleSheet('font-weight: bold; font-size: 11px;')
         r1.addWidget(lbl)
 
-        self._logger_protocol_combo = QComboBox()
+        self._logger_protocol_combo = NativeComboBox()
         self._logger_protocol_combo.addItems(['http://', 'https://'])
         self._logger_protocol_combo.setFixedWidth(78)
         r1.addWidget(self._logger_protocol_combo)
 
-        self._logger_ip_input = QComboBox()
-        self._logger_ip_input.setEditable(True)
+        self._logger_ip_input = IpHistoryCombo(
+            settings_key='LiveCapture/logger_ip_history',
+            default_value='192.168.178.254',
+            placeholder='Logger-IP',
+        )
         self._logger_ip_input.setFixedWidth(180)
-        self._logger_ip_input.lineEdit().setPlaceholderText('Logger-IP')
-        self._logger_ip_input.addItem('192.168.178.254')
         r1.addWidget(self._logger_ip_input)
 
         self._logger_ping_label = QLabel('\u2298 Getrennt')
@@ -9429,9 +9433,8 @@ class WiresharkPanel(QWidget):
         if not ip:
             return
 
-        # IP in Historie speichern
-        if self._logger_ip_input.findText(ip) == -1:
-            self._logger_ip_input.addItem(ip)
+        # IP in Historie speichern (persistiert in QSettings)
+        self._logger_ip_input.save_current()
 
         protocol = self._logger_protocol_combo.currentText()
         base_url = f'{protocol}{ip}'
@@ -9471,31 +9474,36 @@ class WiresharkPanel(QWidget):
 
     def _logger_oauth2_login(self):
         """Meldet sich am CCA-Gerät an und speichert Access/Refresh-Token."""
-        base = self._logger_get_base_url()
-        user = self._logger_auth_user.text().strip()
-        pwd = self._logger_auth_pass.text()
-        if not base or not user or not pwd:
-            QMessageBox.warning(
-                self, 'Anmeldung',
-                'Bitte Base-URL, Benutzername und Passwort eingeben.')
-            return
-
-        self._logger_login_btn.setEnabled(False)
-        self._logger_auth_status.setText('Anmeldung läuft \u2026')
-        self._logger_auth_status.setStyleSheet(
-            'font-size: 11px; color: #FFB74D; padding-left: 6px;'
-            ' background: transparent; border: none;')
-        from PyQt6.QtWidgets import QApplication
-        QApplication.processEvents()
-
-        import requests
+        import traceback
+        _log = logging.getLogger(__name__)
         try:
-            resp = requests.post(
+            base = self._logger_get_base_url()
+            user = self._logger_auth_user.text().strip()
+            pwd = self._logger_auth_pass.text()
+            if not base or not user or not pwd:
+                QMessageBox.warning(
+                    self, 'Anmeldung',
+                    'Bitte Base-URL, Benutzername und Passwort eingeben.')
+                return
+
+            self._logger_login_btn.setEnabled(False)
+            self._logger_auth_status.setText('Anmeldung läuft \u2026')
+            self._logger_auth_status.setStyleSheet(
+                'font-size: 11px; color: #FFB74D; padding-left: 6px;'
+                ' background: transparent; border: none;')
+
+            _log.info('Logger OAuth2 Login: %s user=%s', base, user)
+
+            import requests as _req
+            resp = _req.post(
                 f'{base}/api/v1/oauth2/token',
                 json={'username': user, 'password': pwd},
                 headers={'Content-Type': 'application/json'},
                 timeout=10,
+                verify=False,
             )
+            _log.info('Logger OAuth2 Response: %s', resp.status_code)
+
             if resp.status_code == 200:
                 data = resp.json()
                 self._logger_access_token = data.get('access_token')
@@ -9522,11 +9530,15 @@ class WiresharkPanel(QWidget):
                     self, 'Anmeldung fehlgeschlagen',
                     f'Status {resp.status_code}: {detail}')
         except Exception as exc:
+            _log.error('Logger OAuth2 Login Fehler:\n%s', traceback.format_exc())
             self._logger_auth_status.setText('Verbindungsfehler')
             self._logger_auth_status.setStyleSheet(
                 'font-size: 11px; color: #FF6680; padding-left: 6px;'
                 ' background: transparent; border: none;')
-            QMessageBox.warning(self, 'Verbindungsfehler', str(exc))
+            try:
+                QMessageBox.warning(self, 'Verbindungsfehler', str(exc))
+            except Exception:
+                pass
         finally:
             self._logger_login_btn.setEnabled(True)
 
