@@ -16,9 +16,9 @@ from PyQt6.QtWidgets import (
     QGroupBox, QFormLayout, QProgressBar, QMenu, QToolBar,
     QDialog, QDialogButtonBox, QInputDialog, QCheckBox,
     QColorDialog, QListWidget, QListWidgetItem, QFrame,
-    QTableView, QGridLayout, QScrollArea, QSlider
+    QTableView, QGridLayout, QScrollArea, QSlider, QStackedWidget
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QProcess, QTimer, QModelIndex, QAbstractTableModel, QObject, QSocketNotifier
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QProcess, QTimer, QModelIndex, QAbstractTableModel, QObject, QSocketNotifier, QSortFilterProxyModel, QRect, QPoint
 from PyQt6.QtGui import QAction, QFont, QColor, QBrush, QImage, QPixmap
 import logging
 import subprocess
@@ -1931,9 +1931,29 @@ class WindowsCaptureThread(QThread):
                 if pkt_data is None:
                     break
 
-                # Schnellpfad: 0x2090 Video-Pakete in Queue (NICHT blockierend)
+                # Schnellpfad: 0x2090 Pakete
                 if len(pkt_data) >= 14 and pkt_data[12:14] == b'\x20\x90':
-                    vq_append(pkt_data)
+                    # PLP 0x2090 kann Bus-Daten enthalten (CAN/LIN/FlexRay/Eth)
+                    # → data_type aus TECMP-Header prüfen (Byte 20-21 nach Ethernet-Header)
+                    is_bus_data = False
+                    dt = 0
+                    if len(pkt_data) >= 22:
+                        dt = int.from_bytes(pkt_data[20:22], 'big')
+                        if dt in (0x0001, 0x0002, 0x0003, 0x0004,
+                                  0x0008, 0x0080, 0x0081):
+                            is_bus_data = True
+                    if is_bus_data:
+                        # Bus-Daten: als Scapy-Paket weiterleiten
+                        try:
+                            pkt = Ether(pkt_data)
+                            pkt.time = ts_sec + ts_usec / 1_000_000
+                            if self._running:
+                                self.packet_received.emit(pkt)
+                        except Exception:
+                            pass
+                    else:
+                        # Video-Daten: in Queue für Frame-Assembly
+                        vq_append(pkt_data)
                     self._video_pkt_count += 1
                     packet_count += 1
                     if self.packet_limit > 0 and packet_count >= self.packet_limit:
@@ -4802,6 +4822,351 @@ class _LoggerApiWorker(QThread):
                 self.error.emit(f'Fehler: {e}')
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# CANoe-Style Bus-Filter: Model + ProxyModel + FilterPopup + FilterHeader
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class BusTableModel(QAbstractTableModel):
+    """Datenmodell für Bus-Tabellen (CAN, LIN, Ethernet, FlexRay)."""
+
+    _FONT = QFont("Consolas", 9)  # Einmalig erzeugt, wiederverwendet
+
+    def __init__(self, headers: list, parent=None):
+        super().__init__(parent)
+        self._headers = headers
+        self._rows: List[tuple] = []
+        self._max_rows = 200  # Nur sichtbarer Bereich, kein Akkumulieren
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(self._headers)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        row, col = index.row(), index.column()
+        if row >= len(self._rows):
+            return None
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self._rows[row][col]
+        elif role == Qt.ItemDataRole.FontRole:
+            return self._FONT
+        elif role == Qt.ItemDataRole.TextAlignmentRole:
+            return Qt.AlignmentFlag.AlignCenter
+        return None
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            if section < len(self._headers):
+                return self._headers[section]
+        return None
+
+    def flush_batch(self, new_rows: list):
+        """Batch-Update: Daten direkt ersetzen, nur dataChanged (kein Layout-Signal)."""
+        if not new_rows:
+            return
+        old_count = len(self._rows)
+        self._rows.extend(new_rows)
+        if len(self._rows) > self._max_rows:
+            self._rows = self._rows[-self._max_rows:]
+        new_count = len(self._rows)
+        # Zeilen-Differenz behandeln
+        if new_count > old_count:
+            self.beginInsertRows(QModelIndex(), old_count, new_count - 1)
+            self.endInsertRows()
+        elif new_count < old_count:
+            self.beginRemoveRows(QModelIndex(), new_count, old_count - 1)
+            self.endRemoveRows()
+        # Bestehende Zeilen als geändert markieren (kein Layout-Rebuild)
+        if new_count > 0:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(new_count - 1, len(self._headers) - 1))
+
+    def clear(self):
+        self.beginResetModel()
+        self._rows.clear()
+        self.endResetModel()
+
+    def get_unique_values(self, column: int) -> list:
+        """Einzigartige Werte einer Spalte (für Filter-Popup)."""
+        values = set()
+        for row in self._rows:
+            if column < len(row) and row[column]:
+                values.add(str(row[column]))
+        return sorted(values)
+
+
+class MultiColumnFilterProxyModel(QSortFilterProxyModel):
+    """Proxy-Model mit Filter pro Spalte (Checkbox-Sets + Textsuche)."""
+
+    filter_changed = pyqtSignal()  # Signal wenn Filter sich ändern
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._checkbox_filters: Dict[int, set] = {}   # {col: set_of_allowed_values}
+        self._text_filters: Dict[int, str] = {}       # {col: search_text_lower}
+
+    def set_checkbox_filter(self, column: int, allowed_values: Optional[set]):
+        """Checkbox-Filter für eine Spalte setzen (None = entfernen)."""
+        if allowed_values is None:
+            self._checkbox_filters.pop(column, None)
+        else:
+            self._checkbox_filters[column] = allowed_values
+        self.invalidateFilter()
+        self.filter_changed.emit()
+
+    def set_text_filter(self, column: int, text: str):
+        """Textfilter für eine Spalte setzen."""
+        if not text:
+            self._text_filters.pop(column, None)
+        else:
+            self._text_filters[column] = text.lower()
+        self.invalidateFilter()
+        self.filter_changed.emit()
+
+    def clear_column_filter(self, column: int):
+        """Alle Filter einer Spalte entfernen."""
+        self._checkbox_filters.pop(column, None)
+        self._text_filters.pop(column, None)
+        self.invalidateFilter()
+        self.filter_changed.emit()
+
+    def clear_all_filters(self):
+        """Alle Filter entfernen."""
+        self._checkbox_filters.clear()
+        self._text_filters.clear()
+        self.invalidateFilter()
+        self.filter_changed.emit()
+
+    def has_filter(self, column: int) -> bool:
+        """Prüft ob eine Spalte einen aktiven Filter hat."""
+        return column in self._checkbox_filters or column in self._text_filters
+
+    def active_filter_columns(self) -> list:
+        """Liste aller Spalten mit aktivem Filter."""
+        cols = set(self._checkbox_filters.keys()) | set(self._text_filters.keys())
+        return sorted(cols)
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        model = self.sourceModel()
+        if model is None:
+            return True
+        for col, allowed in self._checkbox_filters.items():
+            idx = model.index(source_row, col, source_parent)
+            value = str(model.data(idx, Qt.ItemDataRole.DisplayRole) or '')
+            if value not in allowed:
+                return False
+        for col, text in self._text_filters.items():
+            idx = model.index(source_row, col, source_parent)
+            value = str(model.data(idx, Qt.ItemDataRole.DisplayRole) or '').lower()
+            if text not in value:
+                return False
+        return True
+
+
+class FilterPopup(QDialog):
+    """CANoe-Style Popup-Filter mit Checkboxen + Textsuche."""
+
+    applied = pyqtSignal(int, set)     # (column, allowed_values)
+    cleared = pyqtSignal(int)          # (column)
+
+    def __init__(self, column: int, header_label: str, unique_values: list,
+                 current_filter: Optional[set] = None, parent=None):
+        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self._column = column
+        self._all_values = unique_values
+        self.setMinimumWidth(220)
+        self.setMaximumHeight(400)
+        self.setStyleSheet(
+            "QDialog { background: #1e1e2e; border: 2px solid #0078d4;"
+            "  border-radius: 6px; }"
+            "QLabel { color: #e0e0e0; background: transparent; }"
+            "QLineEdit { background: #2a2a3e; color: #e0e0e0; border: 1px solid #444;"
+            "  border-radius: 3px; padding: 4px; }"
+            "QCheckBox { color: #e0e0e0; spacing: 6px; padding: 2px; }"
+            "QCheckBox::indicator { width: 14px; height: 14px; }"
+            "QCheckBox::indicator:unchecked { border: 1px solid #666; background: #2a2a3e;"
+            "  border-radius: 2px; }"
+            "QCheckBox::indicator:checked { border: 1px solid #0078d4; background: #0078d4;"
+            "  border-radius: 2px; }"
+            "QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;"
+            "  border-radius: 3px; padding: 5px 12px; }"
+            "QPushButton:hover { background: #3a3a5e; color: #fff; }"
+            "QPushButton#applyBtn { background: #0d47a1; color: white; border: 1px solid #1565c0; }"
+            "QPushButton#applyBtn:hover { background: #1565c0; }"
+            "QPushButton#clearBtn { background: #b71c1c; color: white; border: 1px solid #c62828; }"
+            "QPushButton#clearBtn:hover { background: #c62828; }"
+            "QScrollArea { border: none; background: transparent; }"
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        # --- Header ---
+        title = QLabel(f"🔽 Filter: {header_label}")
+        title.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        title.setStyleSheet("color: #0078d4;")
+        layout.addWidget(title)
+
+        # --- Suchfeld ---
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("🔍 Suchen...")
+        self._search.textChanged.connect(self._on_search_changed)
+        layout.addWidget(self._search)
+
+        # --- Alle-Checkbox ---
+        self._all_cb = QCheckBox("✅ Alle auswählen")
+        self._all_cb.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        all_selected = current_filter is None or len(current_filter) == len(unique_values)
+        self._all_cb.setChecked(all_selected)
+        self._all_cb.stateChanged.connect(self._on_all_toggled)
+        layout.addWidget(self._all_cb)
+
+        # --- Separator ---
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #3a3a5e;")
+        layout.addWidget(sep)
+
+        # --- Scrollbare Checkbox-Liste ---
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        self._cb_layout = QVBoxLayout(scroll_widget)
+        self._cb_layout.setContentsMargins(4, 2, 4, 2)
+        self._cb_layout.setSpacing(2)
+
+        self._checkboxes: List[QCheckBox] = []
+        for val in unique_values:
+            cb = QCheckBox(val)
+            cb.setFont(QFont("Consolas", 9))
+            if current_filter is None or val in current_filter:
+                cb.setChecked(True)
+            cb.stateChanged.connect(self._on_item_toggled)
+            self._cb_layout.addWidget(cb)
+            self._checkboxes.append(cb)
+        self._cb_layout.addStretch()
+
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll, 1)
+
+        # --- Info-Label ---
+        self._info_label = QLabel(self._build_info_text())
+        self._info_label.setFont(QFont("Segoe UI", 8))
+        self._info_label.setStyleSheet("color: #888;")
+        layout.addWidget(self._info_label)
+
+        # --- Buttons ---
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
+
+        clear_btn = QPushButton("✖ Zurücksetzen")
+        clear_btn.setObjectName("clearBtn")
+        clear_btn.clicked.connect(self._on_clear)
+        btn_layout.addWidget(clear_btn)
+
+        btn_layout.addStretch()
+
+        apply_btn = QPushButton("✔ Anwenden")
+        apply_btn.setObjectName("applyBtn")
+        apply_btn.clicked.connect(self._on_apply)
+        btn_layout.addWidget(apply_btn)
+
+        layout.addLayout(btn_layout)
+
+    def _build_info_text(self) -> str:
+        checked = sum(1 for cb in self._checkboxes if cb.isChecked() and cb.isVisible())
+        visible = sum(1 for cb in self._checkboxes if cb.isVisible())
+        return f"{checked}/{visible} ausgewählt"
+
+    def _on_search_changed(self, text: str):
+        text_lower = text.lower()
+        for cb in self._checkboxes:
+            cb.setVisible(text_lower in cb.text().lower())
+        self._info_label.setText(self._build_info_text())
+
+    def _on_all_toggled(self, state):
+        checked = state == 2  # Qt.CheckState.Checked
+        for cb in self._checkboxes:
+            if cb.isVisible():
+                cb.setChecked(checked)
+        self._info_label.setText(self._build_info_text())
+
+    def _on_item_toggled(self):
+        visible_cbs = [cb for cb in self._checkboxes if cb.isVisible()]
+        all_checked = all(cb.isChecked() for cb in visible_cbs) if visible_cbs else False
+        self._all_cb.blockSignals(True)
+        self._all_cb.setChecked(all_checked)
+        self._all_cb.blockSignals(False)
+        self._info_label.setText(self._build_info_text())
+
+    def _on_apply(self):
+        selected = {cb.text() for cb in self._checkboxes if cb.isChecked()}
+        if len(selected) == len(self._all_values):
+            self.cleared.emit(self._column)
+        else:
+            self.applied.emit(self._column, selected)
+        self.close()
+
+    def _on_clear(self):
+        self.cleared.emit(self._column)
+        self.close()
+
+
+class FilterHeaderView(QHeaderView):
+    """Header-View mit Filter-Indikator und Klick-Handler."""
+
+    filter_requested = pyqtSignal(int, QPoint)  # (column, global_pos)
+
+    def __init__(self, orientation=Qt.Orientation.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        self._filtered_columns: set = set()
+        self.setSectionsClickable(True)
+        self.sectionClicked.connect(self._on_section_clicked)
+        self.setStyleSheet(
+            "QHeaderView::section { background: #1a1a2e; color: #8888aa;"
+            "  border: 1px solid #2a2a3e; padding: 3px; font-weight: bold;"
+            "  font-family: 'Segoe UI'; font-size: 9pt; }")
+
+    def set_filtered_columns(self, columns: set):
+        """Aktualisiert die Menge der Spalten mit aktivem Filter."""
+        self._filtered_columns = columns
+        self.viewport().update()
+
+    def paintSection(self, painter, rect, logicalIndex):
+        """Zeichnet die Header-Sektion mit Filter-Indikator."""
+        painter.save()
+        super().paintSection(painter, rect, logicalIndex)
+        painter.restore()
+        if logicalIndex in self._filtered_columns:
+            painter.save()
+            painter.setRenderHint(painter.RenderHint.Antialiasing)
+            indicator_size = 8
+            x = rect.right() - indicator_size - 4
+            y = rect.top() + (rect.height() - indicator_size) // 2
+            painter.setBrush(QBrush(QColor("#0078d4")))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(x, y, indicator_size, indicator_size)
+            painter.restore()
+
+    def _on_section_clicked(self, logical_index: int):
+        """Zeigt Filter-Popup unter dem Header (nur wenn nicht am Resize-Rand)."""
+        # Mausposition prüfen: wenn nahe am Spaltenrand → Resize, kein Popup
+        cursor_x = self.mapFromGlobal(self.cursor().pos()).x()
+        section_start = self.sectionViewportPosition(logical_index)
+        section_end = section_start + self.sectionSize(logical_index)
+        margin = 8  # Pixel-Toleranz für Resize-Zone
+        if cursor_x < section_start + margin or cursor_x > section_end - margin:
+            return  # Resize-Zone → kein Filter-Popup
+        pos = self.mapToGlobal(QPoint(section_start, self.height()))
+        self.filter_requested.emit(logical_index, pos)
+
+
 class WiresharkPanel(QWidget):
     """Wireshark-ähnliches Panel für Paketanalyse."""
 
@@ -4922,13 +5287,13 @@ class WiresharkPanel(QWidget):
         self.interface_combo.setStyleSheet("text-align: left; padding: 3px 8px;")
         self._interface_menu = QMenu(self)
         self.interface_combo.setMenu(self._interface_menu)
-        self._populate_interfaces()
         self._interface_items = []  # [(label, userData), ...]
-        live_capture_layout.addWidget(self.interface_combo)
         self._selected_interfaces = []  # [(iface_name, type), ...] — Mehrfachauswahl
         self._selected_interface_type = "wsl"  # "wsl" oder "windows"
         self._wsl_interface_actions: Dict[str, QAction] = {}  # iface → QAction
         self._alle_action = None  # QAction fuer "Alle (Standard)"
+        self._populate_interfaces()  # NACH Variablen-Init aufrufen
+        live_capture_layout.addWidget(self.interface_combo)
 
         # Capture-Filter
         live_capture_layout.addWidget(QLabel("Capture Filter:"))
@@ -4937,16 +5302,8 @@ class WiresharkPanel(QWidget):
         self.capture_filter_entry.setText(self._default_capture_filter)
         live_capture_layout.addWidget(self.capture_filter_entry, 1)
 
-        # Paket-Limit
-        live_capture_layout.addWidget(QLabel("Max Pakete:"))
-        self.packet_limit_btn = QPushButton("10000")
-        self.packet_limit_menu = QMenu(self)
-        self.packet_limit_btn.setMenu(self.packet_limit_menu)
-        self._selected_packet_limit = "10000"
-        for limit in ["1000", "5000", "10000", "50000", "Unbegrenzt"]:
-            action = self.packet_limit_menu.addAction(limit)
-            action.triggered.connect(lambda checked, l=limit: self._on_packet_limit_selected(l))
-        live_capture_layout.addWidget(self.packet_limit_btn)
+        # Paket-Limit: fest auf Unbegrenzt
+        self._selected_packet_limit = "Unbegrenzt"
 
         # Start/Stop Buttons
         self.start_capture_btn = QPushButton("▶ Start Capture")
@@ -5350,7 +5707,11 @@ class WiresharkPanel(QWidget):
         video_toolbar = QWidget()
         video_toolbar.setStyleSheet(
             'QWidget { background-color: #1a1a2e; }'
-            'QLabel { color: #bbbbdd; background: transparent; border: none; }')
+            'QLabel { color: #bbbbdd; background: transparent; border: none; }'
+            'QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;'
+            '  border-radius: 3px; padding: 3px 8px; }'
+            'QPushButton:hover { background: #3a3a5e; color: #fff; }'
+            'QPushButton:checked { background: #2E7D32; color: white; font-weight: bold; }')
         video_header = QHBoxLayout(video_toolbar)
         video_header.setContentsMargins(4, 0, 4, 2)
         video_header.setSpacing(4)
@@ -5428,11 +5789,23 @@ class WiresharkPanel(QWidget):
             ('FlexRay', '#F44336', '⚡'),
         ]
         self._bus_pause_btns: List[QPushButton] = []
-        for bus_name, bus_color, bus_icon in _bus_defs:
+        self._bus_record_btns: List[QPushButton] = []
+        self._bus_recorded_data: List[List[tuple]] = [[], [], [], []]  # 4 Bus-Typen
+        self._bus_recording: List[bool] = [False, False, False, False]
+        self._bus_filter_status_labels: List[QLabel] = []
+        _BUS_BTN_STYLE = (
+            "QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;"
+            "  border-radius: 3px; padding: 3px 8px; }"
+            "QPushButton:hover { background: #3a3a5e; color: #fff; }"
+            "QPushButton:checked { background: #2E7D32; color: white; font-weight: bold; }")
+        for bi, (bus_name, bus_color, bus_icon) in enumerate(_bus_defs):
             bus_tb = QWidget()
             bus_tb.setStyleSheet(
                 'QWidget { background-color: #1a1a2e; }'
-                'QLabel { color: #bbbbdd; background: transparent; border: none; }')
+                'QLabel { color: #bbbbdd; background: transparent; border: none; }'
+                'QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;'
+                '  border-radius: 3px; padding: 3px 8px; }'
+                'QPushButton:hover { background: #3a3a5e; color: #fff; }')
             bus_h = QHBoxLayout(bus_tb)
             bus_h.setContentsMargins(4, 0, 4, 2)
             bus_h.setSpacing(4)
@@ -5442,14 +5815,46 @@ class WiresharkPanel(QWidget):
             bus_lbl.setStyleSheet(
                 f"color: {bus_color}; font-weight: bold; background: transparent;")
             bus_h.addWidget(bus_lbl)
+
+            # --- Filter-Status-Label ---
+            filter_status = QLabel("")
+            filter_status.setFont(QFont("Segoe UI", 8))
+            filter_status.setStyleSheet("color: #0078d4; background: transparent;")
+            self._bus_filter_status_labels.append(filter_status)
+            bus_h.addWidget(filter_status)
+
             bus_h.addStretch()
 
+            # --- Record-Button ---
+            rec_btn = QPushButton("⏺ Record")
+            rec_btn.setCheckable(True)
+            rec_btn.setFixedWidth(100)
+            rec_btn.setStyleSheet(
+                "QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;"
+                "  border-radius: 3px; padding: 3px 8px; }"
+                "QPushButton:hover { background: #3a3a5e; color: #fff; }"
+                "QPushButton:checked { background: #b71c1c; color: white; font-weight: bold; }")
+            rec_btn.toggled.connect(
+                lambda checked, idx=bi: self._on_bus_record_toggled(idx, checked))
+            self._bus_record_btns.append(rec_btn)
+            bus_h.addWidget(rec_btn)
+
+            # --- Filter-Reset-Button ---
+            filter_reset = QPushButton("🔄 Filter Reset")
+            filter_reset.setFixedWidth(110)
+            filter_reset.setStyleSheet(_BUS_BTN_STYLE)
+            filter_reset.clicked.connect(
+                lambda checked, idx=bi: self._on_bus_filter_reset(idx))
+            bus_h.addWidget(filter_reset)
+
+            # --- Pause-Button ---
             bus_pause = QPushButton("⏸ Pause")
             bus_pause.setCheckable(True)
             bus_pause.setFixedWidth(100)
             bus_pause.setStyleSheet(
                 "QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;"
                 "  border-radius: 3px; padding: 3px 8px; }"
+                "QPushButton:hover { background: #3a3a5e; color: #fff; }"
                 "QPushButton:checked { background: #2E7D32; color: white; font-weight: bold; }")
             self._bus_pause_btns.append(bus_pause)
             bus_h.addWidget(bus_pause)
@@ -5505,40 +5910,88 @@ class WiresharkPanel(QWidget):
         self._live_content_stack.addWidget(self._video_grid_widget)  # Index 0
 
         # --- Pages 1-4: Bus-Ansichten (CAN, LIN, Eth, FlexRay) ---
-        self._bus_tables: List[QTableWidget] = []
+        self._bus_tables: List[QTableView] = []
+        self._bus_models: List[BusTableModel] = []
+        self._bus_proxies: List[MultiColumnFilterProxyModel] = []
+        self._bus_headers: List[FilterHeaderView] = []
         _bus_columns = {
-            'CAN':      ['Zeit', 'Kanal', 'ID', 'Name', 'DLC', 'Daten', 'Info'],
-            'LIN':      ['Zeit', 'Kanal', 'ID', 'Name', 'DLC', 'Daten', 'Prüfsumme'],
-            'Ethernet': ['Zeit', 'Src MAC', 'Dst MAC', 'EtherType', 'Protokoll', 'Länge', 'Info'],
-            'FlexRay':  ['Zeit', 'Kanal', 'Slot', 'Zyklus', 'DLC', 'Daten', 'Info'],
+            'CAN':      ['Nr.', 'Zeit', 'Kanal', 'ID', 'Name', 'DLC', 'Daten', 'Info'],
+            'LIN':      ['Nr.', 'Zeit', 'Kanal', 'ID', 'Name', 'DLC', 'Daten', 'Prüfsumme'],
+            'Ethernet': ['Nr.', 'Zeit', 'Src MAC', 'Dst MAC', 'EtherType', 'Protokoll', 'Länge', 'Info'],
+            'FlexRay':  ['Nr.', 'Zeit', 'Kanal', 'Slot', 'Zyklus', 'DLC', 'Daten', 'Info'],
         }
-        for bus_name, _color, _icon in _bus_defs:
-            bus_table = QTableWidget()
-            bus_table.setColumnCount(7)
-            bus_table.setHorizontalHeaderLabels(_bus_columns[bus_name])
+        self._bus_row_counters = [0, 0, 0, 0]  # 每个 Bus 的序号计数器
+        # Flush-Pause für Column-Resize (muss VOR Header-Erstellung existieren)
+        self._bus_flush_paused = False
+        self._bus_flush_resume_timer = QTimer(self)
+        self._bus_flush_resume_timer.setSingleShot(True)
+        self._bus_flush_resume_timer.setInterval(500)
+        self._bus_flush_resume_timer.timeout.connect(self._resume_bus_flush)
+        for bus_idx, (bus_name, _color, _icon) in enumerate(_bus_defs):
+            # --- Model + Proxy ---
+            columns = _bus_columns[bus_name]
+            model = BusTableModel(columns, self)
+            proxy = MultiColumnFilterProxyModel(self)
+            proxy.setSourceModel(model)
+
+            # --- FilterHeaderView ---
+            filter_header = FilterHeaderView(Qt.Orientation.Horizontal, self)
+            filter_header.filter_requested.connect(
+                lambda col, pos, bi=bus_idx: self._show_bus_filter_popup(bi, col, pos))
+            filter_header.sectionResized.connect(self._pause_bus_flush)
+            proxy.filter_changed.connect(
+                lambda hdr=filter_header, prx=proxy: hdr.set_filtered_columns(
+                    set(prx.active_filter_columns())))
+            proxy.filter_changed.connect(
+                lambda bi=bus_idx: self._update_bus_filter_status(bi))
+
+            # --- QTableView ---
+            bus_table = QTableView()
+            bus_table.setModel(proxy)
+            bus_table.setHorizontalHeader(filter_header)
             bus_table.setAlternatingRowColors(True)
-            bus_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-            bus_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            bus_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+            bus_table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
             bus_table.setFont(QFont("Consolas", 9))
             bus_table.setStyleSheet(
-                "QTableWidget { background-color: #0a0a1a; color: #e0e0e0;"
-                "  gridline-color: #2a2a3e; }"
-                "QTableWidget::item:selected { background-color: #1565c0; }"
-                "QHeaderView::section { background: #1a1a2e; color: #8888aa;"
-                "  border: 1px solid #2a2a3e; padding: 3px; font-weight: bold; }")
+                "QTableView { background-color: #ffffff; color: #1a1a1a;"
+                "  alternate-background-color: #e8f5e9;"
+                "  gridline-color: #c8e6c9; }"
+                "QTableView::item:selected { background-color: #1565c0; color: #ffffff; }")
             header = bus_table.horizontalHeader()
-            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            for col in range(1, 6):
-                header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
-            header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+            header.setStretchLastSection(True)
+            # 默认列宽：Zeit, Kanal/Src, ID/Dst, Name/EtherType, DLC/Proto, Daten, Info
+            _default_widths = [180, 120, 70, 80, 100, 50, 200, 200]  # Nr.(x2)+7列
+            for col, w in enumerate(_default_widths):
+                if col < len(columns):
+                    bus_table.setColumnWidth(col, w)
             bus_table.verticalHeader().setVisible(False)
             bus_table.verticalHeader().setDefaultSectionSize(22)
 
+            self._bus_models.append(model)
+            self._bus_proxies.append(proxy)
+            self._bus_headers.append(filter_header)
             self._bus_tables.append(bus_table)
-            self._live_content_stack.addWidget(bus_table)  # Index 1-4
+            # CAN-Seite (bus_idx==0): PCAN-Integration
+            if bus_idx == 0:
+                from ui.pcan_config_widget import PcanCanPage
+                self._pcan_page = PcanCanPage(bus_table, self)
+                self._pcan_page.frame_for_bus_queue.connect(
+                    lambda row_tuple: self._bus_queues[0].append(row_tuple))
+                self._live_content_stack.addWidget(self._pcan_page)  # Index 1
+            else:
+                self._live_content_stack.addWidget(bus_table)  # Index 2-4
 
         self._current_live_tab = 0
         video_layout.addWidget(self._live_content_stack, 1)
+
+        # ── Bus-Daten Batch-Timer (100ms Intervall → max 10 UI-Updates/s) ──
+        self._bus_queues: List[list] = [[], [], [], []]
+        self._bus_flush_timer = QTimer(self)
+        self._bus_flush_timer.setInterval(200)
+        self._bus_flush_timer.timeout.connect(self._flush_bus_queues)
+        self._bus_flush_timer.start()
 
         # Video-Container initial sichtbar (schwarzer Hintergrund)
 
@@ -6995,19 +7448,23 @@ class WiresharkPanel(QWidget):
     def _on_wsl_interface_toggled(self, iface_name: str, checked: bool):
         """Callback wenn eine WSL-Interface-Checkbox umgeschaltet wird."""
         if iface_name == "":
-            # "Alle (Standard)" gewaehlt → alle Einzel-Checkboxen abwaehlen
-            if self._alle_action:
-                self._alle_action.setChecked(True)
+            if not checked:
+                return  # "Alle" abwaehlen → ignorieren, Einzelauswahl übernimmt
+            # "Alle (Standard)" aktiviert → alle Einzel-Checkboxen abwaehlen
             for act in self._wsl_interface_actions.values():
+                act.blockSignals(True)
                 act.setChecked(False)
+                act.blockSignals(False)
             self._selected_interfaces = [("", "wsl")]
             self._selected_interface_type = "wsl"
             self.interface_combo.setText("Alle (Standard)")
             return
 
-        # Einzel-Interface getoggelt → "Alle" abwaehlen
+        # Einzel-Interface getoggelt → "Alle" abwaehlen (ohne Signal-Kaskade)
         if self._alle_action:
+            self._alle_action.blockSignals(True)
             self._alle_action.setChecked(False)
+            self._alle_action.blockSignals(False)
 
         # Aktuelle Auswahl aus den Checkboxen lesen
         selected = []
@@ -7018,7 +7475,9 @@ class WiresharkPanel(QWidget):
         if not selected:
             # Nichts ausgewaehlt → zurueck auf "Alle"
             if self._alle_action:
+                self._alle_action.blockSignals(True)
                 self._alle_action.setChecked(True)
+                self._alle_action.blockSignals(False)
             self._selected_interfaces = [("", "wsl")]
             self._selected_interface_type = "wsl"
             self.interface_combo.setText("Alle (Standard)")
@@ -7050,7 +7509,6 @@ class WiresharkPanel(QWidget):
     def _on_packet_limit_selected(self, limit: str):
         """Wird aufgerufen, wenn ein Paket-Limit ausgewählt wird."""
         self._selected_packet_limit = limit
-        self.packet_limit_btn.setText(limit)
 
     def _show_live_capture_ui(self):
         """Zeigt die Live-Capture UI an."""
@@ -7083,10 +7541,14 @@ class WiresharkPanel(QWidget):
             return
 
         # Interface(s) und Filter abrufen
-        wsl_ifaces = [n for n, t in self._selected_interfaces if t == "wsl" and n]
+        # Direkt aus Checkbox-Status lesen (robuster als _selected_interfaces)
+        wsl_ifaces = [name for name, act in self._wsl_interface_actions.items()
+                      if act.isChecked()]
+        if not wsl_ifaces and self._selected_interfaces:
+            # Fallback: aus _selected_interfaces (z.B. Windows-Interface)
+            wsl_ifaces = [n for n, t in self._selected_interfaces if t == "wsl" and n]
         # Einzelner Interface-String fuer Abwaertskompatibilitaet
-        interface = wsl_ifaces[0] if len(wsl_ifaces) == 1 else (
-            self._selected_interfaces[0][0] if self._selected_interfaces else "")
+        interface = wsl_ifaces[0] if len(wsl_ifaces) == 1 else ""
         capture_filter = self.capture_filter_entry.text().strip()
 
         # Ring-Buffer Schwellwert aus Paket-Limit
@@ -7146,7 +7608,6 @@ class WiresharkPanel(QWidget):
         self.stop_capture_btn.setEnabled(True)
         self.interface_combo.setEnabled(False)
         self.capture_filter_entry.setEnabled(False)
-        self.packet_limit_btn.setEnabled(False)
         self._video_decode_btn.setEnabled(True)
         filter_info = f" (Filter: {capture_filter})" if capture_filter else ""
         iface_info = f" auf {', '.join(wsl_ifaces)}" if len(wsl_ifaces) > 1 else ""
@@ -7201,7 +7662,6 @@ class WiresharkPanel(QWidget):
         self.stop_capture_btn.setEnabled(False)
         self.interface_combo.setEnabled(True)
         self.capture_filter_entry.setEnabled(True)
-        self.packet_limit_btn.setEnabled(True)
 
         # Video-Decode: Backend stoppen, aber Anzeige beibehalten
         # (letzter Frame + Layout bleiben stehen)
@@ -7226,6 +7686,10 @@ class WiresharkPanel(QWidget):
             self._video_decode_btn.blockSignals(True)
             self._video_decode_btn.setChecked(False)
             self._video_decode_btn.blockSignals(False)
+
+        # PCAN-Verbindung trennen
+        if hasattr(self, "_pcan_page") and self._pcan_page is not None:
+            self._pcan_page.cleanup()
 
         self.status_label.setText(f"Live-Capture gestoppt. {len(self.packets)} Pakete erfasst.")
 
@@ -7288,6 +7752,8 @@ class WiresharkPanel(QWidget):
             try:
                 if Ether in pkt and pkt[Ether].type == 0x2090:
                     self._video_decoder.process_packet(pkt)
+                    # PLP 0x2090 kann auch Bus-Daten enthalten → routing
+                    self._route_tecmp_to_bus_tables(pkt)
                     # Nur Paketzaehler aktualisieren (alle 500 Pakete)
                     self._live_video_pkt_count = getattr(
                         self, '_live_video_pkt_count', 0) + 1
@@ -7310,6 +7776,9 @@ class WiresharkPanel(QWidget):
         # Tabelle aktualisieren (nur neue Zeile hinzufügen für Performance)
         self._add_packet_to_table(pkt, pkt_idx)
 
+        # ── TECMP → Bus-Tabellen Routing (CAN/LIN/Ethernet/FlexRay) ──
+        self._route_tecmp_to_bus_tables(pkt)
+
         # Video-Dekodierung: Nicht-0x2090 Protokolle (GVSP, RTP, etc.)
         if self._video_decode_active and self._video_decoder:
             self._video_decoder.process_packet(pkt)
@@ -7320,6 +7789,140 @@ class WiresharkPanel(QWidget):
             self.packet_count_label.setText(f"Pakete: {len(self.packets)} (gesamt: {total})")
         else:
             self.packet_count_label.setText(f"Pakete: {len(self.packets)}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # TECMP → Bus-Tabellen Routing
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # data_type → bus_index Mapping (0=CAN, 1=LIN, 2=Ethernet, 3=FlexRay)
+    _TECMP_BUS_MAP = {
+        0x0001: 0,  # CAN Raw    → Live CAN
+        0x0002: 0,  # CAN Data   → Live CAN
+        0x0003: 0,  # CAN FD     → Live CAN
+        0x0004: 1,  # LIN        → Live LIN
+        0x0080: 2,  # Ethernet   → Live Eth
+        0x0081: 2,  # Eth Raw    → Live Eth
+        0x0008: 3,  # FlexRay    → Live FlexRay
+    }
+
+    def _route_tecmp_to_bus_tables(self, pkt):
+        """Extrahiert Bus-Daten aus TECMP-Paketen und routet sie in die Bus-Tabellen."""
+        try:
+            tecmp_data = self._extract_tecmp_payload(pkt)
+            if tecmp_data is None:
+                return
+
+            if len(tecmp_data) < 12:
+                return
+
+            data_type = int.from_bytes(tecmp_data[6:8], 'big')
+            bus_index = self._TECMP_BUS_MAP.get(data_type)
+            if bus_index is None:
+                return  # Kein Bus-Datentyp (Status, GPIO, etc.)
+
+            # Pause-Check: wenn der Bus-Tab pausiert ist, nicht einfügen
+            if bus_index < len(self._bus_pause_btns) and self._bus_pause_btns[bus_index].isChecked():
+                return
+
+            # TECMP Header auswerten
+            device_id = int.from_bytes(tecmp_data[0:2], 'big')
+            channel_prefix = f"0x{device_id:04X}"
+
+            # Entries dekodieren
+            result = TECMPDecoder.decode(tecmp_data)
+            entries = result.get("entries", [])
+
+            for entry in entries:
+                bus_data = entry.get("bus_data")
+                if bus_data is None:
+                    continue
+
+                timestamp_ns = entry.get("timestamp_ns", 0)
+                interface_id = entry.get("interface_id", 0)
+                timestamp_s = timestamp_ns / 1_000_000_000.0
+                zeit = f"{timestamp_s:.6f}"
+                kanal = f"IF-{interface_id}"
+
+                row = self._format_bus_row(bus_index, data_type, zeit, kanal,
+                                           bus_data, entry.get("payload", ""))
+                if row:
+                    self._add_bus_data(bus_index, row)
+
+        except Exception:
+            pass
+
+    def _extract_tecmp_payload(self, pkt) -> Optional[bytes]:
+        """Extrahiert TECMP-Payload aus einem Scapy-Paket (EtherType oder UDP)."""
+        # Fall 1: DLT 148 (reines TECMP ohne Ethernet-Header)
+        if not (Ether in pkt or IP in pkt) and Raw in pkt:
+            raw_data = bytes(pkt[Raw].load)
+            if len(raw_data) >= 12:
+                return raw_data
+
+        if Ether not in pkt:
+            return None
+
+        # Fall 2: TECMP/PLP via EtherType 0x99FE oder 0x2090
+        if pkt[Ether].type in (TECMPDecoder.TECMP_ETHERTYPE, 0x2090):
+            if Raw in pkt:
+                return bytes(pkt[Raw].load)
+            return None
+
+        # Fall 3: TECMP via UDP Port 50000
+        if UDP in pkt:
+            udp = pkt[UDP]
+            if (udp.sport == TECMPDecoder.TECMP_DEFAULT_UDP_PORT or
+                    udp.dport == TECMPDecoder.TECMP_DEFAULT_UDP_PORT):
+                if Raw in pkt:
+                    return bytes(pkt[Raw].load)
+
+        return None
+
+    def _format_bus_row(self, bus_index: int, data_type: int, zeit: str,
+                        kanal: str, bus_data: dict, raw_payload: str) -> Optional[tuple]:
+        """Formatiert eine Bus-Zeile je nach Bus-Typ.
+
+        Spalten:
+          CAN:      (Zeit, Kanal, ID, Name, DLC, Daten, Info)
+          LIN:      (Zeit, Kanal, ID, Name, DLC, Daten, Prüfsumme)
+          Ethernet: (Zeit, Src MAC, Dst MAC, EtherType, Protokoll, Länge, Info)
+          FlexRay:  (Zeit, Kanal, Slot, Zyklus, DLC, Daten, Info)
+        """
+        fields = {f[0]: f[1] for f in bus_data.get("fields", [])}
+        protocol = bus_data.get("protocol", "")
+
+        if bus_index == 0:  # CAN / CAN FD
+            can_id = fields.get("CAN ID", "")
+            dlc = fields.get("DLC", "")
+            data_hex = fields.get("Data", "")
+            fd_flags = fields.get("FD Flags", "")
+            info = protocol
+            if fd_flags and fd_flags != "None":
+                info += f" [{fd_flags}]"
+            return (zeit, kanal, can_id, "", dlc, data_hex, info)
+
+        elif bus_index == 1:  # LIN
+            lin_id = fields.get("LIN ID", "")
+            dlc = fields.get("DLC", "")
+            data_hex = fields.get("Data", "")
+            checksum = fields.get("Checksum", "")
+            return (zeit, kanal, lin_id, "", dlc, data_hex, checksum)
+
+        elif bus_index == 2:  # Ethernet
+            src_mac = fields.get("Src MAC", "")
+            dst_mac = fields.get("Dst MAC", "")
+            ethertype = fields.get("EtherType", "")
+            length = fields.get("Length", str(len(raw_payload) // 2))
+            return (zeit, src_mac, dst_mac, ethertype, protocol, length, "")
+
+        elif bus_index == 3:  # FlexRay
+            channel = fields.get("Channel", "")
+            slot_id = fields.get("Slot ID", "")
+            cycle = fields.get("Cycle", "")
+            data_hex = fields.get("Data", "")
+            return (zeit, channel, slot_id, cycle, str(len(data_hex.split())), data_hex, protocol)
+
+        return None
 
     def _trim_live_packets(self):
         """Ring-Buffer: Entfernt die aeltesten 25% der Pakete."""
@@ -9939,4 +10542,152 @@ class WiresharkPanel(QWidget):
         # Toolbar + Content umschalten
         self._live_toolbar_stack.setCurrentIndex(index)
         self._live_content_stack.setCurrentIndex(index)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # CANoe-Style Bus-Filter: Popup + Datenrouting
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _show_bus_filter_popup(self, bus_index: int, column: int, global_pos: QPoint):
+        """Zeigt CANoe-Style Filter-Popup für eine Bus-Tabelle."""
+        model = self._bus_models[bus_index]
+        proxy = self._bus_proxies[bus_index]
+        header_label = model.headerData(
+            column, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole) or ''
+
+        unique_values = model.get_unique_values(column)
+        if not unique_values:
+            return
+
+        current_filter = proxy._checkbox_filters.get(column, None)
+
+        popup = FilterPopup(column, header_label, unique_values, current_filter, self)
+        popup.applied.connect(
+            lambda col, vals, prx=proxy: prx.set_checkbox_filter(col, vals))
+        popup.cleared.connect(
+            lambda col, prx=proxy: prx.clear_column_filter(col))
+
+        popup.move(global_pos)
+        popup.show()
+
+    def _add_bus_data(self, bus_index: int, row_data: tuple):
+        """Fügt eine Zeile in die Bus-Warteschlange ein (wird per Timer geflusht).
+
+        Spaltenformat je nach Bus (mit Nr. als erstes Feld):
+          CAN:      (nr, zeit, kanal, id_hex, name, dlc, daten_hex, info)
+          LIN:      (nr, zeit, kanal, id_hex, name, dlc, daten_hex, prüfsumme)
+          Ethernet: (nr, zeit, src_mac, dst_mac, ethertype, proto, länge, info)
+          FlexRay:  (nr, zeit, kanal, slot, zyklus, dlc, daten_hex, info)
+        """
+        if 0 <= bus_index < len(self._bus_models):
+            # Sequenznummer voranstellen
+            self._bus_row_counters[bus_index] += 1
+            numbered_row = (str(self._bus_row_counters[bus_index]),) + row_data
+            # In Warteschlange statt direkt ins Model
+            self._bus_queues[bus_index].append(numbered_row)
+            # Recording: Daten separat speichern
+            if self._bus_recording[bus_index]:
+                self._bus_recorded_data[bus_index].append(numbered_row)
+
+    def _pause_bus_flush(self, *args):
+        """Pausiert Bus-Flush während Column-Resize (verhindert UI-Freeze)."""
+        self._bus_flush_paused = True
+        self._bus_flush_resume_timer.start()  # Reset: 500ms nach letztem Resize
+
+    def _resume_bus_flush(self):
+        """Setzt Bus-Flush nach Column-Resize fort."""
+        self._bus_flush_paused = False
+
+    def _flush_bus_queues(self):
+        """Timer-Callback: leert alle Bus-Warteschlangen in die Models (Batch-Update)."""
+        if self._bus_flush_paused:
+            return  # Während Column-Resize keine Updates
+        # Nur den aktuell sichtbaren Bus-Tab updaten (Performance)
+        visible = self._current_live_tab - 1  # 0=Video, 1-4=Bus
+        for i in range(4):
+            queue = self._bus_queues[i]
+            if not queue:
+                continue
+            if i != visible:
+                # Unsichtbare Tabs: Daten verwerfen (nur Recording behalten)
+                queue.clear()
+                continue
+            batch = list(queue)
+            queue.clear()
+            if i < len(self._bus_models):
+                self._bus_models[i].flush_batch(batch)
+
+    def _clear_bus_data(self, bus_index: Optional[int] = None):
+        """Löscht Bus-Tabellen-Daten. None = alle löschen."""
+        if bus_index is not None:
+            if 0 <= bus_index < len(self._bus_models):
+                self._bus_models[bus_index].clear()
+        else:
+            for model in self._bus_models:
+                model.clear()
+
+    def _clear_all_bus_filters(self):
+        """Setzt alle Bus-Filter zurück."""
+        for i, proxy in enumerate(self._bus_proxies):
+            proxy.clear_all_filters()
+        self._update_all_bus_filter_status()
+
+    def _on_bus_record_toggled(self, bus_index: int, checked: bool):
+        """Record-Button: startet/stoppt Aufnahme der Bus-Daten."""
+        bus_names = ['CAN', 'LIN', 'Ethernet', 'FlexRay']
+        bus_name = bus_names[bus_index] if bus_index < len(bus_names) else f"Bus-{bus_index}"
+        if checked:
+            self._bus_recorded_data[bus_index] = []
+            self._bus_recording[bus_index] = True
+            self._bus_record_btns[bus_index].setText("⏺ Stop")
+        else:
+            self._bus_recording[bus_index] = False
+            self._bus_record_btns[bus_index].setText("⏺ Record")
+            recorded = self._bus_recorded_data[bus_index]
+            if not recorded:
+                QMessageBox.information(self, "Record", f"Keine {bus_name}-Daten aufgezeichnet.")
+                return
+            # Export-Dialog
+            path, _ = QFileDialog.getSaveFileName(
+                self, f"{bus_name}-Aufnahme speichern",
+                f"{bus_name}_record_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "CSV (*.csv);;Alle (*)")
+            if path:
+                headers = self._bus_models[bus_index]._headers
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(';'.join(headers) + '\n')
+                    for row in recorded:
+                        f.write(';'.join(str(v) for v in row) + '\n')
+                QMessageBox.information(
+                    self, "Record",
+                    f"{len(recorded)} {bus_name}-Frames gespeichert:\n{path}")
+
+    def _on_bus_filter_reset(self, bus_index: int):
+        """Reset-Button: alle Filter einer Bus-Tabelle entfernen."""
+        if 0 <= bus_index < len(self._bus_proxies):
+            self._bus_proxies[bus_index].clear_all_filters()
+            self._update_bus_filter_status(bus_index)
+
+    def _update_bus_filter_status(self, bus_index: int):
+        """Aktualisiert das Filter-Status-Label einer Bus-Tabelle."""
+        if 0 <= bus_index < len(self._bus_proxies):
+            proxy = self._bus_proxies[bus_index]
+            model = self._bus_models[bus_index]
+            active_cols = proxy.active_filter_columns()
+            if active_cols:
+                col_names = []
+                for c in active_cols:
+                    name = model.headerData(
+                        c, Qt.Orientation.Horizontal, Qt.ItemDataRole.DisplayRole)
+                    col_names.append(name or f"#{c}")
+                visible = proxy.rowCount()
+                total = model.rowCount()
+                self._bus_filter_status_labels[bus_index].setText(
+                    f"🔵 Filter aktiv: {', '.join(col_names)}  ({visible}/{total})")
+            else:
+                self._bus_filter_status_labels[bus_index].setText("")
+
+    def _update_all_bus_filter_status(self):
+        """Aktualisiert alle Bus-Filter-Status-Labels."""
+        for i in range(len(self._bus_proxies)):
+            self._update_bus_filter_status(i)
 
