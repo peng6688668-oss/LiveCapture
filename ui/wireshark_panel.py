@@ -10946,6 +10946,9 @@ class WiresharkPanel(QWidget):
             queue.clear()
             if i < len(self._bus_models):
                 self._bus_models[i].flush_batch(batch)
+                # Auto-Scroll zum letzten Eintrag
+                if i < len(self._bus_tables):
+                    self._bus_tables[i].scrollToBottom()
 
     def _clear_bus_data(self, bus_index: Optional[int] = None):
         """Löscht Bus-Tabellen-Daten. None = alle löschen."""
