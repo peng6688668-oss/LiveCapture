@@ -5994,60 +5994,107 @@ class WiresharkPanel(QWidget):
 
         self._top_stack.addWidget(buscheck_splitter)  # Index 1
 
-        # ── Seite 2: Diagnose (UDS, XCP, Kalibrierung) ──
+        # ── Seite 2: Diagnose (XCP + Platzhalter fuer UDS/Signal/Auto) ──
         diagnose_widget = QWidget()
         diagnose_layout = QVBoxLayout(diagnose_widget)
-        diagnose_layout.setContentsMargins(8, 8, 8, 8)
-        diagnose_layout.setSpacing(8)
+        diagnose_layout.setContentsMargins(0, 0, 0, 0)
+        diagnose_layout.setSpacing(0)
 
-        diag_title = QLabel("🔧 Diagnose")
-        diag_title.setStyleSheet(
-            "font-size: 14px; font-weight: bold; color: #333;")
-        diagnose_layout.addWidget(diag_title)
+        # Diagnose Sub-Tab-Leiste
+        diag_tab_bar = QWidget()
+        diag_tab_bar.setStyleSheet('background-color: #e8e8f0;')
+        diag_tab_layout = QHBoxLayout(diag_tab_bar)
+        diag_tab_layout.setContentsMargins(4, 2, 4, 0)
+        diag_tab_layout.setSpacing(2)
 
-        diag_cards_layout = QHBoxLayout()
-        diag_cards_layout.setSpacing(12)
+        self._diag_tab_buttons = []
+        self._diag_stack = QStackedWidget()
 
-        _diag_modules = [
+        _DIAG_TAB_INACTIVE = (
+            'QPushButton { background: #dcdce5; color: #555555;'
+            '  border: 1px solid #c0c0c8; border-bottom: none;'
+            '  border-radius: 4px 4px 0 0; padding: 3px 10px; font-size: 10px; }'
+            'QPushButton:hover { background: #d0d0dc; color: #333333; }')
+        _DIAG_TAB_ACTIVE = (
+            'QPushButton { background: #ffffff; color: #0d47a1;'
+            '  border: 1px solid #c0c0c8; border-bottom: 2px solid #ffffff;'
+            '  border-radius: 4px 4px 0 0; padding: 3px 10px;'
+            '  font-size: 10px; font-weight: bold; }')
+        self._diag_tab_active_style = _DIAG_TAB_ACTIVE
+        self._diag_tab_inactive_style = _DIAG_TAB_INACTIVE
+
+        for i, label in enumerate([
+            '📐 XCP Kalibrierung', '🩺 UDS Diagnose',
+            '📊 Signalanalyse', '🤖 Automatisierung',
+        ]):
+            btn = QPushButton(label)
+            btn.setStyleSheet(_DIAG_TAB_ACTIVE if i == 0 else _DIAG_TAB_INACTIVE)
+            btn.clicked.connect(
+                lambda checked, idx=i: self._switch_diag_tab(idx))
+            diag_tab_layout.addWidget(btn)
+            self._diag_tab_buttons.append(btn)
+        diag_tab_layout.addStretch()
+        diagnose_layout.addWidget(diag_tab_bar)
+
+        # ── Tab 0: XCP Kalibrierung (lazy import von Messtechnik) ──
+        xcp_container = QWidget()
+        xcp_layout = QVBoxLayout(xcp_container)
+        xcp_layout.setContentsMargins(0, 0, 0, 0)
+        try:
+            import sys
+            messtechnik_path = '/home/pengzhang/Messtechnik'
+            if messtechnik_path not in sys.path:
+                sys.path.insert(0, messtechnik_path)
+            from ui.xcp_panel import XCPPanel
+            self._xcp_panel = XCPPanel()
+            xcp_layout.addWidget(self._xcp_panel)
+        except Exception as _xcp_err:
+            _xcp_fallback = QLabel(
+                f"📐 XCP Kalibrierung\n\n"
+                f"Messtechnik-Modul nicht verfuegbar:\n{_xcp_err}\n\n"
+                f"Erwartet unter: /home/pengzhang/Messtechnik/")
+            _xcp_fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            _xcp_fallback.setStyleSheet("color: #888; font-size: 12px;")
+            _xcp_fallback.setWordWrap(True)
+            xcp_layout.addWidget(_xcp_fallback)
+            self._xcp_panel = None
+        self._diag_stack.addWidget(xcp_container)  # Index 0
+
+        # ── Tab 1-3: Platzhalter ──
+        _placeholders = [
             ("🩺 UDS Diagnose",
              "ISO 14229 Unified Diagnostic Services\n"
-             "Fehlerspeicher lesen/loeschen, ECU-Info,\n"
-             "Routinen ausfuehren, IO-Control"),
-            ("📐 XCP Kalibrierung",
-             "ASAM XCP on CAN / XCP on Ethernet\n"
-             "DAQ-Messung, Parameter-Kalibrierung,\n"
-             "A2L-Datei Import, Signaldarstellung"),
+             "Fehlerspeicher lesen/loeschen, ECU-Info, IO-Control"),
             ("📊 Signalanalyse",
              "MDF4 Signal-Viewer, DBC/LDF Dekodierung\n"
-             "Echtzeit-Plot, Statistik, Export,\n"
-             "Trigger-basierte Aufzeichnung"),
+             "Echtzeit-Plot, Statistik, Export"),
             ("🤖 Automatisierung",
-             "Testfall-Scripting (Python),\n"
-             "Sequenz-Editor, CI/CD-Integration,\n"
-             "Report-Generierung"),
+             "Testfall-Scripting (Python), Sequenz-Editor\n"
+             "CI/CD-Integration, Report-Generierung"),
         ]
-        for title, desc in _diag_modules:
-            card = QGroupBox(title)
-            card.setStyleSheet(
-                "QGroupBox { font-weight: bold; font-size: 11px;"
-                "  border: 1px solid #d0d0d8; border-radius: 6px;"
-                "  margin-top: 8px; padding: 12px 8px 8px 8px; }"
-                "QGroupBox::title { subcontrol-origin: margin;"
-                "  left: 10px; padding: 0 6px; }")
-            card_layout = QVBoxLayout(card)
-            lbl = QLabel(desc)
-            lbl.setStyleSheet("color: #555; font-size: 10px;")
-            lbl.setWordWrap(True)
-            card_layout.addWidget(lbl)
-            coming = QLabel("Kommt in V2.0")
-            coming.setStyleSheet(
-                "color: #FF9800; font-weight: bold; font-size: 9px;")
-            coming.setAlignment(Qt.AlignmentFlag.AlignRight)
-            card_layout.addWidget(coming)
-            diag_cards_layout.addWidget(card)
+        for title, desc in _placeholders:
+            ph = QWidget()
+            ph_layout = QVBoxLayout(ph)
+            ph_layout.addStretch()
+            ph_title = QLabel(title)
+            ph_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            ph_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+            ph_layout.addWidget(ph_title)
+            ph_desc = QLabel(desc)
+            ph_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            ph_desc.setStyleSheet("color: #666; font-size: 11px;")
+            ph_desc.setWordWrap(True)
+            ph_layout.addWidget(ph_desc)
+            ph_coming = QLabel("Kommt in V2.0")
+            ph_coming.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            ph_coming.setStyleSheet(
+                "color: #FF9800; font-weight: bold; font-size: 13px;"
+                " margin-top: 12px;")
+            ph_layout.addWidget(ph_coming)
+            ph_layout.addStretch()
+            self._diag_stack.addWidget(ph)
 
-        diagnose_layout.addLayout(diag_cards_layout)
-        diagnose_layout.addStretch()
+        diagnose_layout.addWidget(self._diag_stack, 1)
 
         self._top_stack.addWidget(diagnose_widget)  # Index 2
 
@@ -11612,6 +11659,14 @@ class WiresharkPanel(QWidget):
         if index == 1 and hasattr(self, '_buscheck_blink_timer'):
             self._buscheck_blink_timer.stop()
             self._buscheck_blink_on = False
+
+    def _switch_diag_tab(self, index: int):
+        """Wechselt zwischen Diagnose Sub-Tabs (XCP, UDS, Signal, Auto)."""
+        self._diag_stack.setCurrentIndex(index)
+        for i, btn in enumerate(self._diag_tab_buttons):
+            btn.setStyleSheet(
+                self._diag_tab_active_style if i == index
+                else self._diag_tab_inactive_style)
 
     def _trigger_buscheck_blink(self):
         """Startet BusCheck-Tab-Blinken wenn Loss erkannt und Tab nicht aktiv."""
