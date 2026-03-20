@@ -1655,7 +1655,11 @@ class PacketLoaderThread(QThread):
                 return (src_mac, dst_mac, "ARP", "", length), color_extra
             elif ethertype == 0x86DD:  # IPv6
                 return (src_mac, dst_mac, "IPv6", "", length), color_extra
-            elif ethertype == 0x99FE:  # PLP/TECMP EtherType
+            elif ethertype == 0x99FE:  # PLP/TECMP / ASAM CMP
+                if Raw in pkt and len(bytes(pkt[Raw].load)) >= 2:
+                    r = bytes(pkt[Raw].load)
+                    if r[0] == 0x01 and r[1] == 0x00:
+                        return (src_mac, dst_mac, "ASAM CMP", "", length), color_extra
                 return (src_mac, dst_mac, "PLP/TECMP", "", length), color_extra
             else:
                 return (src_mac, dst_mac, "Ethernet", f"EtherType: 0x{ethertype:04X}", length), color_extra
@@ -2722,10 +2726,14 @@ class LiveVideoDecoder(QObject):
         if not (Ether in pkt):
             return None
 
-        # 1. TECMP (EtherType 0x99FE)
+        # 1. TECMP / ASAM CMP (EtherType 0x99FE)
         if pkt[Ether].type == 0x99FE:
             if Raw in pkt:
                 raw = bytes(pkt[Raw].load)
+                if len(raw) >= 8:
+                    # ASAM CMP: byte[0]=0x01 (Version), byte[1]=0x00 (Reserved)
+                    if raw[0] == 0x01 and raw[1] == 0x00 and raw[4] in (0x01, 0x02, 0x03, 0x0D):
+                        return 'asam_cmp'
                 if len(raw) >= 12:
                     data_type = int.from_bytes(raw[8:10], 'big')
                     # 0x0005 = Ethernet → innerer RTP
@@ -8121,8 +8129,9 @@ class WiresharkPanel(QWidget):
         # Tabelle aktualisieren (nur neue Zeile hinzufügen für Performance)
         self._add_packet_to_table(pkt, pkt_idx)
 
-        # ── TECMP → Bus-Tabellen Routing (CAN/LIN/Ethernet/FlexRay) ──
+        # ── TECMP / ASAM CMP → Bus-Tabellen Routing (CAN/LIN/Ethernet/FlexRay) ──
         self._route_tecmp_to_bus_tables(pkt)
+        self._route_cmp_to_bus_tables(pkt)
 
         # Video-Dekodierung: Nicht-0x2090 Protokolle (GVSP, RTP, etc.)
         if self._video_decode_active and self._video_decoder:
@@ -8151,6 +8160,172 @@ class WiresharkPanel(QWidget):
         0x0020: 4,  # Analog     → Live Analog
         0x000A: 5,  # GPIO       → Live Digital
     }
+
+    # ASAM CMP payload_type → bus_index Mapping
+    _CMP_BUS_MAP = {
+        0x01: 0,  # CAN       → Live CAN
+        0x02: 0,  # CAN FD    → Live CAN
+        0x03: 1,  # LIN       → Live LIN
+        0x04: 3,  # FlexRay   → Live FlexRay
+        0x05: 5,  # Digital   → Live Digital
+        0x07: 4,  # Analog    → Live Analog
+        0x08: 2,  # Ethernet  → Live Eth
+    }
+
+    # ASAM CMP LIN Fehlerflags
+    _CMP_LIN_ERROR_FLAGS = {
+        0x0001: "Checksum", 0x0002: "Collision", 0x0004: "Parity",
+        0x0008: "No Response", 0x0010: "Sync", 0x0020: "Framing",
+        0x0040: "Short Dominant", 0x0080: "Long Dominant",
+    }
+
+    # ASAM CMP CAN Fehlerflags
+    _CMP_CAN_ERROR_FLAGS = {
+        0x0001: "CRC", 0x0002: "ACK", 0x0004: "Passive ACK",
+        0x0008: "Active ACK", 0x0010: "ACK Delim", 0x0020: "Form",
+        0x0040: "Stuff", 0x0080: "CRC Delim", 0x0100: "EOF",
+        0x0200: "Bit", 0x0400: "R0 Bit",
+    }
+
+    def _route_cmp_to_bus_tables(self, pkt):
+        """Extrahiert Bus-Daten aus ASAM CMP-Paketen und routet sie in die Bus-Tabellen."""
+        try:
+            if Ether not in pkt or pkt[Ether].type != 0x99FE:
+                return
+            if Raw not in pkt:
+                return
+            raw = bytes(pkt[Raw].load)
+            if len(raw) < 8:
+                return
+            # ASAM CMP Erkennung: Version=0x01, Reserved=0x00
+            if raw[0] != 0x01 or raw[1] != 0x00:
+                return
+            msg_type = raw[4]
+            if msg_type != 0x01:  # Nur Data Messages (0x01)
+                return
+
+            import struct
+            cur = 8  # Nach dem 8-Byte Frame Header
+            while cur + 16 <= len(raw):
+                # Message Header (16 Bytes)
+                ts_ns = struct.unpack('!Q', raw[cur:cur + 8])[0]
+                interface_id = struct.unpack('!I', raw[cur + 8:cur + 12])[0]
+                common_flags = raw[cur + 12]
+                payload_type = raw[cur + 13]
+                payload_len = struct.unpack('!H', raw[cur + 14:cur + 16])[0]
+
+                payload_start = cur + 16
+                payload_end = payload_start + payload_len
+
+                bus_index = self._CMP_BUS_MAP.get(payload_type)
+                if bus_index is not None and payload_end <= len(raw):
+                    # Pause-Check
+                    if bus_index < len(self._bus_pause_btns) and \
+                       self._bus_pause_btns[bus_index].isChecked():
+                        cur = payload_end
+                        continue
+
+                    payload = raw[payload_start:payload_end]
+                    ts_s = ts_ns / 1_000_000_000.0
+                    zeit = f"{ts_s:.6f}"
+                    kanal = f"IF-{interface_id}"
+                    has_error = bool(common_flags & 0x40)
+
+                    row = self._format_cmp_bus_row(
+                        bus_index, payload_type, zeit, kanal, payload, has_error)
+                    if row:
+                        self._add_bus_data(bus_index, row)
+                        self._plp_pkt_counter[bus_index] += 1
+                        self._plp_can_frame_counter[bus_index] += 1
+
+                        # LIN Per-ID Statistik
+                        if bus_index == 1 and hasattr(self, '_plin_page'):
+                            fields = self._extract_cmp_lin_fields(payload)
+                            if fields:
+                                self._plin_page.record_plp_frame(
+                                    fields, has_error or bool(
+                                        struct.unpack('!H', payload[0:2])[0]))
+
+                cur = payload_end if payload_end > cur + 16 else cur + 16
+
+        except Exception:
+            pass
+
+    def _extract_cmp_lin_fields(self, payload: bytes) -> dict:
+        """Extrahiert LIN-Felder aus CMP LIN Payload fuer Per-ID Statistik."""
+        if len(payload) < 8:
+            return {}
+        import struct
+        flags = struct.unpack('!H', payload[0:2])[0]
+        pid = payload[4]
+        lin_id = pid & 0x3F
+        checksum = payload[6]
+        data_len = payload[7]
+        errors = [n for bit, n in self._CMP_LIN_ERROR_FLAGS.items() if flags & bit]
+        return {
+            "LIN ID": f"0x{lin_id:02X}",
+            "Checksum": f"0x{checksum:02X}",
+            "Errors": ", ".join(errors) if errors else "",
+        }
+
+    def _format_cmp_bus_row(self, bus_index: int, payload_type: int,
+                            zeit: str, kanal: str, payload: bytes,
+                            has_error: bool) -> Optional[tuple]:
+        """Formatiert eine Bus-Zeile aus ASAM CMP Payload."""
+        import struct
+
+        if bus_index == 1 and payload_type == 0x03:  # LIN
+            if len(payload) < 8:
+                return None
+            flags = struct.unpack('!H', payload[0:2])[0]
+            pid = payload[4]
+            lin_id = pid & 0x3F
+            checksum = payload[6]
+            data_len = payload[7]
+            data_bytes = payload[8:8 + data_len] if len(payload) >= 8 + data_len else b''
+            data_hex = " ".join(f"{b:02X}" for b in data_bytes)
+
+            errors = [n for bit, n in self._CMP_LIN_ERROR_FLAGS.items() if flags & bit]
+            checksum_str = f"0x{checksum:02X}"
+            if errors:
+                checksum_str += f" [ERR: {', '.join(errors)}]"
+            return (zeit, kanal, f"0x{lin_id:02X}", "", str(data_len),
+                    data_hex, checksum_str)
+
+        elif bus_index == 0 and payload_type in (0x01, 0x02):  # CAN / CAN FD
+            if len(payload) < 16:
+                return None
+            flags = struct.unpack('!H', payload[0:2])[0]
+            can_id_raw = struct.unpack('!I', payload[4:8])[0]
+            dlc = payload[14]
+            data_len = payload[15]
+            can_id = can_id_raw & 0x1FFFFFFF
+            ide = bool(can_id_raw & 0x80000000)
+            data_bytes = payload[16:16 + data_len] if len(payload) >= 16 + data_len else b''
+            data_hex = " ".join(f"{b:02X}" for b in data_bytes)
+
+            id_str = f"0x{can_id:08X}" if ide else f"0x{can_id:03X}"
+            errors = [n for bit, n in self._CMP_CAN_ERROR_FLAGS.items() if flags & bit]
+            proto = "CAN FD" if payload_type == 0x02 else "CAN"
+            info = f"CMP {proto}"
+            if errors:
+                info += f" [ERR: {', '.join(errors)}]"
+            return (zeit, kanal, id_str, "", str(dlc), data_hex, info)
+
+        elif bus_index == 3 and payload_type == 0x04:  # FlexRay
+            if len(payload) < 14:
+                return None
+            channel = payload[4]
+            slot_id = struct.unpack('!H', payload[6:8])[0]
+            cycle = payload[8]
+            data_len = payload[13]
+            data_bytes = payload[14:14 + data_len] if len(payload) >= 14 + data_len else b''
+            data_hex = " ".join(f"{b:02X}" for b in data_bytes)
+            ch_str = "A" if channel == 0 else "B" if channel == 1 else str(channel)
+            return (zeit, ch_str, str(slot_id), str(cycle), str(data_len),
+                    data_hex, "CMP FlexRay")
+
+        return None
 
     def _route_tecmp_to_bus_tables(self, pkt):
         """Extrahiert Bus-Daten aus TECMP-Paketen und routet sie in die Bus-Tabellen."""
