@@ -6061,6 +6061,12 @@ class WiresharkPanel(QWidget):
             self._bus_filter_status_labels.append(filter_status)
             bus_h.addWidget(filter_status)
 
+            # --- Platzhalter fuer Bus-spezifische Buttons (Verbinden/Start/Stop) ---
+            self._bus_toolbar_insert_layout = QHBoxLayout() if bi == 0 else None
+            if bi == 0:
+                self._bus_toolbar_insert_layout.setSpacing(4)
+                bus_h.addLayout(self._bus_toolbar_insert_layout)
+
             bus_h.addStretch()
 
             # --- Record-Button ---
@@ -6255,6 +6261,14 @@ class WiresharkPanel(QWidget):
                 self._pcan_page.frame_for_bus_queue.connect(
                     lambda row_tuple: self._bus_queues[0].append(row_tuple))
                 self._live_content_stack.addWidget(self._pcan_page)
+                # Verbinden/Start/Stop in Toolbar verschieben
+                if hasattr(self, '_bus_toolbar_insert_layout'):
+                    tl = self._bus_toolbar_insert_layout
+                    p = self._pcan_page
+                    tl.addWidget(p._connect_btn)
+                    tl.addWidget(p._status_indicator)
+                    tl.addWidget(p._per_start)
+                    tl.addWidget(p._per_stop)
             elif bus_idx == 1:  # LIN
                 from ui.plin_config_widget import PlinLinPage
                 self._plin_page = PlinLinPage(bus_table, self)
