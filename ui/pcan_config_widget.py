@@ -656,6 +656,9 @@ class PcanCanPage(QWidget):
                 col, QHeaderView.ResizeMode.Stretch
                 if col == 6 else QHeaderView.ResizeMode.Interactive)
             self._tx_table.setColumnWidth(col, w)
+        # Doppelklick auf Header → Spalte an Inhalt anpassen
+        h.sectionDoubleClicked.connect(
+            lambda col: self._tx_table.resizeColumnToContents(col))
 
         # Leere Zeilen fuer initiale blau/weiss Anzeige
         for r in range(30):

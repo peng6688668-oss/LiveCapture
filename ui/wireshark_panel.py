@@ -6099,15 +6099,26 @@ class WiresharkPanel(QWidget):
                 "QTableView { background-color: #ffffff; color: #1a1a1a;"
                 "  alternate-background-color: #e8f5e9;"
                 "  gridline-color: #c8e6c9; }"
-                "QTableView::item:selected { background-color: #1565c0; color: #ffffff; }")
+                "QTableView::item:selected { background-color: #1565c0;"
+                "  color: #ffffff; }"
+                "QHeaderView::section { background: #f5f5f7; color: #0d0d17;"
+                "  padding: 4px 6px; border: none;"
+                "  border-right: 1px solid #d0d0d8;"
+                "  border-bottom: 1px solid #333333;"
+                "  font-weight: bold; }")
             header = bus_table.horizontalHeader()
             header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-            header.setStretchLastSection(True)
-            # 默认列宽：Zeit, Kanal/Src, ID/Dst, Name/EtherType, DLC/Proto, Daten, Info
-            _default_widths = [180, 120, 70, 80, 100, 50, 200, 200]  # Nr.(x2)+7列
+            # Daten-Spalte (col 6) dehnt sich wie TX-Tabelle
+            if len(columns) > 6:
+                header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+            # 默认列宽 — gleich wie TX: Daten breit, Info kompakt
+            _default_widths = [180, 120, 70, 80, 100, 50, 800, 100]
             for col, w in enumerate(_default_widths):
                 if col < len(columns):
                     bus_table.setColumnWidth(col, w)
+            # Doppelklick auf Header → Spalte an Inhalt anpassen
+            header.sectionDoubleClicked.connect(
+                lambda col, t=bus_table: t.resizeColumnToContents(col))
             bus_table.verticalHeader().setVisible(False)
             bus_table.verticalHeader().setDefaultSectionSize(22)
 
