@@ -346,14 +346,20 @@ class PcanCanPage(QWidget):
 
         self._per_start = QPushButton("\u25b6 Start")
         self._per_start.setStyleSheet(
-            "background-color: #4CAF50; color: white; font-weight: bold;")
+            "QPushButton { background-color: #4CAF50; color: white;"
+            "  font-weight: bold; }"
+            "QPushButton:disabled { background-color: #a0a0a0;"
+            "  color: #666666; }")
         self._per_start.clicked.connect(self._start_periodic)
         self._per_start.setEnabled(False)
         self._per_start.setMinimumWidth(80)
 
         self._per_stop = QPushButton("\u2b1b Stop")
         self._per_stop.setStyleSheet(
-            "background-color: #f44336; color: white; font-weight: bold;")
+            "QPushButton { background-color: #f44336; color: white;"
+            "  font-weight: bold; }"
+            "QPushButton:disabled { background-color: #a0a0a0;"
+            "  color: #666666; }")
         self._per_stop.clicked.connect(self._stop_periodic)
         self._per_stop.setEnabled(False)
         self._per_stop.setMinimumWidth(80)
