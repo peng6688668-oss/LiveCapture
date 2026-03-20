@@ -6061,13 +6061,13 @@ class WiresharkPanel(QWidget):
             self._bus_filter_status_labels.append(filter_status)
             bus_h.addWidget(filter_status)
 
-            # --- Platzhalter fuer Bus-spezifische Buttons (Verbinden/Start/Stop) ---
+            bus_h.addStretch()
+
+            # --- Platzhalter fuer CAN Buttons (Verbinden/Start/Stop) ---
             if bi == 0:
                 self._can_toolbar_layout = QHBoxLayout()
                 self._can_toolbar_layout.setSpacing(4)
                 bus_h.addLayout(self._can_toolbar_layout)
-
-            bus_h.addStretch()
 
             # --- Record-Button ---
             rec_btn = QPushButton("⏺ Record")
