@@ -5775,15 +5775,15 @@ class WiresharkPanel(QWidget):
         counter_title_row.addWidget(self._counter_toggle_btn)
         counter_title_row.addStretch()
 
-        self._counter_reset_btn = QPushButton("Reset")
-        self._counter_reset_btn.setFixedSize(50, 20)
-        self._counter_reset_btn.setFont(QFont("Consolas", 8))
+        self._counter_reset_btn = QPushButton("\u21bb Reset")
+        self._counter_reset_btn.setFixedSize(70, 24)
+        self._counter_reset_btn.setFont(QFont("Segoe UI", 9))
         self._counter_reset_btn.clicked.connect(self._reset_counter_monitor)
         counter_title_row.addWidget(self._counter_reset_btn)
 
-        self._counter_stop_btn = QPushButton("Pause")
-        self._counter_stop_btn.setFixedSize(50, 20)
-        self._counter_stop_btn.setFont(QFont("Consolas", 8))
+        self._counter_stop_btn = QPushButton("\u23f8 Pause")
+        self._counter_stop_btn.setFixedSize(70, 24)
+        self._counter_stop_btn.setFont(QFont("Segoe UI", 9))
         self._counter_stop_btn.setCheckable(True)
         self._counter_stop_btn.setStyleSheet(
             "QPushButton:checked { background-color: #d32f2f; color: white; }"
@@ -5951,7 +5951,7 @@ class WiresharkPanel(QWidget):
         top_tab_layout.setSpacing(2)
 
         self._top_tab_buttons = []
-        for i, label in enumerate(['🌐 Netzwerk', '🔍 BusCheck']):
+        for i, label in enumerate(['🌐 Netzwerk', '🔍 BusCheck', '🔧 Diagnose']):
             btn = QPushButton(label)
             btn.setStyleSheet(_TOP_TAB_ACTIVE if i == 0 else _TOP_TAB_INACTIVE)
             btn.clicked.connect(lambda checked, idx=i: self._switch_top_tab(idx))
@@ -5993,6 +5993,63 @@ class WiresharkPanel(QWidget):
         buscheck_splitter.setSizes([500, 500])
 
         self._top_stack.addWidget(buscheck_splitter)  # Index 1
+
+        # ── Seite 2: Diagnose (UDS, XCP, Kalibrierung) ──
+        diagnose_widget = QWidget()
+        diagnose_layout = QVBoxLayout(diagnose_widget)
+        diagnose_layout.setContentsMargins(8, 8, 8, 8)
+        diagnose_layout.setSpacing(8)
+
+        diag_title = QLabel("🔧 Diagnose")
+        diag_title.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #333;")
+        diagnose_layout.addWidget(diag_title)
+
+        diag_cards_layout = QHBoxLayout()
+        diag_cards_layout.setSpacing(12)
+
+        _diag_modules = [
+            ("🩺 UDS Diagnose",
+             "ISO 14229 Unified Diagnostic Services\n"
+             "Fehlerspeicher lesen/loeschen, ECU-Info,\n"
+             "Routinen ausfuehren, IO-Control"),
+            ("📐 XCP Kalibrierung",
+             "ASAM XCP on CAN / XCP on Ethernet\n"
+             "DAQ-Messung, Parameter-Kalibrierung,\n"
+             "A2L-Datei Import, Signaldarstellung"),
+            ("📊 Signalanalyse",
+             "MDF4 Signal-Viewer, DBC/LDF Dekodierung\n"
+             "Echtzeit-Plot, Statistik, Export,\n"
+             "Trigger-basierte Aufzeichnung"),
+            ("🤖 Automatisierung",
+             "Testfall-Scripting (Python),\n"
+             "Sequenz-Editor, CI/CD-Integration,\n"
+             "Report-Generierung"),
+        ]
+        for title, desc in _diag_modules:
+            card = QGroupBox(title)
+            card.setStyleSheet(
+                "QGroupBox { font-weight: bold; font-size: 11px;"
+                "  border: 1px solid #d0d0d8; border-radius: 6px;"
+                "  margin-top: 8px; padding: 12px 8px 8px 8px; }"
+                "QGroupBox::title { subcontrol-origin: margin;"
+                "  left: 10px; padding: 0 6px; }")
+            card_layout = QVBoxLayout(card)
+            lbl = QLabel(desc)
+            lbl.setStyleSheet("color: #555; font-size: 10px;")
+            lbl.setWordWrap(True)
+            card_layout.addWidget(lbl)
+            coming = QLabel("Kommt in V2.0")
+            coming.setStyleSheet(
+                "color: #FF9800; font-weight: bold; font-size: 9px;")
+            coming.setAlignment(Qt.AlignmentFlag.AlignRight)
+            card_layout.addWidget(coming)
+            diag_cards_layout.addWidget(card)
+
+        diagnose_layout.addLayout(diag_cards_layout)
+        diagnose_layout.addStretch()
+
+        self._top_stack.addWidget(diagnose_widget)  # Index 2
 
         self._top_stack.setCurrentIndex(0)  # Default: Netzwerk
         top_container_layout.addWidget(self._top_stack, 1)
@@ -10449,7 +10506,7 @@ class WiresharkPanel(QWidget):
                 # Legacy-Modus
                 if hasattr(self, '_cm_pause'):
                     self._cm_pause.set()
-                self._counter_stop_btn.setText("Resume")
+                self._counter_stop_btn.setText("\u25b6 Resume")
                 for *_, val in [v[:2] for v in self._counter_labels.values()]:
                     val.setText("—  (pausiert)")
                 self._counter_since_label.setText("Counter Monitor pausiert")
@@ -10472,7 +10529,7 @@ class WiresharkPanel(QWidget):
                     self._cm_reset.set()
                 if hasattr(self, '_cm_pause'):
                     self._cm_pause.clear()
-                self._counter_stop_btn.setText("Pause")
+                self._counter_stop_btn.setText("\u23f8 Pause")
                 # Jitter-Log Marker
                 try:
                     import time as _t
@@ -11545,12 +11602,42 @@ class WiresharkPanel(QWidget):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _switch_top_tab(self, index: int):
-        """Wechselt zwischen Netzwerk (0) und BusCheck (1) im oberen Bereich."""
+        """Wechselt zwischen Netzwerk (0), BusCheck (1), Diagnose (2)."""
         self._top_stack.setCurrentIndex(index)
         for i, btn in enumerate(self._top_tab_buttons):
             btn.setStyleSheet(
                 self._top_tab_active_style if i == index
                 else self._top_tab_inactive_style)
+        # BusCheck-Blinken stoppen wenn Tab aktiv
+        if index == 1 and hasattr(self, '_buscheck_blink_timer'):
+            self._buscheck_blink_timer.stop()
+            self._buscheck_blink_on = False
+
+    def _trigger_buscheck_blink(self):
+        """Startet BusCheck-Tab-Blinken wenn Loss erkannt und Tab nicht aktiv."""
+        if self._top_stack.currentIndex() == 1:
+            return  # Bereits auf BusCheck
+        if not hasattr(self, '_buscheck_blink_timer'):
+            self._buscheck_blink_timer = QTimer(self)
+            self._buscheck_blink_timer.setInterval(500)
+            self._buscheck_blink_timer.timeout.connect(self._buscheck_blink_tick)
+            self._buscheck_blink_on = False
+        if not self._buscheck_blink_timer.isActive():
+            self._buscheck_blink_timer.start()
+
+    def _buscheck_blink_tick(self):
+        """Blinkt den BusCheck-Tab rot/normal."""
+        self._buscheck_blink_on = not self._buscheck_blink_on
+        if len(self._top_tab_buttons) > 1:
+            if self._buscheck_blink_on:
+                self._top_tab_buttons[1].setStyleSheet(
+                    'QPushButton { background: #F44336; color: white;'
+                    '  border: 1px solid #c0c0c8; border-bottom: none;'
+                    '  border-radius: 4px 4px 0 0; padding: 4px 12px;'
+                    '  font-size: 11px; font-weight: bold; }')
+            else:
+                self._top_tab_buttons[1].setStyleSheet(
+                    self._top_tab_inactive_style)
 
     def _switch_live_tab(self, index: int):
         """Wechselt zwischen Live-Ansichten (Video, CAN, LIN, Eth, FlexRay)."""
@@ -11665,11 +11752,13 @@ class WiresharkPanel(QWidget):
                     ct['gap_log'].append((prev, value, nmiss))
                     if len(ct['gap_log']) > 100:
                         ct['gap_log'] = ct['gap_log'][-50:]
+                    self._trigger_buscheck_blink()
             elif delta >= 32768:
                 ct['ooo'] += 1
                 ct['ooo_log'].append((prev, value))
                 if len(ct['ooo_log']) > 100:
                     ct['ooo_log'] = ct['ooo_log'][-50:]
+                self._trigger_buscheck_blink()
         ct['prev'] = value
 
     def _update_tecmp_cmp_counter_ui(self):
