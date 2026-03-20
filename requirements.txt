@@ -4,3 +4,4 @@ opencv-python-headless>=4.8.0
 scapy>=2.5.0
 python-can>=4.0.0
 plin-linux>=0.0.3
+cantools>=39.0.0

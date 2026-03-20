@@ -631,11 +631,35 @@ class PlinLinPage(QWidget):
         if not PLIN_AVAILABLE:
             QMessageBox.warning(
                 self, "Fehler",
-                "plin-linux nicht installiert.\npip install plin-linux")
+                "plin-linux nicht installiert.\n\n"
+                "Installation:\n"
+                "  pip install plin-linux\n\n"
+                "Danach LiveCapture neu starten.")
             self._connect_btn.setChecked(False)
             return
 
         device_path = self._iface_combo.currentText().strip()
+
+        # Pruefen ob das Geraet existiert
+        if not os.path.exists(device_path):
+            available = sorted(glob.glob('/dev/plin*'))
+            if available:
+                hint = (
+                    f"Verfuegbare Geraete:\n"
+                    f"  {', '.join(available)}\n\n"
+                    f"Bitte ein vorhandenes Geraet auswaehlen.")
+            else:
+                hint = (
+                    "Keine /dev/plin* Geraete gefunden.\n\n"
+                    "\u2022 PCAN-USB Pro FD angeschlossen?\n"
+                    "\u2022 PLIN-Treiber geladen? (modprobe peak_usb)\n"
+                    "\u2022 Kernel-Modul: lsmod | grep peak")
+            QMessageBox.warning(
+                self, "Geraet nicht gefunden",
+                f"'{device_path}' existiert nicht.\n\n{hint}")
+            self._connect_btn.setChecked(False)
+            return
+
         try:
             baudrate = int(self._bitrate_combo.currentText().strip())
         except ValueError:
@@ -648,6 +672,17 @@ class PlinLinPage(QWidget):
         try:
             self._plin = PLIN(device_path)
             self._plin.start(mode=mode, baudrate=baudrate)
+        except PermissionError:
+            QMessageBox.warning(
+                self, "Zugriff verweigert",
+                f"Keine Berechtigung fuer '{device_path}'.\n\n"
+                "Loesung:\n"
+                f"  sudo chmod 666 {device_path}\n"
+                "oder Benutzer zur Gruppe 'dialout' hinzufuegen:\n"
+                f"  sudo usermod -aG dialout $USER")
+            self._connect_btn.setChecked(False)
+            self._plin = None
+            return
         except Exception as e:
             QMessageBox.warning(
                 self, "Verbindungsfehler",
@@ -655,7 +690,7 @@ class PlinLinPage(QWidget):
                 f"{e}\n\n"
                 "\u2022 PCAN-USB Pro FD angeschlossen?\n"
                 "\u2022 PLIN-Treiber geladen?\n"
-                "\u2022 Zugriffsrechte auf " + device_path + "?")
+                f"\u2022 Zugriffsrechte auf {device_path}?")
             self._connect_btn.setChecked(False)
             self._plin = None
             return
