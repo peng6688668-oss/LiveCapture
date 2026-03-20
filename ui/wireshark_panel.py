@@ -5922,11 +5922,51 @@ class WiresharkPanel(QWidget):
 
         self._loss_monitor_widget.hide()
 
-        # Oberer Bereich: Horizontaler Splitter (Durchsatz | Counter | LossMonitor | Paketliste/Video)
-        top_splitter = QSplitter(Qt.Orientation.Horizontal)
-        top_splitter.addWidget(self.net_speed_widget)
-        top_splitter.addWidget(self._counter_widget)
-        top_splitter.addWidget(self._loss_monitor_widget)
+        # ── Oberer Bereich: Tab-basiert (Netzwerk | BusCheck) ──
+        top_container = QWidget()
+        top_container_layout = QVBoxLayout(top_container)
+        top_container_layout.setContentsMargins(0, 0, 0, 0)
+        top_container_layout.setSpacing(0)
+
+        # Tab-Leiste
+        _TOP_TAB_INACTIVE = (
+            'QPushButton { background: #dcdce5; color: #555555;'
+            '  border: 1px solid #c0c0c8; border-bottom: none;'
+            '  border-radius: 4px 4px 0 0; padding: 4px 12px; font-size: 11px; }'
+            'QPushButton:hover { background: #d0d0dc; color: #333333; }'
+        )
+        _TOP_TAB_ACTIVE = (
+            'QPushButton { background: #ffffff; color: #0d47a1;'
+            '  border: 1px solid #c0c0c8; border-bottom: 2px solid #ffffff;'
+            '  border-radius: 4px 4px 0 0; padding: 4px 12px;'
+            '  font-size: 11px; font-weight: bold; }'
+        )
+        self._top_tab_active_style = _TOP_TAB_ACTIVE
+        self._top_tab_inactive_style = _TOP_TAB_INACTIVE
+
+        top_tab_bar = QWidget()
+        top_tab_bar.setStyleSheet('background-color: #e8e8f0;')
+        top_tab_layout = QHBoxLayout(top_tab_bar)
+        top_tab_layout.setContentsMargins(4, 2, 4, 0)
+        top_tab_layout.setSpacing(2)
+
+        self._top_tab_buttons = []
+        for i, label in enumerate(['🌐 Netzwerk', '🔍 BusCheck']):
+            btn = QPushButton(label)
+            btn.setStyleSheet(_TOP_TAB_ACTIVE if i == 0 else _TOP_TAB_INACTIVE)
+            btn.clicked.connect(lambda checked, idx=i: self._switch_top_tab(idx))
+            top_tab_layout.addWidget(btn)
+            self._top_tab_buttons.append(btn)
+        top_tab_layout.addStretch()
+        top_container_layout.addWidget(top_tab_bar)
+
+        # Stacked Widget: Seite 0 = Netzwerk, Seite 1 = BusCheck
+        self._top_stack = QStackedWidget()
+
+        # ── Seite 0: Netzwerk (Durchsatz + Paketliste) ──
+        netzwerk_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        netzwerk_splitter.addWidget(self.net_speed_widget)
 
         # Paketliste mit Titel-Zeile
         pkt_container = QWidget()
@@ -5939,9 +5979,26 @@ class WiresharkPanel(QWidget):
         pkt_title.setFont(QFont("Segoe UI", 9))
         pkt_container_layout.addWidget(pkt_title)
         pkt_container_layout.addWidget(self.packet_table, 1)
-        top_splitter.addWidget(pkt_container)
+        netzwerk_splitter.addWidget(pkt_container)
+        netzwerk_splitter.addWidget(self._video_settings_widget)
+        netzwerk_splitter.setSizes([140, 800, 0])
 
-        top_splitter.addWidget(self._video_settings_widget)
+        self._top_stack.addWidget(netzwerk_splitter)  # Index 0
+
+        # ── Seite 1: BusCheck (Counter + Loss Monitor) ──
+        buscheck_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._counter_widget.show()
+        buscheck_splitter.addWidget(self._counter_widget)
+        buscheck_splitter.addWidget(self._loss_monitor_widget)
+        buscheck_splitter.setSizes([500, 500])
+
+        self._top_stack.addWidget(buscheck_splitter)  # Index 1
+
+        self._top_stack.setCurrentIndex(0)  # Default: Netzwerk
+        top_container_layout.addWidget(self._top_stack, 1)
+
+        # top_splitter durch top_container ersetzen
+        top_splitter = top_container
 
         # Video-Anzeigebereich (initial hidden, rechts neben Paketliste)
         self._video_container = QWidget()
@@ -6413,7 +6470,8 @@ class WiresharkPanel(QWidget):
 
         # Video-Container initial sichtbar (schwarzer Hintergrund)
 
-        self._top_splitter = top_splitter
+        self._top_splitter = top_splitter  # QWidget (Tab-Container)
+        self._netzwerk_splitter = netzwerk_splitter  # QSplitter (Netzwerk-Seite)
         main_splitter.addWidget(top_splitter)
         main_splitter.addWidget(self._video_container)
 
@@ -8160,7 +8218,7 @@ class WiresharkPanel(QWidget):
         self.net_speed_widget.show()
         self._counter_widget.show()
         self._loss_monitor_widget.show()
-        self._top_splitter.setSizes([140, 420, 250, 430])
+        self._netzwerk_splitter.setSizes([140, 800, 0])
         # Vertikale Aufteilung: Panels oben ~40%, Live unten ~60%
         self._main_splitter.setSizes([360, 540, 0])
         self._prev_net_stats = self._read_net_dev()
@@ -9373,20 +9431,16 @@ class WiresharkPanel(QWidget):
             # Paketanzeige anzeigen
             self._video_settings_widget.hide()
             self.packet_table.show()
-            # Splitter: [net_speed, counter, loss_monitor, packet_table, vs_widget]
-            sizes = self._top_splitter.sizes()
+            sizes = self._netzwerk_splitter.sizes()
             total = sum(sizes)
-            rest = total - sizes[0] - sizes[1] - sizes[2]
-            self._top_splitter.setSizes([sizes[0], sizes[1], sizes[2], rest, 0])
+            self._netzwerk_splitter.setSizes([sizes[0], total - sizes[0], 0])
         else:
             # Video-Einstellungen anzeigen
             self.packet_table.hide()
             self._video_settings_widget.show()
-            # Splitter: Video-Einstellungen bekommt Paketlisten-Platz
-            sizes = self._top_splitter.sizes()
+            sizes = self._netzwerk_splitter.sizes()
             total = sum(sizes)
-            rest = total - sizes[0] - sizes[1] - sizes[2]
-            self._top_splitter.setSizes([sizes[0], sizes[1], sizes[2], 0, rest])
+            self._netzwerk_splitter.setSizes([sizes[0], 0, total - sizes[0]])
 
     def _add_video_settings_stream(self, stream_id: int):
         """Fuegt einen Tab fuer einen neuen Video-Stream hinzu."""
@@ -11489,6 +11543,14 @@ class WiresharkPanel(QWidget):
     # ═══════════════════════════════════════════════════════════════════════
     # Live-Tab Umschaltung (Video / CAN / LIN / Eth / FlexRay)
     # ═══════════════════════════════════════════════════════════════════════
+
+    def _switch_top_tab(self, index: int):
+        """Wechselt zwischen Netzwerk (0) und BusCheck (1) im oberen Bereich."""
+        self._top_stack.setCurrentIndex(index)
+        for i, btn in enumerate(self._top_tab_buttons):
+            btn.setStyleSheet(
+                self._top_tab_active_style if i == index
+                else self._top_tab_inactive_style)
 
     def _switch_live_tab(self, index: int):
         """Wechselt zwischen Live-Ansichten (Video, CAN, LIN, Eth, FlexRay)."""
