@@ -5761,13 +5761,37 @@ class WiresharkPanel(QWidget):
         counter_main_layout.setContentsMargins(0, 0, 0, 0)
         counter_main_layout.setSpacing(2)
 
+        # Titel-Zeile: Toggle + Reset + Pause
+        counter_title_row = QHBoxLayout()
+        counter_title_row.setContentsMargins(0, 0, 0, 0)
+        counter_title_row.setSpacing(2)
+
         self._counter_toggle_btn = QPushButton("🔢 PLP/TECMP/CMP Counter ▼")
         self._counter_toggle_btn.setStyleSheet(
             "text-align: left; padding: 4px 8px; font-weight: bold;"
         )
         self._counter_toggle_btn.setFlat(True)
         self._counter_toggle_btn.clicked.connect(self._toggle_counter_panel)
-        counter_main_layout.addWidget(self._counter_toggle_btn)
+        counter_title_row.addWidget(self._counter_toggle_btn)
+        counter_title_row.addStretch()
+
+        self._counter_reset_btn = QPushButton("Reset")
+        self._counter_reset_btn.setFixedSize(50, 20)
+        self._counter_reset_btn.setFont(QFont("Consolas", 8))
+        self._counter_reset_btn.clicked.connect(self._reset_counter_monitor)
+        counter_title_row.addWidget(self._counter_reset_btn)
+
+        self._counter_stop_btn = QPushButton("Pause")
+        self._counter_stop_btn.setFixedSize(50, 20)
+        self._counter_stop_btn.setFont(QFont("Consolas", 8))
+        self._counter_stop_btn.setCheckable(True)
+        self._counter_stop_btn.setStyleSheet(
+            "QPushButton:checked { background-color: #d32f2f; color: white; }"
+        )
+        self._counter_stop_btn.toggled.connect(self._toggle_counter_monitor_running)
+        counter_title_row.addWidget(self._counter_stop_btn)
+
+        counter_main_layout.addLayout(counter_title_row)
 
         self._counter_content = QGroupBox()
         self._counter_content.setStyleSheet("QGroupBox { padding: 4px; margin: 0px; }")
@@ -5795,21 +5819,25 @@ class WiresharkPanel(QWidget):
         self._counter_gap_label.hide()  # nur bei step=1 sichtbar
         self._counter_content_layout.addWidget(self._counter_gap_label)
 
-        # ── TECMP/CMP Counter Tracking ──
-        self._tecmp_ct = {
-            'prev': -1, 'total': 0, 'gaps': 0, 'lost': 0,
-            'ooo': 0, 'gap_log': [], 'ooo_log': [],
-        }
-        self._cmp_ct = {
-            'prev': -1, 'total': 0, 'gaps': 0, 'lost': 0,
-            'ooo': 0, 'gap_log': [], 'ooo_log': [],
-        }
+        # ── TECMP/CMP Counter Tracking (per-device) ──
+        # {device_id: {'prev': int, 'total': int, 'gaps': int, 'lost': int,
+        #              'ooo': int, 'gap_log': [], 'ooo_log': []}}
+        self._tecmp_dev_ct = {}
+        self._cmp_dev_ct = {}
+        # Bus-spezifische Loss-Zaehler (fuer Trend-Diagramm)
+        # {(protocol, bus_name, device_id): {'total': int, 'lost': int}}
+        self._bus_loss_counters = {}
         self._tecmp_cmp_label = QLabel("")
         self._tecmp_cmp_label.setFont(QFont("Consolas", 8))
         self._tecmp_cmp_label.setWordWrap(True)
         self._tecmp_cmp_label.setTextFormat(Qt.TextFormat.RichText)
         self._tecmp_cmp_label.setStyleSheet("padding-left: 4px;")
         self._counter_content_layout.addWidget(self._tecmp_cmp_label)
+
+        # Loss Rate Trend Widget
+        from ui.widgets.loss_rate_trend_widget import LossRateTrendWidget
+        self._loss_trend_widget = LossRateTrendWidget(self)
+        self._counter_content_layout.addWidget(self._loss_trend_widget)
 
         self._tecmp_cmp_timer = QTimer(self)
         self._tecmp_cmp_timer.setInterval(1000)
@@ -5821,23 +5849,7 @@ class WiresharkPanel(QWidget):
         self._gap_poll_timer.timeout.connect(self._poll_gap_files)
         self._gap_poll_timer.setInterval(2000)
 
-        # Reset-Button
-        self._counter_reset_btn = QPushButton("↺ Zurücksetzen")
-        self._counter_reset_btn.setFixedHeight(24)
-        self._counter_reset_btn.setFont(QFont("Consolas", 8))
-        self._counter_reset_btn.clicked.connect(self._reset_counter_monitor)
-        self._counter_content_layout.addWidget(self._counter_reset_btn)
-
-        # Stop/Start-Button
-        self._counter_stop_btn = QPushButton("⏹ Counter pausieren")
-        self._counter_stop_btn.setFixedHeight(24)
-        self._counter_stop_btn.setFont(QFont("Consolas", 8))
-        self._counter_stop_btn.setCheckable(True)
-        self._counter_stop_btn.setStyleSheet(
-            "QPushButton:checked { background-color: #d32f2f; color: white; }"
-        )
-        self._counter_stop_btn.toggled.connect(self._toggle_counter_monitor_running)
-        self._counter_content_layout.addWidget(self._counter_stop_btn)
+        # (Reset- und Pause-Buttons sind oben in der Titel-Zeile)
 
         # ScrollArea fuer Counter-Inhalt (Gap-Analyse kann lang werden)
         self._counter_scroll = QScrollArea()
@@ -8472,9 +8484,14 @@ class WiresharkPanel(QWidget):
 
             import struct
 
-            # CMP Sequence Counter Tracking (bytes 6-7)
+            # CMP Sequence Counter Tracking (per-device, bytes 6-7)
             cmp_seq = struct.unpack('!H', raw[6:8])[0]
-            self._track_counter(self._cmp_ct, cmp_seq)
+            if device_id not in self._cmp_dev_ct:
+                self._cmp_dev_ct[device_id] = {
+                    'prev': -1, 'total': 0, 'gaps': 0, 'lost': 0,
+                    'ooo': 0, 'gap_log': [], 'ooo_log': [],
+                }
+            self._track_counter(self._cmp_dev_ct[device_id], cmp_seq)
 
             # CMP Statistik: Paket und Geraet zaehlen
             self._cmp_pkt_total += 1
@@ -8670,9 +8687,15 @@ class WiresharkPanel(QWidget):
             if tecmp_data[0] == 0x01 and tecmp_data[1] == 0x00:
                 return
 
-            # TECMP Counter Tracking (bytes 2-3)
+            # TECMP Counter Tracking (per-device, bytes 2-3)
+            device_id = int.from_bytes(tecmp_data[0:2], 'big')
             tecmp_counter = int.from_bytes(tecmp_data[2:4], 'big')
-            self._track_counter(self._tecmp_ct, tecmp_counter)
+            if device_id not in self._tecmp_dev_ct:
+                self._tecmp_dev_ct[device_id] = {
+                    'prev': -1, 'total': 0, 'gaps': 0, 'lost': 0,
+                    'ooo': 0, 'gap_log': [], 'ooo_log': [],
+                }
+            self._track_counter(self._tecmp_dev_ct[device_id], tecmp_counter)
 
             data_type = int.from_bytes(tecmp_data[6:8], 'big')
             bus_index = self._TECMP_BUS_MAP.get(data_type)
@@ -10358,7 +10381,7 @@ class WiresharkPanel(QWidget):
                 # Legacy-Modus
                 if hasattr(self, '_cm_pause'):
                     self._cm_pause.set()
-                self._counter_stop_btn.setText("▶ Counter fortsetzen")
+                self._counter_stop_btn.setText("Resume")
                 for *_, val in [v[:2] for v in self._counter_labels.values()]:
                     val.setText("—  (pausiert)")
                 self._counter_since_label.setText("Counter Monitor pausiert")
@@ -10381,7 +10404,7 @@ class WiresharkPanel(QWidget):
                     self._cm_reset.set()
                 if hasattr(self, '_cm_pause'):
                     self._cm_pause.clear()
-                self._counter_stop_btn.setText("⏹ Counter pausieren")
+                self._counter_stop_btn.setText("Pause")
                 # Jitter-Log Marker
                 try:
                     import time as _t
@@ -10439,17 +10462,13 @@ class WiresharkPanel(QWidget):
         self._counter_since_label.setText(
             f"Seit: {time.strftime('%H:%M:%S')}")
 
-        # TECMP/CMP Counter zuruecksetzen
-        for ct in (self._tecmp_ct, self._cmp_ct):
-            ct['prev'] = -1
-            ct['total'] = 0
-            ct['gaps'] = 0
-            ct['lost'] = 0
-            ct['ooo'] = 0
-            ct['gap_log'].clear()
-            ct['ooo_log'].clear()
+        # TECMP/CMP Counter zuruecksetzen (per-device)
+        self._tecmp_dev_ct.clear()
+        self._cmp_dev_ct.clear()
         self._tecmp_cmp_label.setText("")
         self._tecmp_cmp_label.hide()
+        if hasattr(self, '_loss_trend_widget'):
+            self._loss_trend_widget.clear()
 
     def _poll_counter_stats(self):
         """Liest Counter-Statistiken aus Shared Array (QTimer, 1x/s)."""
@@ -11578,46 +11597,72 @@ class WiresharkPanel(QWidget):
         ct['prev'] = value
 
     def _update_tecmp_cmp_counter_ui(self):
-        """Timer-Callback: Aktualisiert TECMP/CMP Counter-Anzeige im Panel."""
+        """Timer-Callback: Aktualisiert TECMP/CMP Counter-Anzeige im Panel (per-device)."""
         parts = []
-        for name, ct in [("TECMP", self._tecmp_ct), ("CMP", self._cmp_ct)]:
-            if ct['total'] == 0:
-                continue
-            total = ct['total']
-            lost = ct['lost']
-            gaps = ct['gaps']
-            ooo = ct['ooo']
+        trend_data = {}
+        _bus_names = ['CAN', 'LIN', 'Ethernet', 'FlexRay', 'Analog', 'Digital']
 
-            if lost == 0 and ooo == 0:
-                color = "#4CAF50"
-                text = (f"<b>{name}:</b> "
-                        f"<span style='color:{color}'>Verlust 0%</span>, "
-                        f"{total} Pakete")
-            else:
-                rate = lost / max(total + lost, 1)
-                text = (f"<b>{name}:</b> "
-                        f"<span style='color:#F44336'>Verlust {rate:.4%}</span>, "
-                        f"<span style='color:#FF9800'>{lost} verloren, "
-                        f"{gaps} Luecken</span>, "
-                        f"{total} empfangen")
-            if ooo > 0:
-                text += (f"<br>&nbsp;&nbsp;"
-                         f"<span style='color:#F44336'>"
-                         f"Out-of-Order: {ooo}</span>")
-                for prev, curr in ct['ooo_log'][-3:]:
-                    text += f" [{prev}\u2192{curr}]"
-            if gaps > 0 and ct['gap_log']:
-                text += "<br>&nbsp;&nbsp;Letzte Luecken: "
-                for prev, curr, nmiss in ct['gap_log'][-3:]:
-                    text += (f"<span style='color:#FF9800'>"
-                             f"{prev}\u2192{curr} ({nmiss})</span> ")
-            parts.append(text)
+        for proto_name, dev_dict in [("TECMP", self._tecmp_dev_ct),
+                                      ("CMP", self._cmp_dev_ct)]:
+            for dev_id, ct in dev_dict.items():
+                if ct['total'] == 0:
+                    continue
+                total = ct['total']
+                lost = ct['lost']
+                gaps = ct['gaps']
+                ooo = ct['ooo']
+                dev_str = f"0x{dev_id:04X}" if dev_id > 0 else ""
+                label = f"{proto_name} {dev_str}".strip()
+
+                if lost == 0 and ooo == 0:
+                    text = (f"<b>{label}:</b> "
+                            f"<span style='color:#4CAF50'>Verlust 0%</span>, "
+                            f"{total} Pakete")
+                else:
+                    rate = lost / max(total + lost, 1)
+                    text = (f"<b>{label}:</b> "
+                            f"<span style='color:#F44336'>Verlust {rate:.4%}</span>, "
+                            f"<span style='color:#FF9800'>{lost} verloren, "
+                            f"{gaps} Luecken</span>, "
+                            f"{total} empfangen")
+                if ooo > 0:
+                    text += (f" <span style='color:#F44336'>"
+                             f"OOO: {ooo}</span>")
+                    for prev, curr in ct['ooo_log'][-2:]:
+                        text += f" [{prev}\u2192{curr}]"
+                if gaps > 0 and ct['gap_log']:
+                    text += "<br>&nbsp;&nbsp;Luecken: "
+                    for prev, curr, nmiss in ct['gap_log'][-3:]:
+                        text += (f"<span style='color:#FF9800'>"
+                                 f"{prev}\u2192{curr} ({nmiss})</span> ")
+                parts.append(text)
+
+                # Trend-Daten: pro Protokoll+Device zusammenfassen
+                trend_key = label
+                trend_data[trend_key] = {
+                    'total': total, 'lost': lost,
+                    'bus': proto_name, 'device': dev_id,
+                }
+
+        # Pro-Bus Loss-Zaehler fuer Trend-Diagramm (aus CMP proto counter)
+        for key, cnt in self._cmp_proto_counter.items():
+            bus = key  # z.B. 'CAN', 'LIN', 'FlexRay'
+            if bus in _bus_names:
+                trend_key = f"CMP {bus}"
+                if trend_key not in trend_data:
+                    trend_data[trend_key] = {
+                        'total': cnt, 'lost': 0, 'bus': bus, 'device': 0,
+                    }
 
         if parts:
             self._tecmp_cmp_label.setText("<br>".join(parts))
             self._tecmp_cmp_label.show()
         else:
             self._tecmp_cmp_label.hide()
+
+        # Trend-Widget aktualisieren
+        if hasattr(self, '_loss_trend_widget') and trend_data:
+            self._loss_trend_widget.update_tick(trend_data)
 
     def _update_cmp_stats(self):
         """Timer-Callback: Aktualisiert CMP/PLP/TECMP Statistik-Labels in Bus-Toolbars."""
