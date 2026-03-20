@@ -6261,8 +6261,16 @@ class WiresharkPanel(QWidget):
                 self._plin_page.frame_for_bus_queue.connect(
                     lambda row_tuple: self._bus_queues[1].append(row_tuple))
                 self._live_content_stack.addWidget(self._plin_page)
+            elif bus_idx == 2:  # Ethernet
+                from ui.eth_config_widget import EthLivePage
+                self._eth_page = EthLivePage(bus_table, self)
+                self._live_content_stack.addWidget(self._eth_page)
+            elif bus_idx == 3:  # FlexRay
+                from ui.flexray_config_widget import FlexRayLivePage
+                self._flexray_page = FlexRayLivePage(bus_table, self)
+                self._live_content_stack.addWidget(self._flexray_page)
             else:
-                self._live_content_stack.addWidget(bus_table)  # Eth/FlexRay
+                self._live_content_stack.addWidget(bus_table)
 
         self._current_live_tab = 0
         video_layout.addWidget(self._live_content_stack, 1)
