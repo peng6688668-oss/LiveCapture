@@ -7832,6 +7832,7 @@ class WiresharkPanel(QWidget):
         self.packets = PacketStore()
         self.filtered_indices = []
         self.packet_model.clear()
+        self.packet_model.init_empty_rows(30)
 
         # Capture-Thread starten
         # Prioritaet: 1. Windows dumpcap.exe  2. Linux dumpcap  3. Scapy
@@ -9292,6 +9293,7 @@ class WiresharkPanel(QWidget):
         self.filtered_indices = []
         self._total_trimmed = 0
         self.packet_model.clear()
+        self.packet_model.init_empty_rows(30)
         self.detail_tree.clear()
         self.hex_view.clear()
         self.packet_count_label.setText("Pakete: 0")
