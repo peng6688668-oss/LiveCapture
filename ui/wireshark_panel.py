@@ -5011,12 +5011,16 @@ class BusTableModel(QAbstractTableModel):
         """Batch-Update: Daten direkt ersetzen, nur dataChanged (kein Layout-Signal)."""
         if not new_rows:
             return
-        # Platzhalter-Zeilen beim ersten echten Dateneingang entfernen
+        # Platzhalter-Zeilen beim ersten echten Dateneingang:
+        # komplettes Reset mit neuen Daten in einem Schritt
         if self._has_placeholder:
             self.beginResetModel()
-            self._rows.clear()
+            self._rows = list(new_rows)
+            if len(self._rows) > self._max_rows:
+                self._rows = self._rows[-self._max_rows:]
             self._has_placeholder = False
             self.endResetModel()
+            return
         old_count = len(self._rows)
         self._rows.extend(new_rows)
         if len(self._rows) > self._max_rows:
