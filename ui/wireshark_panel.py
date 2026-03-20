@@ -1258,10 +1258,13 @@ class PacketTableModel(QAbstractTableModel):
 
     HEADERS = ["Nr.", "Zeit", "Quelle", "Ziel", "Protokoll", "Länge", "Info"]
 
+    _FONT = QFont("Consolas", 9)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._rows: List[tuple] = []
         self._colors: List[tuple] = []
+        self._has_placeholder = False
 
     def rowCount(self, parent=QModelIndex()):
         return len(self._rows)
@@ -1275,10 +1278,18 @@ class PacketTableModel(QAbstractTableModel):
         row, col = index.row(), index.column()
         if role == Qt.ItemDataRole.DisplayRole:
             return self._rows[row][col]
+        elif role == Qt.ItemDataRole.FontRole:
+            return self._FONT
+        elif role == Qt.ItemDataRole.TextAlignmentRole:
+            return Qt.AlignmentFlag.AlignCenter
         elif role == Qt.ItemDataRole.BackgroundRole:
+            if self._has_placeholder:
+                return None
             bg = self._colors[row][1]
             return QColor(bg) if bg else None
         elif role == Qt.ItemDataRole.ForegroundRole:
+            if self._has_placeholder:
+                return None
             fg = self._colors[row][0]
             return QColor(fg) if fg else None
         return None
@@ -1288,9 +1299,26 @@ class PacketTableModel(QAbstractTableModel):
             return self.HEADERS[section]
         return None
 
+    def init_empty_rows(self, count: int):
+        """Fuellt das Model mit leeren Zeilen fuer initiale Anzeige."""
+        self.beginResetModel()
+        empty = tuple('' for _ in self.HEADERS)
+        self._rows = [empty for _ in range(count)]
+        self._colors = [(None, None) for _ in range(count)]
+        self._has_placeholder = True
+        self.endResetModel()
+
     def append_rows(self, rows: list, colors: list):
         """Batch-Append für neue Zeilen."""
         if not rows:
+            return
+        # Platzhalter beim ersten echten Dateneingang entfernen
+        if self._has_placeholder:
+            self.beginResetModel()
+            self._rows = list(rows)
+            self._colors = list(colors)
+            self._has_placeholder = False
+            self.endResetModel()
             return
         start = len(self._rows)
         self.beginInsertRows(QModelIndex(), start, start + len(rows) - 1)
@@ -1302,6 +1330,7 @@ class PacketTableModel(QAbstractTableModel):
         self.beginResetModel()
         self._rows.clear()
         self._colors.clear()
+        self._has_placeholder = False
         self.endResetModel()
 
     def reset_with_data(self, rows: list, colors: list):
@@ -1309,6 +1338,7 @@ class PacketTableModel(QAbstractTableModel):
         self.beginResetModel()
         self._rows = rows
         self._colors = colors
+        self._has_placeholder = False
         self.endResetModel()
 
 
@@ -5635,17 +5665,54 @@ class WiresharkPanel(QWidget):
         self.packet_table.setAlternatingRowColors(True)
         self.packet_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.packet_table.customContextMenuRequested.connect(self._show_packet_context_menu)
+        self.packet_table.setFont(QFont("Consolas", 9))
+        self.packet_table.verticalHeader().setVisible(False)
+        self.packet_table.verticalHeader().setDefaultSectionSize(22)
+        self.packet_table.setStyleSheet(
+            "QTableView { background-color: #ffffff; color: #1a1a1a;"
+            "  alternate-background-color: #e8f5e9;"
+            "  gridline-color: #c8e6c9; }"
+            "QTableView::item:selected { background-color: #1565c0;"
+            "  color: #ffffff; }"
+            "QHeaderView::section { background: #f5f5f7; color: #0d0d17;"
+            "  padding: 4px 6px; border: none;"
+            "  border-right: 1px solid #d0d0d8;"
+            "  border-bottom: 1px solid #333333;"
+            "  font-weight: bold; }")
 
         # Spaltenbreiten
         header = self.packet_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        _pkt_default_widths = [60, 120, 140, 140, 100, 60, 300]
+        for col, w in enumerate(_pkt_default_widths):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+            self.packet_table.setColumnWidth(col, w)
+        # Info-Spalte (col 6) dehnt sich
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        header.resizeSection(6, 180)  # Info-Spalte schmaler
+
+        # Doppelklick auf Header → Spaltenbreite umschalten
+        self._pkt_default_widths = dict(enumerate(_pkt_default_widths))
+        self._pkt_col_toggled = {}
+
+        def _toggle_pkt_col(col):
+            if self._pkt_col_toggled.get(col, False):
+                if col == 6:
+                    header.setSectionResizeMode(
+                        col, QHeaderView.ResizeMode.Stretch)
+                if col in self._pkt_default_widths:
+                    self.packet_table.setColumnWidth(
+                        col, self._pkt_default_widths[col])
+                self._pkt_col_toggled[col] = False
+            else:
+                if col == 6:
+                    header.setSectionResizeMode(
+                        col, QHeaderView.ResizeMode.Interactive)
+                self.packet_table.resizeColumnToContents(col)
+                self._pkt_col_toggled[col] = True
+
+        header.sectionDoubleClicked.connect(_toggle_pkt_col)
+
+        # Leere Zeilen fuer initiale Anzeige
+        self.packet_model.init_empty_rows(30)
 
         # ── Video-Einstellungen-Panel (umschaltbar mit Paketliste) ──
         self._video_settings_widget = QWidget()
