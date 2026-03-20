@@ -5635,8 +5635,12 @@ class WiresharkPanel(QWidget):
         self._net_speed_iface_container = QVBoxLayout()
         self._net_speed_content_layout.addLayout(self._net_speed_iface_container)
 
-        net_speed_main_layout.addWidget(self._net_speed_content)
-        net_speed_main_layout.addStretch(1)
+        # ScrollArea fuer Netzwerk-Durchsatz
+        net_speed_scroll = QScrollArea()
+        net_speed_scroll.setWidgetResizable(True)
+        net_speed_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        net_speed_scroll.setWidget(self._net_speed_content)
+        net_speed_main_layout.addWidget(net_speed_scroll, 1)
 
         self._net_speed_expanded = True
         self._net_speed_labels: Dict[str, Tuple[QLabel, QLabel, QLabel]] = {}
@@ -5888,6 +5892,7 @@ class WiresharkPanel(QWidget):
         # Video-Anzeigebereich (initial hidden, rechts neben Paketliste)
         self._video_container = QWidget()
         self._video_container.setMinimumWidth(300)
+        self._video_container.setMinimumHeight(200)
         video_layout = QVBoxLayout(self._video_container)
         video_layout.setContentsMargins(0, 0, 0, 0)
         video_layout.setSpacing(0)
@@ -7798,9 +7803,8 @@ class WiresharkPanel(QWidget):
         self._counter_widget.show()
         self._loss_monitor_widget.show()
         self._top_splitter.setSizes([140, 420, 250, 430])
-        # Vertikale Aufteilung: Panels oben ~50%, Video unten ~50%
-        # (gleich wie nach Video-Decode, damit Layout stabil bleibt)
-        self._main_splitter.setSizes([450, 450, 0])
+        # Vertikale Aufteilung: Panels oben ~40%, Live unten ~60%
+        self._main_splitter.setSizes([360, 540, 0])
         self._prev_net_stats = self._read_net_dev()
         self._net_speed_timer.start(1000)
         self._loss_monitor_timer.start(2000)
@@ -8368,7 +8372,7 @@ class WiresharkPanel(QWidget):
         # Video-Container anzeigen (volle Breite unterhalb)
         self._video_container.show()
         self._bottom_splitter.hide()
-        self._main_splitter.setSizes([450, 450, 0])
+        self._main_splitter.setSizes([360, 540, 0])
         self._video_display.setText("Warte auf Video-Signal...")
         backend = "AF_PACKET/MMAP" if self._afpacket_workers else "Software"
         self._video_info_label.setText(f"Live Video [{backend}]  —  Warte auf Signal...")
