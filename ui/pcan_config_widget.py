@@ -320,23 +320,32 @@ class PcanCanPage(QWidget):
         self._loopback_check = QCheckBox("Loopback")
         row1.addWidget(self._loopback_check)
 
-        # Platzhalter fuer Bus-Toolbar-Buttons (Record, Filter Reset, Pause)
-        # und Zyklisch-Steuerung
+        # Platzhalter fuer Bus-Toolbar-Buttons
+        # Verbinden + Start/Stop werden hier eingefuegt (vor Record/Filter/Pause)
         self._bus_btn_layout = QHBoxLayout()
         self._bus_btn_layout.setSpacing(4)
-        row1.addLayout(self._bus_btn_layout)
 
-        # ── Zyklisch-Steuerung (nach Pause) ──
-        self._periodic_layout = QHBoxLayout()
-        self._periodic_layout.setSpacing(4)
+        # Verbinden-Button (in Toolbar-Zeile, vor Record)
+        self._connect_btn = QPushButton("Verbinden")
+        self._connect_btn.setCheckable(True)
+        self._connect_btn.setStyleSheet(_BTN_CONNECT_CHECKED)
+        self._connect_btn.setMinimumWidth(100)
+        self._connect_btn.toggled.connect(self._on_connect_toggled)
+        self._bus_btn_layout.addWidget(self._connect_btn)
 
-        self._periodic_layout.addWidget(QLabel("Zyklisch:"))
+        self._status_indicator = QLabel("\u25cf Getrennt")
+        self._status_indicator.setStyleSheet(
+            "color: #F44336; font-weight: bold;")
+        self._bus_btn_layout.addWidget(self._status_indicator)
+
+        # Zyklisch: Intervall + Start + Stop
+        self._bus_btn_layout.addWidget(QLabel("Zyklisch:"))
         self._per_interval = QSpinBox()
         self._per_interval.setRange(1, 60000)
         self._per_interval.setValue(100)
         self._per_interval.setSuffix(" ms")
         self._per_interval.setMaximumWidth(100)
-        self._periodic_layout.addWidget(self._per_interval)
+        self._bus_btn_layout.addWidget(self._per_interval)
 
         self._per_start = QPushButton("\u25b6 Start")
         self._per_start.setStyleSheet(
@@ -344,7 +353,7 @@ class PcanCanPage(QWidget):
         self._per_start.clicked.connect(self._start_periodic)
         self._per_start.setEnabled(False)
         self._per_start.setMinimumWidth(80)
-        self._periodic_layout.addWidget(self._per_start)
+        self._bus_btn_layout.addWidget(self._per_start)
 
         self._per_stop = QPushButton("\u2b1b Stop")
         self._per_stop.setStyleSheet(
@@ -352,9 +361,9 @@ class PcanCanPage(QWidget):
         self._per_stop.clicked.connect(self._stop_periodic)
         self._per_stop.setEnabled(False)
         self._per_stop.setMinimumWidth(80)
-        self._periodic_layout.addWidget(self._per_stop)
+        self._bus_btn_layout.addWidget(self._per_stop)
 
-        row1.addLayout(self._periodic_layout)
+        row1.addLayout(self._bus_btn_layout)
 
         self._dbc_btn = QPushButton('DBC...')
         self._dbc_btn.setToolTip('DBC-Datei laden fuer CAN-Nachrichtennamen')
@@ -423,18 +432,6 @@ class PcanCanPage(QWidget):
         row1.addWidget(self._auto_btn)
 
         row1.addStretch()
-
-        # Verbinden-Button
-        self._connect_btn = QPushButton("Verbinden")
-        self._connect_btn.setCheckable(True)
-        self._connect_btn.setStyleSheet(_BTN_CONNECT_CHECKED)
-        self._connect_btn.setMinimumWidth(110)
-        self._connect_btn.toggled.connect(self._on_connect_toggled)
-        row1.addWidget(self._connect_btn)
-
-        self._status_indicator = QLabel("\u25cf Getrennt")
-        self._status_indicator.setStyleSheet("color: #F44336; font-weight: bold;")
-        row1.addWidget(self._status_indicator)
 
         clayout.addLayout(row1)
 
