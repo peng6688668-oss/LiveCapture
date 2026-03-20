@@ -6282,8 +6282,7 @@ class WiresharkPanel(QWidget):
             elif bus_idx == 1:  # LIN
                 from ui.plin_config_widget import PlinLinPage
                 self._plin_page = PlinLinPage(bus_table, self)
-                self._plin_page.frame_for_bus_queue.connect(
-                    lambda row_tuple: self._add_bus_data(1, row_tuple))
+                # RX-Daten kommen ueber PLP (CCA9010), nicht ueber PLIN-Echo
                 self._live_content_stack.addWidget(self._plin_page)
                 # Verbinden/Start/Stop in Toolbar verschieben
                 if hasattr(self, '_lin_toolbar_layout'):

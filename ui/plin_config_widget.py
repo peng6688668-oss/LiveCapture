@@ -774,10 +774,8 @@ class PlinLinPage(QWidget):
             self._plin = None
             return
 
-        self._rx_thread = LinReceiveThread(self._plin, self)
-        self._rx_thread.frame_received.connect(self._on_frame_received)
-        self._rx_thread.error_occurred.connect(self._on_rx_error)
-        self._rx_thread.start()
+        # RX-Daten kommen ausschliesslich ueber PLP (CCA9010 → _add_bus_data),
+        # daher kein LinReceiveThread noetig. PLIN wird nur zum Senden genutzt.
         self._start_time = time.time()
 
         # UI aktualisieren
