@@ -121,6 +121,9 @@ class PcanCanPage(QWidget):
         self._plot_widget = None  # CanSignalPlotWidget
         self._schedule_widget = None  # ScheduleTableWidget
         self._stats_widget = None  # BusStatisticsWidget
+        self._diag_widget = None   # UDSDiagWidget
+        self._gateway_widget = None  # GatewayConfigWidget
+        self._gateway_engine = None  # GatewayEngine
         self._dbc_name = ''  # geladener DBC-Dateiname
         self._last_tx_count = 0
         self._last_rx_count = 0
@@ -393,6 +396,22 @@ class PcanCanPage(QWidget):
         self._stats_btn.toggled.connect(self._toggle_stats)
         row1.addWidget(self._stats_btn)
 
+        # UDS Diagnose Toggle
+        self._diag_btn = QPushButton('UDS')
+        self._diag_btn.setCheckable(True)
+        self._diag_btn.setMinimumWidth(60)
+        self._diag_btn.setToolTip('UDS Diagnose-Panel (ISO 14229)')
+        self._diag_btn.toggled.connect(self._toggle_diag)
+        row1.addWidget(self._diag_btn)
+
+        # Gateway Toggle
+        self._gateway_btn = QPushButton('Gateway')
+        self._gateway_btn.setCheckable(True)
+        self._gateway_btn.setMinimumWidth(70)
+        self._gateway_btn.setToolTip('Cross-Bus Routing')
+        self._gateway_btn.toggled.connect(self._toggle_gateway)
+        row1.addWidget(self._gateway_btn)
+
         row1.addStretch()
 
         # Verbinden-Button
@@ -517,6 +536,71 @@ class PcanCanPage(QWidget):
         else:
             if self._stats_widget is not None:
                 self._stats_widget.hide()
+
+    # ── UDS Diagnose ──
+
+    def _toggle_diag(self, checked: bool):
+        if checked:
+            if self._diag_widget is None:
+                from ui.widgets.uds_diag_widget import UDSDiagWidget
+                self._diag_widget = UDSDiagWidget(self)
+                self._diag_widget.send_can_frame.connect(
+                    self._on_diag_send)
+                self.layout().insertWidget(4, self._diag_widget)
+            self._diag_widget.show()
+        else:
+            if self._diag_widget is not None:
+                self._diag_widget.hide()
+
+    def _on_diag_send(self, frame_id: int, data: bytes):
+        """Sendet einen CAN-Frame aus dem UDS-Panel."""
+        if self._bus is None:
+            return
+        try:
+            import can
+            msg = can.Message(
+                arbitration_id=frame_id,
+                data=data,
+                is_extended_id=frame_id > 0x7FF,
+            )
+            self._bus.send(msg)
+            self._tx_count += 1
+            if self._stats_widget:
+                self._stats_widget.record_tx()
+        except Exception as e:
+            _log.error("UDS-Senden: %s", e)
+
+    # ── Gateway ──
+
+    def _toggle_gateway(self, checked: bool):
+        if checked:
+            if self._gateway_engine is None:
+                from core.gateway_engine import GatewayEngine
+                self._gateway_engine = GatewayEngine(self)
+                # CAN-Sender registrieren
+                self._gateway_engine.register_sender(
+                    'CAN', self._gateway_can_send)
+            if self._gateway_widget is None:
+                from ui.widgets.gateway_config_widget import GatewayConfigWidget
+                self._gateway_widget = GatewayConfigWidget(
+                    self._gateway_engine, self)
+                self.layout().insertWidget(5, self._gateway_widget)
+            self._gateway_widget.show()
+        else:
+            if self._gateway_widget is not None:
+                self._gateway_widget.hide()
+
+    def _gateway_can_send(self, frame_id: int, data: bytes, dlc: int):
+        """Gateway-Sender fuer CAN."""
+        if self._bus is None:
+            return
+        import can
+        msg = can.Message(
+            arbitration_id=frame_id,
+            data=data[:dlc],
+            is_extended_id=frame_id > 0x7FF,
+        )
+        self._bus.send(msg)
 
     # ── TX Templates ──
 
@@ -1082,6 +1166,15 @@ class PcanCanPage(QWidget):
         self._rx_count += 1
         if self._stats_widget:
             self._stats_widget.record_rx()
+        # UDS ISO-TP Reassembly
+        if self._diag_widget is not None:
+            self._diag_widget.on_can_frame_received(
+                frame['can_id'], frame.get('data', b''))
+        # Gateway-Routing
+        if self._gateway_engine is not None:
+            self._gateway_engine.on_frame_received(
+                'CAN', frame['can_id'],
+                frame.get('data', b''), frame.get('dlc', 0))
 
         ts = frame['timestamp']
         if self._start_time and ts > 1e9:
@@ -1421,6 +1514,10 @@ class PcanCanPage(QWidget):
             self._schedule_widget.cleanup()
         if self._stats_widget is not None:
             self._stats_widget.cleanup()
+        if self._diag_widget is not None:
+            self._diag_widget.cleanup()
+        if self._gateway_widget is not None:
+            self._gateway_widget.cleanup()
         if self._rx_thread is not None:
             self._rx_thread.stop()
             self._rx_thread.wait(2000)
