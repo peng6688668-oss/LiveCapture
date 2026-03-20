@@ -5927,7 +5927,20 @@ class WiresharkPanel(QWidget):
         top_splitter.addWidget(self.net_speed_widget)
         top_splitter.addWidget(self._counter_widget)
         top_splitter.addWidget(self._loss_monitor_widget)
-        top_splitter.addWidget(self.packet_table)
+
+        # Paketliste mit Titel-Zeile
+        pkt_container = QWidget()
+        pkt_container_layout = QVBoxLayout(pkt_container)
+        pkt_container_layout.setContentsMargins(0, 0, 0, 0)
+        pkt_container_layout.setSpacing(0)
+        pkt_title = QLabel("📋 Paketliste")
+        pkt_title.setStyleSheet(
+            "text-align: left; padding: 4px 8px; font-weight: bold;")
+        pkt_title.setFont(QFont("Segoe UI", 9))
+        pkt_container_layout.addWidget(pkt_title)
+        pkt_container_layout.addWidget(self.packet_table, 1)
+        top_splitter.addWidget(pkt_container)
+
         top_splitter.addWidget(self._video_settings_widget)
 
         # Video-Anzeigebereich (initial hidden, rechts neben Paketliste)
