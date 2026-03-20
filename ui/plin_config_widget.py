@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QComboBox, QSpinBox, QCheckBox, QHeaderView,
     QGroupBox, QMessageBox, QTableView, QFileDialog, QInputDialog,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings, QFileSystemWatcher
 from PyQt6.QtGui import QColor, QFont
 
 from ui.widgets.native_combo_box import NativeComboBox, NATIVE_COMBO_CSS
@@ -154,7 +154,11 @@ class PlinLinPage(QWidget):
         self._bus_row_counters = None
         self._bus_index = 1
         self._last_bus_row_count = 0
+        self._stats_widget = None  # BusStatisticsWidget
+        self._id_stats: Dict[int, dict] = {}  # Per-ID Statistik
+        self._id_stats_widget = None  # LinIdStatsWidget
         self._init_ui()
+        self._init_device_watcher()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -214,6 +218,67 @@ class PlinLinPage(QWidget):
         self._rate_timer.timeout.connect(self._update_rates)
         self._rate_timer.start()
         self._auto_load_ldf()
+
+    # ── Geraete-Hotplug-Ueberwachung ────────────────────────────────────
+
+    def _init_device_watcher(self):
+        """Ueberwacht /dev/ auf Aenderungen an plin*-Geraeten."""
+        self._dev_watcher = QFileSystemWatcher(['/dev/'], self)
+        self._dev_watcher.directoryChanged.connect(self._on_dev_changed)
+        self._known_devs = set(glob.glob('/dev/plin*'))
+
+    def _on_dev_changed(self, _path: str):
+        """Wird aufgerufen wenn sich /dev/ aendert — plin*-Geraete pruefen."""
+        current = set(glob.glob('/dev/plin*'))
+        if current == self._known_devs:
+            return
+
+        added = current - self._known_devs
+        removed = self._known_devs - current
+        self._known_devs = current
+
+        # Dropdown aktualisieren (nur wenn nicht verbunden)
+        if self._plin is None:
+            prev = self._iface_combo.currentText()
+            self._iface_combo.clear()
+            devs = sorted(current) if current else ['/dev/plin0']
+            self._iface_combo.addItems(devs)
+            if prev in devs:
+                self._iface_combo.setCurrentText(prev)
+
+        # Benutzer informieren
+        if added:
+            names = ', '.join(sorted(added))
+            self._device_label.setText(f"PCAN USB PRO FD (LIN) — {names} erkannt")
+            self._device_label.setStyleSheet(
+                "color: #4CAF50; font-weight: bold; font-size: 11px;"
+                "  padding: 3px 8px; background: transparent;")
+            _log.info("PLIN-Geraet(e) hinzugefuegt: %s", names)
+        elif removed:
+            names = ', '.join(sorted(removed))
+            self._device_label.setText(f"PCAN USB PRO FD (LIN) — {names} entfernt")
+            self._device_label.setStyleSheet(
+                "color: #F44336; font-weight: bold; font-size: 11px;"
+                "  padding: 3px 8px; background: transparent;")
+            _log.warning("PLIN-Geraet(e) entfernt: %s", names)
+
+            # Verbindung trennen wenn aktives Geraet entfernt
+            if self._plin is not None:
+                active = self._iface_combo.currentText()
+                if active in removed:
+                    _log.error("Aktives Geraet %s entfernt — Verbindung trennen",
+                               active)
+                    self._connect_btn.setChecked(False)
+
+        # Label nach 5s zuruecksetzen
+        QTimer.singleShot(5000, self._reset_device_label)
+
+    def _reset_device_label(self):
+        """Setzt das Geraete-Label auf den Standard zurueck."""
+        self._device_label.setText("PCAN USB PRO FD (LIN)")
+        self._device_label.setStyleSheet(
+            "color: #e8560a; font-weight: bold; font-size: 11px;"
+            "  padding: 3px 8px; background: transparent;")
 
     # ── Konfigurationspanel ─────────────────────────────────────────────
 
@@ -341,6 +406,14 @@ class PlinLinPage(QWidget):
         self._tpl_load_btn.setMinimumWidth(80)
         self._tpl_load_btn.clicked.connect(self._load_tx_template)
         row1.addWidget(self._tpl_load_btn)
+
+        # Statistics Toggle
+        self._stats_btn = QPushButton('Statistik')
+        self._stats_btn.setCheckable(True)
+        self._stats_btn.setMinimumWidth(80)
+        self._stats_btn.setToolTip('Echtzeit LIN-Statistik (TX/RX-Rate + Per-ID)')
+        self._stats_btn.toggled.connect(self._toggle_stats)
+        row1.addWidget(self._stats_btn)
 
         row1.addStretch()
 
@@ -816,6 +889,18 @@ class PlinLinPage(QWidget):
 
             self._tx_count += 1
             self._tx_reference[lin_id] = bytes(data)
+            if self._stats_widget:
+                self._stats_widget.record_tx()
+
+            # Per-ID TX-Statistik
+            if lin_id not in self._id_stats:
+                self._id_stats[lin_id] = {
+                    'rx_count': 0, 'tx_count': 0, 'err_count': 0,
+                    'last_rx': 0.0, 'last_tx': 0.0,
+                    'last_rx_rate': 0.0, 'prev_rx_count': 0,
+                }
+            self._id_stats[lin_id]['tx_count'] += 1
+            self._id_stats[lin_id]['last_tx'] = time.time()
 
             elapsed = time.time() - (self._start_time or time.time())
             self._add_tx_row(lin_id, data, elapsed, checksum)
@@ -824,6 +909,8 @@ class PlinLinPage(QWidget):
             return True
         except Exception as e:
             _log.error("LIN-Senden: %s", e)
+            if self._stats_widget:
+                self._stats_widget.record_error()
             return False
 
     def _start_periodic(self):
@@ -875,6 +962,21 @@ class PlinLinPage(QWidget):
     def _on_frame_received(self, frame: dict):
         """Empfangener Frame → Signal fuer bus_queues."""
         self._rx_count += 1
+        if self._stats_widget:
+            self._stats_widget.record_rx()
+
+        # Per-ID Statistik aktualisieren
+        lin_id = frame.get('lin_id', 0)
+        now = time.time()
+        if lin_id not in self._id_stats:
+            self._id_stats[lin_id] = {
+                'rx_count': 0, 'tx_count': 0, 'err_count': 0,
+                'last_rx': 0.0, 'last_tx': 0.0,
+                'last_rx_rate': 0.0, 'prev_rx_count': 0,
+            }
+        entry = self._id_stats[lin_id]
+        entry['rx_count'] += 1
+        entry['last_rx'] = now
 
         ts = frame['timestamp']
         if self._start_time and ts > 1e9:
@@ -915,6 +1017,8 @@ class PlinLinPage(QWidget):
 
     def _on_rx_error(self, error):
         _log.error("PLIN RX-Fehler: %s", error)
+        if self._stats_widget:
+            self._stats_widget.record_error()
 
     # ═══════════════════════════════════════════════════════════════════
     # TX-Tabelle
@@ -976,6 +1080,49 @@ class PlinLinPage(QWidget):
                     f"RX \u2014 Empfangene Daten ({', '.join(parts)})")
 
     # ═══════════════════════════════════════════════════════════════════
+    # Statistik
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _toggle_stats(self, checked: bool):
+        if checked:
+            if self._stats_widget is None:
+                from ui.widgets.bus_statistics_widget import BusStatisticsWidget
+                self._stats_widget = BusStatisticsWidget('LIN', self)
+            if self._id_stats_widget is None:
+                self._id_stats_widget = LinIdStatsWidget(self)
+                self._id_stats_widget.set_ldf_lookup(self.ldf_lookup)
+            # Einfuegen nach config_widget (Position 1 und 2)
+            main_layout = self.layout()
+            main_layout.insertWidget(1, self._stats_widget)
+            main_layout.insertWidget(2, self._id_stats_widget)
+            self._stats_widget.show()
+            self._id_stats_widget.show()
+            # Per-ID Tabelle regelmaessig aktualisieren
+            if not hasattr(self, '_id_stats_timer'):
+                self._id_stats_timer = QTimer(self)
+                self._id_stats_timer.setInterval(1000)
+                self._id_stats_timer.timeout.connect(self._update_id_stats)
+            self._id_stats_timer.start()
+        else:
+            if self._stats_widget is not None:
+                self._stats_widget.hide()
+            if self._id_stats_widget is not None:
+                self._id_stats_widget.hide()
+            if hasattr(self, '_id_stats_timer'):
+                self._id_stats_timer.stop()
+
+    def _update_id_stats(self):
+        """Aktualisiert die Per-ID-Statistiktabelle."""
+        if self._id_stats_widget is None:
+            return
+        # Raten berechnen (Delta pro Sekunde)
+        now = time.time()
+        for entry in self._id_stats.values():
+            entry['last_rx_rate'] = entry['rx_count'] - entry['prev_rx_count']
+            entry['prev_rx_count'] = entry['rx_count']
+        self._id_stats_widget.update_data(self._id_stats, now)
+
+    # ═══════════════════════════════════════════════════════════════════
     # Bereinigung
     # ═══════════════════════════════════════════════════════════════════
 
@@ -983,6 +1130,10 @@ class PlinLinPage(QWidget):
         """Muss von aussen aufgerufen werden (z.B. closeEvent)."""
         self._rate_timer.stop()
         self._stop_periodic()
+        if hasattr(self, '_id_stats_timer'):
+            self._id_stats_timer.stop()
+        if self._stats_widget is not None:
+            self._stats_widget.cleanup()
         if self._rx_thread is not None:
             self._rx_thread.stop()
             self._rx_thread.wait(2000)
@@ -991,3 +1142,139 @@ class PlinLinPage(QWidget):
                 self._plin.stop()
             except Exception:
                 pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LinIdStatsWidget — Per-LIN-ID Statistik-Tabelle
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ID_STATS_HEADERS = ["ID", "Name", "RX", "TX", "Fehler", "Rate (f/s)", "Letzte RX"]
+
+
+class LinIdStatsWidget(QWidget):
+    """Tabelle mit Statistik pro LIN-ID (0x00–0x3F)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._ldf_lookup = None
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        # Header
+        hdr = QHBoxLayout()
+        hdr.setSpacing(8)
+        title = QLabel("LIN Per-ID Statistik")
+        title.setStyleSheet("font-weight: bold; font-size: 11px;")
+        hdr.addWidget(title)
+
+        self._id_count_label = QLabel("0 IDs aktiv")
+        self._id_count_label.setFont(_MONO)
+        hdr.addWidget(self._id_count_label)
+
+        clear_btn = QPushButton("Zuruecksetzen")
+        clear_btn.setMinimumWidth(100)
+        clear_btn.clicked.connect(self._clear)
+        hdr.addWidget(clear_btn)
+        hdr.addStretch()
+        layout.addLayout(hdr)
+
+        # Tabelle
+        self._table = QTableWidget()
+        self._table.setColumnCount(7)
+        self._table.setHorizontalHeaderLabels(_ID_STATS_HEADERS)
+        self._table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setFont(_MONO)
+        self._table.setStyleSheet(
+            "QTableWidget { background-color: #ffffff; color: #1a1a1a;"
+            "  gridline-color: #e0e0e0; }"
+            "QTableWidget::item:selected { background-color: #1565c0;"
+            "  color: #ffffff; }"
+            "QHeaderView::section { background: #f5f5f7; color: #0d0d17;"
+            "  padding: 4px 6px; border: none;"
+            "  border-right: 1px solid #d0d0d8;"
+            "  border-bottom: 1px solid #333333;"
+            "  font-weight: bold; }")
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(22)
+        self._table.setMinimumHeight(80)
+        self._table.setMaximumHeight(200)
+
+        h = self._table.horizontalHeader()
+        _col_widths = [60, 150, 80, 80, 80, 90, 160]
+        for col, w in enumerate(_col_widths):
+            h.setSectionResizeMode(
+                col, QHeaderView.ResizeMode.Stretch
+                if col == 1 else QHeaderView.ResizeMode.Interactive)
+            self._table.setColumnWidth(col, w)
+
+        layout.addWidget(self._table, 1)
+
+    def set_ldf_lookup(self, func):
+        """Setzt die LDF-Lookup-Funktion fuer Frame-Namen."""
+        self._ldf_lookup = func
+
+    def _clear(self):
+        """Signal an Parent zum Zuruecksetzen der ID-Statistik."""
+        parent = self.parent()
+        if hasattr(parent, '_id_stats'):
+            parent._id_stats.clear()
+        self._table.setRowCount(0)
+        self._id_count_label.setText("0 IDs aktiv")
+
+    def update_data(self, id_stats: Dict[int, dict], now: float):
+        """Aktualisiert die Tabelle mit den neuesten Daten."""
+        sorted_ids = sorted(id_stats.keys())
+        self._id_count_label.setText(f"{len(sorted_ids)} IDs aktiv")
+
+        self._table.setRowCount(len(sorted_ids))
+        for row, lin_id in enumerate(sorted_ids):
+            entry = id_stats[lin_id]
+            name = self._ldf_lookup(lin_id) if self._ldf_lookup else ""
+            rx_rate = entry.get('last_rx_rate', 0)
+            last_rx = entry.get('last_rx', 0.0)
+            age = now - last_rx if last_rx > 0 else -1
+
+            if age < 0:
+                age_str = "-"
+            elif age < 1:
+                age_str = "< 1s"
+            elif age < 60:
+                age_str = f"{age:.0f}s"
+            else:
+                age_str = f"{age / 60:.1f}min"
+
+            cells = [
+                f"0x{lin_id:02X}",
+                name,
+                str(entry.get('rx_count', 0)),
+                str(entry.get('tx_count', 0)),
+                str(entry.get('err_count', 0)),
+                str(rx_rate),
+                age_str,
+            ]
+
+            bg = QColor("#e3f2fd") if row % 2 == 0 else QColor("#ffffff")
+            for col, text in enumerate(cells):
+                item = self._table.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem(text)
+                    item.setBackground(bg)
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignCenter
+                        | Qt.AlignmentFlag.AlignVCenter)
+                    self._table.setItem(row, col, item)
+                else:
+                    item.setText(text)
+                    item.setBackground(bg)
+
+                # Farbkodierung: Fehler rot, aktive Rate gruen
+                if col == 4 and entry.get('err_count', 0) > 0:
+                    item.setForeground(QColor("#F44336"))
+                elif col == 5 and rx_rate > 0:
+                    item.setForeground(QColor("#4CAF50"))
