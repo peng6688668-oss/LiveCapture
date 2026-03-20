@@ -14,6 +14,18 @@ Regeln:
 
 ---
 
+## Auto-Commit & Push — WICHTIG
+
+Nach jeder Code-Aenderung in diesem Projekt **MUSS** automatisch:
+1. `git add` der geaenderten Dateien
+2. `git commit` mit aussagekraeftiger Commit-Message (conventional commits Format)
+3. `git push github master` zum Remote `github` (github.com/peng6688668-oss/LiveCapture)
+
+Dies gilt fuer JEDE Aenderung — egal ob Bug-Fix, neues Feature oder Refactoring.
+Nicht warten bis der Nutzer darum bittet.
+
+---
+
 ## PLP / TECMP / CMP — Protokoll-Kurzreferenz
 
 | Protokoll | EtherType | Quelle | Version-Byte |
