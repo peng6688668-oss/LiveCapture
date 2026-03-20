@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
-# Standard QComboBox verwenden — globales Theme liefert Dreieckspfeil
+from ui.widgets.native_combo_box import ArrowComboBox
 
 try:
     import pyqtgraph as pg
@@ -293,7 +293,7 @@ class DigitalLivePage(QWidget):
 
         # Channel select
         cl.addWidget(QLabel("Kanal:"))
-        self._channel_combo = QComboBox()
+        self._channel_combo = ArrowComboBox()
         self._channel_combo.addItems(
             ["Alle"] + [f"CH{i}" for i in range(8)])
         self._channel_combo.setMinimumWidth(80)
@@ -303,7 +303,7 @@ class DigitalLivePage(QWidget):
 
         # Edge trigger
         cl.addWidget(QLabel("Flanke:"))
-        self._edge_combo = QComboBox()
+        self._edge_combo = ArrowComboBox()
         self._edge_combo.addItems(["Both", "Rising", "Falling"])
         self._edge_combo.setMinimumWidth(90)
         self._edge_combo.currentTextChanged.connect(

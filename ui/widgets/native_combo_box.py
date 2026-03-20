@@ -123,6 +123,7 @@ class NativeComboBox(QComboBox):
     Der Pfeil wird pixelgenau gezeichnet — kein CSS, kein SVG,
     keine Trennlinien-Artefakte.
     Editable + ReadOnly → gleiche Popup-Rendering wie IpHistoryCombo.
+    NUR fuer CAN/LIN Config-Widgets verwenden.
     """
 
     def __init__(self, parent=None):
@@ -140,6 +141,19 @@ class NativeComboBox(QComboBox):
         if popup is not None:
             pos = self.mapToGlobal(QPoint(0, self.height()))
             popup.move(pos)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        _paint_dropdown_arrow(self, event)
+
+
+class ArrowComboBox(QComboBox):
+    """Standard-QComboBox mit Dreieckspfeil via paintEvent.
+
+    NICHT editable — normales Klickverhalten bleibt erhalten.
+    Schwarzes Quadrat wird durch paintEvent ueberdeckt.
+    Fuer alle Seiten ausser CAN/LIN verwenden.
+    """
 
     def paintEvent(self, event):
         super().paintEvent(event)

@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QSettings, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 
-# Standard QComboBox verwenden — globales Theme liefert Dreieckspfeil
+from ui.widgets.native_combo_box import ArrowComboBox
 
 _log = logging.getLogger(__name__)
 
@@ -161,7 +161,7 @@ class FlexRayLivePage(QWidget):
 
         # Kanal-Filter
         cl.addWidget(QLabel("Kanal:"))
-        self._channel_combo = QComboBox()
+        self._channel_combo = ArrowComboBox()
         self._channel_combo.addItems(["Alle", "A", "B"])
         self._channel_combo.setMaximumWidth(80)
         cl.addWidget(self._channel_combo)

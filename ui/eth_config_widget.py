@@ -27,6 +27,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
 
+from ui.widgets.native_combo_box import ArrowComboBox
+
 _log = logging.getLogger(__name__)
 _MONO = QFont("Consolas", 9)
 
@@ -170,7 +172,7 @@ class EthLivePage(QWidget):
         row1.setSpacing(8)
 
         row1.addWidget(QLabel("Protokoll-Filter:"))
-        self._proto_combo = QComboBox()
+        self._proto_combo = ArrowComboBox()
         for name in _PROTOCOLS:
             self._proto_combo.addItem(name)
         self._proto_combo.setMinimumWidth(180)
