@@ -328,16 +328,20 @@ class PcanCanPage(QWidget):
         self._per_interval.setMaximumWidth(100)
         self._periodic_layout.addWidget(self._per_interval)
 
-        self._per_start = QPushButton("Start")
+        self._per_start = QPushButton("\u25b6 Start")
+        self._per_start.setStyleSheet(
+            "background-color: #4CAF50; color: white; font-weight: bold;")
         self._per_start.clicked.connect(self._start_periodic)
         self._per_start.setEnabled(False)
-        self._per_start.setMinimumWidth(55)
+        self._per_start.setMinimumWidth(80)
         self._periodic_layout.addWidget(self._per_start)
 
-        self._per_stop = QPushButton("Stopp")
+        self._per_stop = QPushButton("\u2b1b Stop")
+        self._per_stop.setStyleSheet(
+            "background-color: #f44336; color: white; font-weight: bold;")
         self._per_stop.clicked.connect(self._stop_periodic)
         self._per_stop.setEnabled(False)
-        self._per_stop.setMinimumWidth(55)
+        self._per_stop.setMinimumWidth(80)
         self._periodic_layout.addWidget(self._per_stop)
 
         row1.addLayout(self._periodic_layout)
