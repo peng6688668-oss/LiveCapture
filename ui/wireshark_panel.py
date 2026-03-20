@@ -5271,9 +5271,11 @@ class FilterHeaderView(QHeaderView):
         self.setSectionsClickable(True)
         self.sectionClicked.connect(self._on_section_clicked)
         self.setStyleSheet(
-            "QHeaderView::section { background: #1a1a2e; color: #8888aa;"
-            "  border: 1px solid #2a2a3e; padding: 3px; font-weight: bold;"
-            "  font-family: 'Segoe UI'; font-size: 9pt; }")
+            "QHeaderView::section { background: #f5f5f7; color: #0d0d17;"
+            "  padding: 4px 6px; border: none;"
+            "  border-right: 1px solid #d0d0d8;"
+            "  border-bottom: 1px solid #333333;"
+            "  font-weight: bold; font-family: 'Segoe UI'; font-size: 9pt; }")
 
     def set_filtered_columns(self, columns: set):
         """Aktualisiert die Menge der Spalten mit aktivem Filter."""
@@ -5803,20 +5805,20 @@ class WiresharkPanel(QWidget):
 
         # ── Tab-Leiste: Live Video | Live CAN | Live LIN | Live Eth | Live FlexRay ──
         tab_bar_widget = QWidget()
-        tab_bar_widget.setStyleSheet('background-color: #1a1a2e;')
+        tab_bar_widget.setStyleSheet('background-color: #e8e8f0;')
         tab_bar_layout = QHBoxLayout(tab_bar_widget)
         tab_bar_layout.setContentsMargins(4, 2, 4, 0)
         tab_bar_layout.setSpacing(2)
 
         _TAB_STYLE_INACTIVE = (
-            'QPushButton { background: #2a2a3e; color: #8888aa;'
-            '  border: 1px solid #3a3a5e; border-bottom: none;'
+            'QPushButton { background: #dcdce5; color: #555555;'
+            '  border: 1px solid #c0c0c8; border-bottom: none;'
             '  border-radius: 4px 4px 0 0; padding: 4px 12px; font-size: 11px; }'
-            'QPushButton:hover { background: #3a3a5e; color: #bbbbdd; }'
+            'QPushButton:hover { background: #d0d0dc; color: #333333; }'
         )
         _TAB_STYLE_ACTIVE = (
-            'QPushButton { background: #0d47a1; color: #ffffff;'
-            '  border: 1px solid #1565c0; border-bottom: none;'
+            'QPushButton { background: #ffffff; color: #0d47a1;'
+            '  border: 1px solid #c0c0c8; border-bottom: 2px solid #ffffff;'
             '  border-radius: 4px 4px 0 0; padding: 4px 12px;'
             '  font-size: 11px; font-weight: bold; }'
         )
@@ -5848,11 +5850,11 @@ class WiresharkPanel(QWidget):
         # --- Toolbar 0: Live Video ---
         video_toolbar = QWidget()
         video_toolbar.setStyleSheet(
-            'QWidget { background-color: #1a1a2e; }'
-            'QLabel { color: #bbbbdd; background: transparent; border: none; }'
-            'QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;'
+            'QWidget { background-color: #e8e8f0; }'
+            'QLabel { color: #333333; background: transparent; border: none; }'
+            'QPushButton { background: #dcdce5; color: #333; border: 1px solid #c0c0c8;'
             '  border-radius: 3px; padding: 3px 8px; }'
-            'QPushButton:hover { background: #3a3a5e; color: #fff; }'
+            'QPushButton:hover { background: #d0d0dc; color: #111; }'
             'QPushButton:checked { background: #2E7D32; color: white; font-weight: bold; }')
         video_header = QHBoxLayout(video_toolbar)
         video_header.setContentsMargins(4, 0, 4, 2)
@@ -5936,18 +5938,18 @@ class WiresharkPanel(QWidget):
         self._bus_recording: List[bool] = [False, False, False, False]
         self._bus_filter_status_labels: List[QLabel] = []
         _BUS_BTN_STYLE = (
-            "QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;"
+            "QPushButton { background: #dcdce5; color: #333; border: 1px solid #c0c0c8;"
             "  border-radius: 3px; padding: 3px 8px; }"
-            "QPushButton:hover { background: #3a3a5e; color: #fff; }"
+            "QPushButton:hover { background: #d0d0dc; color: #111; }"
             "QPushButton:checked { background: #2E7D32; color: white; font-weight: bold; }")
         for bi, (bus_name, bus_color, bus_icon) in enumerate(_bus_defs):
             bus_tb = QWidget()
             bus_tb.setStyleSheet(
-                'QWidget { background-color: #1a1a2e; }'
-                'QLabel { color: #bbbbdd; background: transparent; border: none; }'
-                'QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;'
+                'QWidget { background-color: #e8e8f0; }'
+                'QLabel { color: #333333; background: transparent; border: none; }'
+                'QPushButton { background: #dcdce5; color: #333; border: 1px solid #c0c0c8;'
                 '  border-radius: 3px; padding: 3px 8px; }'
-                'QPushButton:hover { background: #3a3a5e; color: #fff; }')
+                'QPushButton:hover { background: #d0d0dc; color: #111; }')
             bus_h = QHBoxLayout(bus_tb)
             bus_h.setContentsMargins(4, 0, 4, 2)
             bus_h.setSpacing(4)
@@ -5972,9 +5974,9 @@ class WiresharkPanel(QWidget):
             rec_btn.setCheckable(True)
             rec_btn.setFixedWidth(100)
             rec_btn.setStyleSheet(
-                "QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;"
+                "QPushButton { background: #dcdce5; color: #333; border: 1px solid #c0c0c8;"
                 "  border-radius: 3px; padding: 3px 8px; }"
-                "QPushButton:hover { background: #3a3a5e; color: #fff; }"
+                "QPushButton:hover { background: #d0d0dc; color: #111; }"
                 "QPushButton:checked { background: #b71c1c; color: white; font-weight: bold; }")
             rec_btn.toggled.connect(
                 lambda checked, idx=bi: self._on_bus_record_toggled(idx, checked))
@@ -5994,9 +5996,9 @@ class WiresharkPanel(QWidget):
             bus_pause.setCheckable(True)
             bus_pause.setFixedWidth(100)
             bus_pause.setStyleSheet(
-                "QPushButton { background: #2a2a3e; color: #ddd; border: 1px solid #444;"
+                "QPushButton { background: #dcdce5; color: #333; border: 1px solid #c0c0c8;"
                 "  border-radius: 3px; padding: 3px 8px; }"
-                "QPushButton:hover { background: #3a3a5e; color: #fff; }"
+                "QPushButton:hover { background: #d0d0dc; color: #111; }"
                 "QPushButton:checked { background: #2E7D32; color: white; font-weight: bold; }")
             self._bus_pause_btns.append(bus_pause)
             bus_h.addWidget(bus_pause)
@@ -6028,7 +6030,7 @@ class WiresharkPanel(QWidget):
             id_lbl.setFixedHeight(20)
             id_lbl.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
             id_lbl.setStyleSheet(
-                "background-color: #1a1a2e; color: #4FC3F7; padding: 2px;")
+                "background-color: #e8e8f0; color: #1565c0; padding: 2px;")
             panel_layout.addWidget(id_lbl)
 
             vid_lbl = QLabel()
