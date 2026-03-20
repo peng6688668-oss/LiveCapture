@@ -6256,6 +6256,15 @@ class WiresharkPanel(QWidget):
         self._current_live_tab = 0
         video_layout.addWidget(self._live_content_stack, 1)
 
+        # ── PLP/CAN 统计计数器 ──
+        self._plp_pkt_counter = [0, 0, 0, 0]      # 每个 Bus 收到的 PLP 包数
+        self._plp_can_frame_counter = [0, 0, 0, 0]  # 每个 Bus 从 PLP 解出的 CAN 帧数
+        if hasattr(self, '_pcan_page'):
+            self._pcan_page.set_plp_counter_ref(
+                self._plp_pkt_counter, self._plp_can_frame_counter, 0)
+            self._pcan_page.set_bus_row_counter_ref(
+                self._bus_row_counters, 0)
+
         # ── Bus-Daten Batch-Timer (100ms Intervall → max 10 UI-Updates/s) ──
         self._bus_queues: List[list] = [[], [], [], []]
         self._bus_flush_timer = QTimer(self)
@@ -8103,6 +8112,10 @@ class WiresharkPanel(QWidget):
             result = TECMPDecoder.decode(tecmp_data)
             entries = result.get("entries", [])
 
+            # PLP 包计数
+            self._plp_pkt_counter[bus_index] += 1
+            can_in_this_plp = 0
+
             for entry in entries:
                 bus_data = entry.get("bus_data")
                 if bus_data is None:
@@ -8118,6 +8131,10 @@ class WiresharkPanel(QWidget):
                                            bus_data, entry.get("payload", ""))
                 if row:
                     self._add_bus_data(bus_index, row)
+                    can_in_this_plp += 1
+
+            # CAN-from-PLP 帧计数
+            self._plp_can_frame_counter[bus_index] += can_in_this_plp
 
         except Exception:
             pass

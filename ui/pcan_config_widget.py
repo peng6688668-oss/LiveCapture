@@ -128,7 +128,10 @@ class PcanCanPage(QWidget):
         self._prev_sysfs_rx = 0  # PLP-Paketrate aus sysfs
         self._smoothed_can_rate = 0.0  # EMA-geglaettete CAN-Rate
         self._smoothed_plp_rate = 0.0  # EMA-geglaettete PLP-Rate
+        self._smoothed_plp_can_rate = 0.0  # EMA: CAN-Frames aus PLP
+        self._smoothed_pcan_rate = 0.0  # EMA: PCAN direkte Frames
         self._smoothed_tx_rate = 0.0   # EMA-geglaettete TX-Rate
+        self._last_plp_can_count = 0
         self._last_rate_time = 0.0     # Zeitstempel fuer Rate-Berechnung
         self._init_ui()
 
@@ -421,11 +424,14 @@ class PcanCanPage(QWidget):
         self._bus_row_counters = counters
         self._bus_index = index
 
-    def set_plp_counter_ref(self, counters: list, index: int):
-        """Setzt Referenz auf plp_packet_counters fuer PLP-Ratenberechnung."""
-        self._plp_counters = counters
+    def set_plp_counter_ref(self, plp_pkt_counters: list,
+                            plp_can_counters: list, index: int):
+        """Setzt Referenz auf PLP-Zaehler fuer Ratenberechnung."""
+        self._plp_counters = plp_pkt_counters
+        self._plp_can_counters = plp_can_counters
         self._plp_index = index
         self._last_plp_count = 0
+        self._last_plp_can_count = 0
 
     def set_source_iface_ref(self, ifaces: list, protos: list, index: int):
         """Setzt Referenz auf bus_source_ifaces/protos fuer RX-Header."""
@@ -1032,39 +1038,61 @@ class PcanCanPage(QWidget):
         self._last_tx_count = self._tx_count
         instant_tx = tx_delta / elapsed
         self._smoothed_tx_rate = alpha * instant_tx + (1 - alpha) * self._smoothed_tx_rate
-        self._tx_rate_label.setText(f"{round(self._smoothed_tx_rate)} paket/s")
+        tx_display = round(self._smoothed_tx_rate)
 
-        # CAN-Rate (EMA): bus_row_counters zaehlt einzelne CAN-Frames
-        if self._bus_row_counters is not None:
-            current = self._bus_row_counters[self._bus_index]
-            can_delta = current - self._last_bus_row_count
-            self._last_bus_row_count = current
-        else:
-            can_delta = self._rx_count - self._last_rx_count
-            self._last_rx_count = self._rx_count
-        instant_can = can_delta / elapsed
-        self._smoothed_can_rate = alpha * instant_can + (1 - alpha) * self._smoothed_can_rate
-
-        # PLP-Rate (EMA)
+        # ── PLP-Rate + CAN-from-PLP ──
         plp_delta = 0
+        plp_can_delta = 0
         if hasattr(self, "_plp_counters") and self._plp_counters is not None:
-            current_plp = self._plp_counters[self._plp_index]
+            idx = self._plp_index
+            current_plp = self._plp_counters[idx]
             plp_delta = current_plp - self._last_plp_count
             self._last_plp_count = current_plp
+        if hasattr(self, "_plp_can_counters") and self._plp_can_counters is not None:
+            idx = self._plp_index
+            current_plp_can = self._plp_can_counters[idx]
+            plp_can_delta = current_plp_can - self._last_plp_can_count
+            self._last_plp_can_count = current_plp_can
+
         instant_plp = plp_delta / elapsed
+        instant_plp_can = plp_can_delta / elapsed
         self._smoothed_plp_rate = alpha * instant_plp + (1 - alpha) * self._smoothed_plp_rate
+        self._smoothed_plp_can_rate = alpha * instant_plp_can + (1 - alpha) * getattr(
+            self, '_smoothed_plp_can_rate', 0.0)
 
-        # CAN-Rate auf TX-Rate begrenzen (kann nicht mehr empfangen als gesendet)
-        can_display = round(self._smoothed_can_rate)
-        tx_display = round(self._smoothed_tx_rate)
-        if tx_display > 0 and can_display > tx_display:
-            can_display = tx_display
-        self._can_rate_label.setText(f"CAN: {can_display} Frames/s")
-
+        # Durchschnittliche CAN-Frames pro PLP-Paket
         plp_display = round(self._smoothed_plp_rate)
-        if can_display > 0 and plp_display < 1:
+        plp_can_display = round(self._smoothed_plp_can_rate)
+        if plp_can_display > 0 and plp_display < 1:
             plp_display = 1
-        self._plp_rate_label.setText(f"PLP: {plp_display} Pkt/s")
+        avg_can_per_plp = round(plp_can_display / plp_display) if plp_display > 0 else 0
+
+        # ── PCAN-Rate (direkt von SocketCAN, nicht aus PLP) ──
+        pcan_delta = self._rx_count - self._last_rx_count
+        self._last_rx_count = self._rx_count
+        instant_pcan = pcan_delta / elapsed
+        self._smoothed_pcan_rate = alpha * instant_pcan + (1 - alpha) * getattr(
+            self, '_smoothed_pcan_rate', 0.0)
+        pcan_display = round(self._smoothed_pcan_rate)
+
+        # ── CAN-Gesamt = PLP-CAN + PCAN ──
+        can_total = plp_can_display + pcan_display
+
+        # ── Anzeige aktualisieren ──
+        # TX-Rate
+        self._tx_rate_label.setText(f"{tx_display} paket/s")
+
+        # PLP: Pkt/s (×N CAN/Pkt)
+        if plp_display > 0:
+            self._plp_rate_label.setText(
+                f"PLP: {plp_display} Pkt/s (\u00d7{avg_can_per_plp} CAN/Pkt)")
+        else:
+            self._plp_rate_label.setText("PLP: 0 Pkt/s")
+
+        # CAN: N(PLP) + N(PCAN) = N F/s | TX: N F/s
+        self._can_rate_label.setText(
+            f"CAN: {plp_can_display}(PLP) + {pcan_display}(PCAN)"
+            f" = {can_total} F/s")
 
         # RX-Titel: Quell-Interface + Protokoll anzeigen
         if hasattr(self, '_source_ifaces'):
