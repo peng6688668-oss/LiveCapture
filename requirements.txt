@@ -3,3 +3,4 @@ numpy>=1.24.0
 opencv-python-headless>=4.8.0
 scapy>=2.5.0
 python-can>=4.0.0
+plin-linux>=0.0.3
