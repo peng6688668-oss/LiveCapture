@@ -6062,10 +6062,10 @@ class WiresharkPanel(QWidget):
             bus_h.addWidget(filter_status)
 
             # --- Platzhalter fuer Bus-spezifische Buttons (Verbinden/Start/Stop) ---
-            self._bus_toolbar_insert_layout = QHBoxLayout() if bi == 0 else None
             if bi == 0:
-                self._bus_toolbar_insert_layout.setSpacing(4)
-                bus_h.addLayout(self._bus_toolbar_insert_layout)
+                self._can_toolbar_layout = QHBoxLayout()
+                self._can_toolbar_layout.setSpacing(4)
+                bus_h.addLayout(self._can_toolbar_layout)
 
             bus_h.addStretch()
 
@@ -6262,8 +6262,8 @@ class WiresharkPanel(QWidget):
                     lambda row_tuple: self._bus_queues[0].append(row_tuple))
                 self._live_content_stack.addWidget(self._pcan_page)
                 # Verbinden/Start/Stop in Toolbar verschieben
-                if hasattr(self, '_bus_toolbar_insert_layout'):
-                    tl = self._bus_toolbar_insert_layout
+                if hasattr(self, '_can_toolbar_layout'):
+                    tl = self._can_toolbar_layout
                     p = self._pcan_page
                     tl.addWidget(p._connect_btn)
                     tl.addWidget(p._status_indicator)
