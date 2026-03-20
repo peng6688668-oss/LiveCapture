@@ -5280,10 +5280,9 @@ class FilterPopup(QDialog):
 
 
 class FilterHeaderView(QHeaderView):
-    """Header-View mit Filter-Indikator und Klick-Handler.
+    """Header-View mit Filter-Indikator und Rechtsklick-Handler.
 
-    Unterscheidet Einzel- und Doppelklick:
-    - Einzelklick: Filter-Popup oeffnen
+    - Rechtsklick: Filter-Popup oeffnen
     - Doppelklick: Spaltenbreite umschalten (sectionDoubleClicked)
     """
 
@@ -5293,14 +5292,8 @@ class FilterHeaderView(QHeaderView):
         super().__init__(orientation, parent)
         self._filtered_columns: set = set()
         self.setSectionsClickable(True)
-        # Einzelklick verzoegern, damit Doppelklick erkannt werden kann
-        self._pending_click_col = -1
-        self._click_timer = QTimer(self)
-        self._click_timer.setSingleShot(True)
-        self._click_timer.setInterval(300)  # ms — Standard-Doppelklick-Intervall
-        self._click_timer.timeout.connect(self._fire_pending_click)
-        self.sectionClicked.connect(self._on_section_clicked)
-        self.sectionDoubleClicked.connect(self._on_section_double_clicked)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_right_click)
         self.setStyleSheet(
             "QHeaderView::section { background: #f5f5f7; color: #0d0d17;"
             "  padding: 4px 6px; border: none;"
@@ -5329,31 +5322,14 @@ class FilterHeaderView(QHeaderView):
             painter.drawEllipse(x, y, indicator_size, indicator_size)
             painter.restore()
 
-    def _on_section_clicked(self, logical_index: int):
-        """Verzoegert Einzelklick — wartet ob Doppelklick folgt."""
-        self._pending_click_col = logical_index
-        self._click_timer.start()
-
-    def _on_section_double_clicked(self, logical_index: int):
-        """Doppelklick erkannt — Einzelklick abbrechen."""
-        self._click_timer.stop()
-        self._pending_click_col = -1
-
-    def _fire_pending_click(self):
-        """Einzelklick bestaetigt — Filter-Popup oeffnen."""
-        col = self._pending_click_col
-        self._pending_click_col = -1
+    def _on_right_click(self, pos: QPoint):
+        """Rechtsklick auf Header → Filter-Popup oeffnen."""
+        col = self.logicalIndexAt(pos)
         if col < 0:
             return
-        # Mausposition prüfen: wenn nahe am Spaltenrand → Resize, kein Popup
-        cursor_x = self.mapFromGlobal(self.cursor().pos()).x()
         section_start = self.sectionViewportPosition(col)
-        section_end = section_start + self.sectionSize(col)
-        margin = 8  # Pixel-Toleranz für Resize-Zone
-        if cursor_x < section_start + margin or cursor_x > section_end - margin:
-            return  # Resize-Zone → kein Filter-Popup
-        pos = self.mapToGlobal(QPoint(section_start, self.height()))
-        self.filter_requested.emit(col, pos)
+        global_pos = self.mapToGlobal(QPoint(section_start, self.height()))
+        self.filter_requested.emit(col, global_pos)
 
 
 class WiresharkPanel(QWidget):
