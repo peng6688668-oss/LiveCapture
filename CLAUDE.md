@@ -14,12 +14,22 @@ Regeln:
 
 ---
 
-## Auto-Commit & Push — WICHTIG
+## Deployment-Pipeline — WICHTIG
 
-Nach jeder Code-Aenderung in diesem Projekt **MUSS** automatisch:
-1. `git add` der geaenderten Dateien
-2. `git commit` mit aussagekraeftiger Commit-Message (conventional commits Format)
-3. `git push github master` zum Remote `github` (github.com/peng6688668-oss/LiveCapture)
+Nach jeder Code-Aenderung **MUSS** automatisch dieser 3-Schritt-Workflow ausgefuehrt werden:
+
+### Schritt 1: Lokal entwickeln
+- Alle Aenderungen in `/home/pengzhang/meine Projekte/LiveCapture/` vornehmen
+- Dies ist die einzige Quelle der Wahrheit (Single Source of Truth)
+
+### Schritt 2: Remote synchronisieren
+- Geaenderte Dateien per `scp` oder `rsync` nach `localadm@192.168.41.68:/home/localadm/LiveCapture/` uebertragen
+- Nur geaenderte Dateien synchronisieren, nicht das gesamte Projekt
+
+### Schritt 3: Git commit & push
+- `git add` der geaenderten Dateien
+- `git commit` mit aussagekraeftiger Commit-Message (conventional commits Format)
+- `git push github master` zum Remote `github` (github.com/peng6688668-oss/LiveCapture)
 
 Dies gilt fuer JEDE Aenderung — egal ob Bug-Fix, neues Feature oder Refactoring.
 Nicht warten bis der Nutzer darum bittet.
