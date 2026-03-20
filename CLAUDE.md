@@ -47,6 +47,25 @@ Alle neu erstellten Buttons **MUESSEN** ausreichend gross sein, damit der Text/I
 
 ---
 
+## ComboBox-Stil — WICHTIG
+
+Alle `QComboBox` im gesamten Projekt **MUESSEN** den einheitlichen Dropdown-Pfeil verwenden:
+- Kein schwarzes Quadrat oder Standard-System-Pfeil
+- Immer den CSS-Dreieckspfeil wie bei Live CAN Bitrate:
+```
+QComboBox::drop-down { border: none; width: 20px; }
+QComboBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #555;
+    margin-right: 6px;
+}
+```
+- Bei neuen Widgets: entweder globales Theme uebernehmen lassen oder `_COMBO_STYLE` Konstante verwenden
+
+---
+
 ## PLP / TECMP / CMP — Protokoll-Kurzreferenz
 
 | Protokoll | EtherType | Quelle | Version-Byte |

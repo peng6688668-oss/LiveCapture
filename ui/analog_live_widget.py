@@ -25,6 +25,13 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
+_COMBO_STYLE = (
+    "QComboBox::drop-down { border: none; width: 20px; }"
+    "QComboBox::down-arrow { image: none;"
+    "  border-left: 4px solid transparent; border-right: 4px solid transparent;"
+    "  border-top: 5px solid #555; margin-right: 6px; }"
+)
+
 try:
     import pyqtgraph as pg
     PG_AVAILABLE = True
@@ -284,6 +291,7 @@ class AnalogLivePage(QWidget):
         # Channel select
         cl.addWidget(QLabel("Kanal:"))
         self._channel_combo = QComboBox()
+        self._channel_combo.setStyleSheet(_COMBO_STYLE)
         self._channel_combo.addItems(
             ["Alle"] + [f"CH{i}" for i in range(8)])
         self._channel_combo.setMinimumWidth(80)
@@ -294,6 +302,7 @@ class AnalogLivePage(QWidget):
         # Y-axis range
         cl.addWidget(QLabel("Y-Bereich:"))
         self._yrange_combo = QComboBox()
+        self._yrange_combo.setStyleSheet(_COMBO_STYLE)
         self._yrange_combo.addItems(list(_Y_RANGE_PRESETS.keys()))
         self._yrange_combo.setCurrentText("Auto")
         self._yrange_combo.setMinimumWidth(80)
