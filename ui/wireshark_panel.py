@@ -5353,12 +5353,13 @@ class FilterHeaderView(QHeaderView):
             painter.restore()
 
     def _on_right_click(self, pos: QPoint):
-        """Rechtsklick auf Header → Filter-Popup oeffnen."""
+        """Rechtsklick auf Header → Filter-Popup oberhalb des Headers oeffnen."""
         col = self.logicalIndexAt(pos)
         if col < 0:
             return
         section_start = self.sectionViewportPosition(col)
-        global_pos = self.mapToGlobal(QPoint(section_start, self.height()))
+        # Popup oberhalb des Headers anzeigen (y=0 ist Oberkante des Headers)
+        global_pos = self.mapToGlobal(QPoint(section_start, 0))
         self.filter_requested.emit(col, global_pos)
 
 
@@ -10837,7 +10838,10 @@ class WiresharkPanel(QWidget):
         popup.cleared.connect(
             lambda col, prx=proxy: prx.clear_column_filter(col))
 
-        popup.move(global_pos)
+        # Popup oberhalb der Klickposition anzeigen
+        popup.adjustSize()
+        popup_height = popup.sizeHint().height()
+        popup.move(global_pos.x(), global_pos.y() - popup_height)
         popup.show()
 
     def _add_bus_data(self, bus_index: int, row_data: tuple):
