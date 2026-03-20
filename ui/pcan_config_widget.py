@@ -124,6 +124,8 @@ class PcanCanPage(QWidget):
         self._diag_widget = None   # UDSDiagWidget
         self._gateway_widget = None  # GatewayConfigWidget
         self._gateway_engine = None  # GatewayEngine
+        self._auto_widget = None   # ScriptEditorWidget
+        self._auto_api = None      # AutomationAPI
         self._dbc_name = ''  # geladener DBC-Dateiname
         self._last_tx_count = 0
         self._last_rx_count = 0
@@ -412,6 +414,14 @@ class PcanCanPage(QWidget):
         self._gateway_btn.toggled.connect(self._toggle_gateway)
         row1.addWidget(self._gateway_btn)
 
+        # Automation Toggle
+        self._auto_btn = QPushButton('Script')
+        self._auto_btn.setCheckable(True)
+        self._auto_btn.setMinimumWidth(60)
+        self._auto_btn.setToolTip('Python Automation Script')
+        self._auto_btn.toggled.connect(self._toggle_automation)
+        row1.addWidget(self._auto_btn)
+
         row1.addStretch()
 
         # Verbinden-Button
@@ -601,6 +611,40 @@ class PcanCanPage(QWidget):
             is_extended_id=frame_id > 0x7FF,
         )
         self._bus.send(msg)
+
+    # ── Automation ──
+
+    def _toggle_automation(self, checked: bool):
+        if checked:
+            if self._auto_api is None:
+                from core.automation_api import AutomationAPI
+                self._auto_api = AutomationAPI()
+                self._auto_api.set_can_sender(self._auto_can_send)
+            if self._auto_widget is None:
+                from ui.widgets.script_editor_widget import ScriptEditorWidget
+                self._auto_widget = ScriptEditorWidget(self._auto_api, self)
+                self.layout().insertWidget(6, self._auto_widget)
+            self._auto_widget.show()
+        else:
+            if self._auto_widget is not None:
+                self._auto_widget.hide()
+
+    def _auto_can_send(self, frame_id: int, data: bytes) -> bool:
+        """CAN-Sender fuer Automation API."""
+        if self._bus is None:
+            return False
+        try:
+            import can
+            msg = can.Message(
+                arbitration_id=frame_id,
+                data=data,
+                is_extended_id=frame_id > 0x7FF,
+            )
+            self._bus.send(msg)
+            self._tx_count += 1
+            return True
+        except Exception:
+            return False
 
     # ── TX Templates ──
 
@@ -1175,6 +1219,11 @@ class PcanCanPage(QWidget):
             self._gateway_engine.on_frame_received(
                 'CAN', frame['can_id'],
                 frame.get('data', b''), frame.get('dlc', 0))
+        # Automation API
+        if self._auto_api is not None:
+            self._auto_api.on_frame_received(
+                'CAN', frame['can_id'],
+                frame.get('data', b''), frame.get('dlc', 0))
 
         ts = frame['timestamp']
         if self._start_time and ts > 1e9:
@@ -1518,6 +1567,8 @@ class PcanCanPage(QWidget):
             self._diag_widget.cleanup()
         if self._gateway_widget is not None:
             self._gateway_widget.cleanup()
+        if self._auto_widget is not None:
+            self._auto_widget.cleanup()
         if self._rx_thread is not None:
             self._rx_thread.stop()
             self._rx_thread.wait(2000)
