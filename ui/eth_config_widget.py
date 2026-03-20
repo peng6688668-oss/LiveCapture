@@ -1,11 +1,18 @@
-"""Ethernet Live-Seite fuer RX-Monitoring.
+"""Automotive Ethernet Live-Seite fuer RX-Monitoring.
 
-Ethernet-Daten kommen ueber TECMP/PLP (EtherType 0x0080/0x0081).
+Ethernet-Daten kommen ueber TECMP/PLP (DataType 0x0080/0x0081).
+Unterstuetzte physikalische Schichten:
+  - 100BASE-T1 (BroadR-Reach)
+  - 1000BASE-T1 (Gigabit Automotive)
+  - 10BASE-T1S (Multidrop)
+  - Multi-Gigabit
+  - Standard 100BASE-TX / 1000BASE-T
+
 Funktionen:
-- Faltbares Konfigurationspanel (EtherType-Filter)
-- RX-Bereich: Bestehendes Ethernet-TableView (BusTableModel + FilterHeader)
-- Protokoll-Erkennung (IPv4/ARP/IPv6/SOME-IP/DoIP/VLAN)
-- Ratenanzeige (PLP/TECMP Frames/s)
+- Protokoll-Filter (IPv4/IPv6/ARP/VLAN/SOME-IP/DoIP/AVB)
+- Physikalische Schicht + Capture-Modul Info
+- Protokoll-Statistiken
+- Ratenanzeige
 """
 
 import logging
@@ -13,33 +20,41 @@ import time
 from typing import Dict, Optional
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
-    QPushButton, QLabel, QComboBox, QHeaderView,
-    QGroupBox, QTableView,
+    QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QComboBox, QGroupBox,
+    QTableView, QTableWidget, QTableWidgetItem, QHeaderView,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFont
-
-from ui.widgets.native_combo_box import NativeComboBox, NATIVE_COMBO_CSS
+from PyQt6.QtGui import QFont, QColor
 
 _log = logging.getLogger(__name__)
-
 _MONO = QFont("Consolas", 9)
 
-# EtherType Registry fuer Protokollnamen
-_ETHERTYPE_NAMES = {
-    0x0800: "IPv4", 0x0806: "ARP", 0x86DD: "IPv6",
-    0x8100: "VLAN", 0x88A8: "Q-in-Q",
-    0x0000: "Alle",
+# Automotive Ethernet Protokoll-Registry
+_PROTOCOLS = {
+    'Alle': None,
+    'IPv4 (0x0800)': 0x0800,
+    'IPv6 (0x86DD)': 0x86DD,
+    'ARP (0x0806)': 0x0806,
+    'VLAN 802.1Q (0x8100)': 0x8100,
+    'SOME/IP': 'SOME/IP',
+    'DoIP (ISO 13400)': 'DoIP',
+    'AVB/TSN (IEEE 1722)': 'AVB',
 }
+
+# Unterstuetzte Capture-Module und physikalische Schichten
+_PHY_LAYERS = [
+    ("100BASE-T1", "BroadR-Reach, IEEE 802.3bw", "CM 100 High"),
+    ("1000BASE-T1", "Gigabit Automotive, IEEE 802.3bp", "CM 1000 High"),
+    ("10BASE-T1S", "Multidrop, IEEE 802.3cg", "CM 10Base-T1S"),
+    ("Multi-Gigabit", "2.5G/5G/10G Automotive", "CM MultiGigabit"),
+    ("100BASE-TX", "Standard Fast Ethernet", "Standard NIC"),
+    ("1000BASE-T", "Standard Gigabit Ethernet", "Standard NIC"),
+]
 
 
 class EthLivePage(QWidget):
-    """Ethernet Live-Seite: RX-only Monitoring mit Protokoll-Erkennung.
-
-    Nimmt das bestehende Ethernet-TableView (BusTableModel) als RX-Bereich
-    und fuegt Konfiguration + Ratenanzeige hinzu.
-    """
+    """Automotive Ethernet Live-Seite mit Protokoll-Info und Filter."""
 
     frame_for_bus_queue = pyqtSignal(tuple)
 
@@ -54,6 +69,7 @@ class EthLivePage(QWidget):
         self._last_rate_time = 0.0
         self._last_plp_count = 0
         self._last_shown_src = ''
+        self._proto_counts: Dict[str, int] = {}
         self._init_ui()
 
     def _init_ui(self):
@@ -61,7 +77,7 @@ class EthLivePage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ── Faltbares Konfigurationspanel ──
+        # ── Konfigurationspanel ──
         self._config_widget = self._create_config_panel()
         layout.addWidget(self._config_widget)
 
@@ -80,7 +96,8 @@ class EthLivePage(QWidget):
         rx_header_layout.setContentsMargins(4, 0, 4, 0)
         rx_header_layout.setSpacing(8)
 
-        self._rx_title = QLabel("RX \u2014 Ethernet Daten (TECMP/PLP)")
+        self._rx_title = QLabel(
+            "RX \u2014 Automotive Ethernet (TECMP/PLP)")
         self._rx_title.setStyleSheet(
             "font-weight: bold; font-size: 11px; background: transparent;")
         rx_header_layout.addWidget(self._rx_title)
@@ -92,7 +109,7 @@ class EthLivePage(QWidget):
             " background: transparent;")
         rx_header_layout.addWidget(self._plp_rate_label)
 
-        self._rx_rate_label = QLabel("Ethernet: 0 Frames/s")
+        self._rx_rate_label = QLabel("Eth: 0 Frames/s")
         self._rx_rate_label.setStyleSheet(
             "color: #B9F6CA; font-weight: bold; font-size: 10px;"
             " background: transparent;")
@@ -101,9 +118,27 @@ class EthLivePage(QWidget):
         rx_layout.addWidget(rx_header_widget)
         rx_layout.addWidget(self._existing_table)
 
+        # ── Protokoll-Statistik (unterhalb RX-Tabelle) ──
+        self._proto_stats_widget = QGroupBox("Protokoll-Statistik")
+        self._proto_stats_widget.setStyleSheet(
+            "QGroupBox { font-weight: bold; padding-top: 14px;"
+            " margin-top: 4px; }")
+        self._proto_stats_widget.setMaximumHeight(80)
+        ps_layout = QHBoxLayout(self._proto_stats_widget)
+        ps_layout.setSpacing(12)
+        self._proto_stat_labels: Dict[str, QLabel] = {}
+        for proto in ['IPv4', 'IPv6', 'ARP', 'VLAN', 'SOME/IP',
+                       'DoIP', 'AVB', 'Andere']:
+            lbl = QLabel(f"{proto}: 0")
+            lbl.setFont(_MONO)
+            ps_layout.addWidget(lbl)
+            self._proto_stat_labels[proto] = lbl
+        ps_layout.addStretch()
+        rx_layout.addWidget(self._proto_stats_widget)
+
         layout.addWidget(rx_wrapper, 1)
 
-        # ── Raten-Timer ──
+        # ── Timer ──
         self._rate_timer = QTimer(self)
         self._rate_timer.timeout.connect(self._update_rates)
         self._rate_timer.start(1000)
@@ -114,7 +149,7 @@ class EthLivePage(QWidget):
         wrapper_layout.setContentsMargins(0, 0, 0, 0)
         wrapper_layout.setSpacing(0)
 
-        # Toggle-Button
+        # Toggle
         self._config_toggle = QPushButton("\u25bc Konfiguration")
         self._config_toggle.setStyleSheet(
             "text-align: left; padding: 2px 8px; font-weight: bold;"
@@ -126,28 +161,75 @@ class EthLivePage(QWidget):
         wrapper_layout.addWidget(self._config_toggle)
 
         self._config_content = QWidget()
-        self._config_content.setStyleSheet(NATIVE_COMBO_CSS)
-        cl = QHBoxLayout(self._config_content)
-        cl.setContentsMargins(4, 2, 4, 2)
-        cl.setSpacing(8)
+        cl = QVBoxLayout(self._config_content)
+        cl.setContentsMargins(4, 2, 4, 4)
+        cl.setSpacing(4)
 
-        # EtherType-Filter
-        cl.addWidget(QLabel("EtherType-Filter:"))
-        self._ethertype_combo = NativeComboBox()
-        self._ethertype_combo.addItem("Alle", 0x0000)
-        self._ethertype_combo.addItem("IPv4 (0x0800)", 0x0800)
-        self._ethertype_combo.addItem("ARP (0x0806)", 0x0806)
-        self._ethertype_combo.addItem("IPv6 (0x86DD)", 0x86DD)
-        self._ethertype_combo.addItem("VLAN (0x8100)", 0x8100)
-        self._ethertype_combo.setMaximumWidth(180)
-        cl.addWidget(self._ethertype_combo)
+        # Zeile 1: Protokoll-Filter + Capture-Modul Info
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
 
-        # Info-Label
-        self._info_label = QLabel("Ethernet Daten via TECMP/PLP")
-        self._info_label.setStyleSheet("color: #888; font-size: 10px;")
-        cl.addWidget(self._info_label)
+        row1.addWidget(QLabel("Protokoll-Filter:"))
+        self._proto_combo = QComboBox()
+        for name in _PROTOCOLS:
+            self._proto_combo.addItem(name)
+        self._proto_combo.setMinimumWidth(180)
+        self._proto_combo.setStyleSheet(
+            "QComboBox { min-height: 22px; }"
+            "QComboBox::drop-down { border: none; width: 20px; }"
+            "QComboBox::down-arrow { image: none;"
+            "  border-left: 4px solid transparent;"
+            "  border-right: 4px solid transparent;"
+            "  border-top: 5px solid #555; margin-right: 6px; }")
+        row1.addWidget(self._proto_combo)
 
-        cl.addStretch()
+        # Capture-Modul Anzeige
+        self._cm_label = QLabel(
+            "\u2139 Datenquelle: Technica CM / ViGEM Logger")
+        self._cm_label.setStyleSheet(
+            "color: #1565c0; font-size: 10px;")
+        row1.addWidget(self._cm_label)
+
+        row1.addStretch()
+        cl.addLayout(row1)
+
+        # Zeile 2: Physikalische Schichten Tabelle
+        phy_group = QGroupBox(
+            "Unterstuetzte Physikalische Schichten (Automotive Ethernet)")
+        phy_group.setStyleSheet(
+            "QGroupBox { font-weight: bold; font-size: 10px;"
+            " padding-top: 14px; margin-top: 2px; }")
+        phy_layout = QVBoxLayout(phy_group)
+        phy_layout.setContentsMargins(4, 4, 4, 4)
+
+        phy_table = QTableWidget()
+        phy_table.setRowCount(len(_PHY_LAYERS))
+        phy_table.setColumnCount(3)
+        phy_table.setHorizontalHeaderLabels(
+            ['Physikalische Schicht', 'Standard', 'Capture-Modul'])
+        phy_table.setFont(QFont("Consolas", 8))
+        phy_table.setMaximumHeight(140)
+        phy_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers)
+        phy_table.verticalHeader().setVisible(False)
+        phy_table.verticalHeader().setDefaultSectionSize(20)
+        h = phy_table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        phy_table.setColumnWidth(0, 120)
+        phy_table.setColumnWidth(2, 140)
+
+        for i, (phy, std, cm) in enumerate(_PHY_LAYERS):
+            phy_table.setItem(i, 0, QTableWidgetItem(phy))
+            phy_table.setItem(i, 1, QTableWidgetItem(std))
+            cm_item = QTableWidgetItem(cm)
+            cm_item.setForeground(QColor("#1565c0"))
+            phy_table.setItem(i, 2, cm_item)
+
+        phy_layout.addWidget(phy_table)
+        cl.addWidget(phy_group)
+
         wrapper_layout.addWidget(self._config_content)
         return wrapper
 
@@ -155,6 +237,13 @@ class EthLivePage(QWidget):
         self._config_content.setVisible(expanded)
         self._config_toggle.setText(
             "\u25bc Konfiguration" if expanded else "\u25b6 Konfiguration")
+
+    # ── Protokoll zaehlen ──
+
+    def count_protocol(self, proto_name: str):
+        """Wird von wireshark_panel aufgerufen bei jedem gerouteten Frame."""
+        self._proto_counts[proto_name] = (
+            self._proto_counts.get(proto_name, 0) + 1)
 
     # ── Counter Refs ──
 
@@ -192,9 +281,10 @@ class EthLivePage(QWidget):
         else:
             delta = 0
         instant = delta / elapsed
-        self._smoothed_rx_rate = alpha * instant + (1 - alpha) * self._smoothed_rx_rate
+        self._smoothed_rx_rate = (alpha * instant
+                                  + (1 - alpha) * self._smoothed_rx_rate)
         self._rx_rate_label.setText(
-            f"Ethernet: {round(self._smoothed_rx_rate)} Frames/s")
+            f"Eth: {round(self._smoothed_rx_rate)} Frames/s")
 
         # PLP Rate
         plp_delta = 0
@@ -203,24 +293,30 @@ class EthLivePage(QWidget):
             plp_delta = current_plp - self._last_plp_count
             self._last_plp_count = current_plp
         instant_plp = plp_delta / elapsed
-        self._smoothed_plp_rate = alpha * instant_plp + (1 - alpha) * self._smoothed_plp_rate
+        self._smoothed_plp_rate = (alpha * instant_plp
+                                   + (1 - alpha) * self._smoothed_plp_rate)
         plp_display = round(self._smoothed_plp_rate)
         if round(self._smoothed_rx_rate) > 0 and plp_display < 1:
             plp_display = 1
         self._plp_rate_label.setText(f"PLP: {plp_display} Pkt/s")
 
-        # RX-Titel aktualisieren
+        # Protokoll-Statistik aktualisieren
+        for proto, lbl in self._proto_stat_labels.items():
+            count = self._proto_counts.get(proto, 0)
+            lbl.setText(f"{proto}: {count}")
+
+        # RX-Titel
         if hasattr(self, '_source_ifaces'):
             idx = self._source_iface_index
             iface = self._source_ifaces[idx]
-            proto = self._source_protos[idx] if hasattr(
-                self, '_source_protos') else ''
+            proto = (self._source_protos[idx]
+                     if hasattr(self, '_source_protos') else '')
             src_key = f"{iface}:{proto}"
             if src_key != self._last_shown_src and (iface or proto):
                 self._last_shown_src = src_key
                 parts = [x for x in (iface, proto) if x]
                 self._rx_title.setText(
-                    f"RX \u2014 Ethernet Daten ({', '.join(parts)})")
+                    f"RX \u2014 Automotive Ethernet ({', '.join(parts)})")
 
     # ── Cleanup ──
 
