@@ -8480,6 +8480,9 @@ class WiresharkPanel(QWidget):
 
             import struct
 
+            device_id = struct.unpack('!H', raw[2:4])[0]
+            stream_id = raw[5]
+
             # CMP Sequence Counter Tracking (per-device, bytes 6-7)
             cmp_seq = struct.unpack('!H', raw[6:8])[0]
             if device_id not in self._cmp_dev_ct:
@@ -8491,8 +8494,6 @@ class WiresharkPanel(QWidget):
 
             # CMP Statistik: Paket und Geraet zaehlen
             self._cmp_pkt_total += 1
-            device_id = struct.unpack('!H', raw[2:4])[0]
-            stream_id = raw[5]
             if device_id not in self._cmp_devices:
                 self._cmp_devices[device_id] = {'streams': set(), 'msgs': 0}
             self._cmp_devices[device_id]['streams'].add(stream_id)
