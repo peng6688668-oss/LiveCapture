@@ -362,10 +362,21 @@ class PlinLinPage(QWidget):
         self._bus_btn_layout.setSpacing(4)
         row1.addLayout(self._bus_btn_layout)
 
-        # ── Zyklisch-Steuerung ──
+        # Verbinden + Start/Stop: Werden erstellt, aber vom WiresharkPanel
+        # in die Toolbar-Zeile verschoben (reparented)
+        self._connect_btn = QPushButton("Verbinden")
+        self._connect_btn.setCheckable(True)
+        self._connect_btn.setStyleSheet(_BTN_CONNECT_CHECKED)
+        self._connect_btn.setMinimumWidth(100)
+        self._connect_btn.toggled.connect(self._on_connect_toggled)
+
+        self._status_indicator = QLabel("\u25cf Getrennt")
+        self._status_indicator.setStyleSheet(
+            "color: #F44336; font-weight: bold;")
+
+        # Zyklisch: Intervall bleibt in Config-Zeile
         self._periodic_layout = QHBoxLayout()
         self._periodic_layout.setSpacing(4)
-
         self._periodic_layout.addWidget(QLabel("Zyklisch:"))
         self._per_interval = QSpinBox()
         self._per_interval.setRange(1, 60000)
@@ -373,20 +384,21 @@ class PlinLinPage(QWidget):
         self._per_interval.setSuffix(" ms")
         self._per_interval.setMaximumWidth(100)
         self._periodic_layout.addWidget(self._per_interval)
+        row1.addLayout(self._periodic_layout)
 
-        self._per_start = QPushButton("Start")
+        self._per_start = QPushButton("\u25b6 Start")
+        self._per_start.setStyleSheet(
+            "background-color: #4CAF50; color: white; font-weight: bold;")
         self._per_start.clicked.connect(self._start_periodic)
         self._per_start.setEnabled(False)
-        self._per_start.setMinimumWidth(73)
-        self._periodic_layout.addWidget(self._per_start)
+        self._per_start.setMinimumWidth(80)
 
-        self._per_stop = QPushButton("Stopp")
+        self._per_stop = QPushButton("\u2b1b Stop")
+        self._per_stop.setStyleSheet(
+            "background-color: #f44336; color: white; font-weight: bold;")
         self._per_stop.clicked.connect(self._stop_periodic)
         self._per_stop.setEnabled(False)
-        self._per_stop.setMinimumWidth(73)
-        self._periodic_layout.addWidget(self._per_stop)
-
-        row1.addLayout(self._periodic_layout)
+        self._per_stop.setMinimumWidth(80)
 
         self._ldf_btn = QPushButton('LDF...')
         self._ldf_btn.setToolTip('LDF-Datei laden fuer LIN-Nachrichtennamen')
@@ -416,18 +428,6 @@ class PlinLinPage(QWidget):
         row1.addWidget(self._stats_btn)
 
         row1.addStretch()
-
-        # Verbinden-Button
-        self._connect_btn = QPushButton("Verbinden")
-        self._connect_btn.setCheckable(True)
-        self._connect_btn.setStyleSheet(_BTN_CONNECT_CHECKED)
-        self._connect_btn.setMinimumWidth(110)
-        self._connect_btn.toggled.connect(self._on_connect_toggled)
-        row1.addWidget(self._connect_btn)
-
-        self._status_indicator = QLabel("\u25cf Getrennt")
-        self._status_indicator.setStyleSheet("color: #F44336; font-weight: bold;")
-        row1.addWidget(self._status_indicator)
 
         clayout.addLayout(row1)
 

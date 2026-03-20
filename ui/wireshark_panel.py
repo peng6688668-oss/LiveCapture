@@ -6067,11 +6067,15 @@ class WiresharkPanel(QWidget):
 
             bus_h.addStretch()
 
-            # --- Platzhalter fuer CAN Buttons (Verbinden/Start/Stop) ---
+            # --- Platzhalter fuer CAN/LIN Buttons (Verbinden/Start/Stop) ---
             if bi == 0:
                 self._can_toolbar_layout = QHBoxLayout()
                 self._can_toolbar_layout.setSpacing(4)
                 bus_h.addLayout(self._can_toolbar_layout)
+            elif bi == 1:
+                self._lin_toolbar_layout = QHBoxLayout()
+                self._lin_toolbar_layout.setSpacing(4)
+                bus_h.addLayout(self._lin_toolbar_layout)
 
             # --- Record-Button ---
             rec_btn = QPushButton("⏺ Record")
@@ -6281,6 +6285,14 @@ class WiresharkPanel(QWidget):
                 self._plin_page.frame_for_bus_queue.connect(
                     lambda row_tuple: self._bus_queues[1].append(row_tuple))
                 self._live_content_stack.addWidget(self._plin_page)
+                # Verbinden/Start/Stop in Toolbar verschieben
+                if hasattr(self, '_lin_toolbar_layout'):
+                    tl = self._lin_toolbar_layout
+                    p = self._plin_page
+                    tl.addWidget(p._connect_btn)
+                    tl.addWidget(p._status_indicator)
+                    tl.addWidget(p._per_start)
+                    tl.addWidget(p._per_stop)
             elif bus_idx == 2:  # Ethernet
                 from ui.eth_config_widget import EthLivePage
                 self._eth_page = EthLivePage(bus_table, self)
