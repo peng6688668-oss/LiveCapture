@@ -643,9 +643,32 @@ class PcanLivePanel(QWidget):
         h.setSectionResizeMode(_COL_ZEIT, QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(_COL_KANAL, QHeaderView.ResizeMode.ResizeToContents)
         h.setSectionResizeMode(_COL_ID, QHeaderView.ResizeMode.ResizeToContents)
-        h.setSectionResizeMode(_COL_NAME, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(_COL_NAME, QHeaderView.ResizeMode.Interactive)
         h.setSectionResizeMode(_COL_DLC, QHeaderView.ResizeMode.ResizeToContents)
-        h.setSectionResizeMode(_COL_DATEN, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(_COL_DATEN, QHeaderView.ResizeMode.Interactive)
+
+        # Daten und Nachricht: gleiche Standardbreite fuer TX und RX
+        table.setColumnWidth(_COL_NAME, 200)
+        table.setColumnWidth(_COL_DATEN, 300)
+
+        # Letzte Spalte dehnt sich, damit kein Leerraum rechts entsteht
+        h.setStretchLastSection(True)
+
+        # Doppelklick auf Header → Spalte automatisch an Inhalt anpassen
+        h.sectionDoubleClicked.connect(
+            lambda col: table.resizeColumnToContents(col)
+        )
+
+        # Einheitlicher Header-Stil (kein schwarzer Hintergrund)
+        h.setStyleSheet(
+            "QHeaderView::section {"
+            "  background-color: transparent;"
+            "  border: 1px solid #c0c0c0;"
+            "  padding: 4px;"
+            "  font-weight: bold;"
+            "  font-size: 9pt;"
+            "}"
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
     # Verbindung
