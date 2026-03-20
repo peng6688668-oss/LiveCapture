@@ -5761,7 +5761,7 @@ class WiresharkPanel(QWidget):
         counter_main_layout.setContentsMargins(0, 0, 0, 0)
         counter_main_layout.setSpacing(2)
 
-        self._counter_toggle_btn = QPushButton("🔢 PLP Counter ▼")
+        self._counter_toggle_btn = QPushButton("🔢 PLP/TECMP/CMP Counter ▼")
         self._counter_toggle_btn.setStyleSheet(
             "text-align: left; padding: 4px 8px; font-weight: bold;"
         )
@@ -5794,6 +5794,27 @@ class WiresharkPanel(QWidget):
         self._counter_gap_label.setStyleSheet("padding-left: 4px;")
         self._counter_gap_label.hide()  # nur bei step=1 sichtbar
         self._counter_content_layout.addWidget(self._counter_gap_label)
+
+        # ── TECMP/CMP Counter Tracking ──
+        self._tecmp_ct = {
+            'prev': -1, 'total': 0, 'gaps': 0, 'lost': 0,
+            'ooo': 0, 'gap_log': [], 'ooo_log': [],
+        }
+        self._cmp_ct = {
+            'prev': -1, 'total': 0, 'gaps': 0, 'lost': 0,
+            'ooo': 0, 'gap_log': [], 'ooo_log': [],
+        }
+        self._tecmp_cmp_label = QLabel("")
+        self._tecmp_cmp_label.setFont(QFont("Consolas", 8))
+        self._tecmp_cmp_label.setWordWrap(True)
+        self._tecmp_cmp_label.setTextFormat(Qt.TextFormat.RichText)
+        self._tecmp_cmp_label.setStyleSheet("padding-left: 4px;")
+        self._counter_content_layout.addWidget(self._tecmp_cmp_label)
+
+        self._tecmp_cmp_timer = QTimer(self)
+        self._tecmp_cmp_timer.setInterval(1000)
+        self._tecmp_cmp_timer.timeout.connect(self._update_tecmp_cmp_counter_ui)
+        self._tecmp_cmp_timer.start()
 
         # Gap-Datei Polling Timer (alle 2s)
         self._gap_poll_timer = QTimer(self)
@@ -8451,6 +8472,10 @@ class WiresharkPanel(QWidget):
 
             import struct
 
+            # CMP Sequence Counter Tracking (bytes 6-7)
+            cmp_seq = struct.unpack('!H', raw[6:8])[0]
+            self._track_counter(self._cmp_ct, cmp_seq)
+
             # CMP Statistik: Paket und Geraet zaehlen
             self._cmp_pkt_total += 1
             device_id = struct.unpack('!H', raw[2:4])[0]
@@ -8640,6 +8665,14 @@ class WiresharkPanel(QWidget):
 
             if len(tecmp_data) < 12:
                 return
+
+            # ASAM CMP Pakete ueberspringen (werden von _route_cmp_to_bus_tables behandelt)
+            if tecmp_data[0] == 0x01 and tecmp_data[1] == 0x00:
+                return
+
+            # TECMP Counter Tracking (bytes 2-3)
+            tecmp_counter = int.from_bytes(tecmp_data[2:4], 'big')
+            self._track_counter(self._tecmp_ct, tecmp_counter)
 
             data_type = int.from_bytes(tecmp_data[6:8], 'big')
             bus_index = self._TECMP_BUS_MAP.get(data_type)
@@ -10260,10 +10293,10 @@ class WiresharkPanel(QWidget):
         self._counter_expanded = not self._counter_expanded
         if self._counter_expanded:
             self._counter_content.show()
-            self._counter_toggle_btn.setText("🔢 PLP Counter ▼")
+            self._counter_toggle_btn.setText("🔢 PLP/TECMP/CMP Counter ▼")
         else:
             self._counter_content.hide()
-            self._counter_toggle_btn.setText("🔢 PLP Counter ▶")
+            self._counter_toggle_btn.setText("🔢 PLP/TECMP/CMP Counter ▶")
 
     def _start_counter_monitor(self, interfaces: list):
         """Startet den PLP Counter Monitor (Inline-Modus).
@@ -10405,6 +10438,18 @@ class WiresharkPanel(QWidget):
         self._cm_start_time = time.time()
         self._counter_since_label.setText(
             f"Seit: {time.strftime('%H:%M:%S')}")
+
+        # TECMP/CMP Counter zuruecksetzen
+        for ct in (self._tecmp_ct, self._cmp_ct):
+            ct['prev'] = -1
+            ct['total'] = 0
+            ct['gaps'] = 0
+            ct['lost'] = 0
+            ct['ooo'] = 0
+            ct['gap_log'].clear()
+            ct['ooo_log'].clear()
+        self._tecmp_cmp_label.setText("")
+        self._tecmp_cmp_label.hide()
 
     def _poll_counter_stats(self):
         """Liest Counter-Statistiken aus Shared Array (QTimer, 1x/s)."""
@@ -11508,6 +11553,71 @@ class WiresharkPanel(QWidget):
                     self._bus_flush_paused = True
                     self._bus_tables[i].scrollToBottom()
                     self._bus_flush_paused = False
+
+    def _track_counter(self, ct: dict, value: int):
+        """Generischer 16-bit Counter Tracker fuer Gap/OOO Erkennung."""
+        ct['total'] += 1
+        prev = ct['prev']
+        if prev >= 0:
+            delta = value - prev
+            if delta < 0:
+                delta += 65536
+            if 0 < delta < 32768:
+                if delta > 1:
+                    nmiss = delta - 1
+                    ct['gaps'] += 1
+                    ct['lost'] += nmiss
+                    ct['gap_log'].append((prev, value, nmiss))
+                    if len(ct['gap_log']) > 100:
+                        ct['gap_log'] = ct['gap_log'][-50:]
+            elif delta >= 32768:
+                ct['ooo'] += 1
+                ct['ooo_log'].append((prev, value))
+                if len(ct['ooo_log']) > 100:
+                    ct['ooo_log'] = ct['ooo_log'][-50:]
+        ct['prev'] = value
+
+    def _update_tecmp_cmp_counter_ui(self):
+        """Timer-Callback: Aktualisiert TECMP/CMP Counter-Anzeige im Panel."""
+        parts = []
+        for name, ct in [("TECMP", self._tecmp_ct), ("CMP", self._cmp_ct)]:
+            if ct['total'] == 0:
+                continue
+            total = ct['total']
+            lost = ct['lost']
+            gaps = ct['gaps']
+            ooo = ct['ooo']
+
+            if lost == 0 and ooo == 0:
+                color = "#4CAF50"
+                text = (f"<b>{name}:</b> "
+                        f"<span style='color:{color}'>Verlust 0%</span>, "
+                        f"{total} Pakete")
+            else:
+                rate = lost / max(total + lost, 1)
+                text = (f"<b>{name}:</b> "
+                        f"<span style='color:#F44336'>Verlust {rate:.4%}</span>, "
+                        f"<span style='color:#FF9800'>{lost} verloren, "
+                        f"{gaps} Luecken</span>, "
+                        f"{total} empfangen")
+            if ooo > 0:
+                text += (f"<br>&nbsp;&nbsp;"
+                         f"<span style='color:#F44336'>"
+                         f"Out-of-Order: {ooo}</span>")
+                for prev, curr in ct['ooo_log'][-3:]:
+                    text += f" [{prev}\u2192{curr}]"
+            if gaps > 0 and ct['gap_log']:
+                text += "<br>&nbsp;&nbsp;Letzte Luecken: "
+                for prev, curr, nmiss in ct['gap_log'][-3:]:
+                    text += (f"<span style='color:#FF9800'>"
+                             f"{prev}\u2192{curr} ({nmiss})</span> ")
+            parts.append(text)
+
+        if parts:
+            self._tecmp_cmp_label.setText("<br>".join(parts))
+            self._tecmp_cmp_label.show()
+        else:
+            self._tecmp_cmp_label.hide()
 
     def _update_cmp_stats(self):
         """Timer-Callback: Aktualisiert CMP/PLP/TECMP Statistik-Labels in Bus-Toolbars."""
