@@ -119,6 +119,8 @@ class PcanCanPage(QWidget):
         self._dbc = None  # cantools Database
         self._signal_detail_visible = False
         self._plot_widget = None  # CanSignalPlotWidget
+        self._schedule_widget = None  # ScheduleTableWidget
+        self._stats_widget = None  # BusStatisticsWidget
         self._dbc_name = ''  # geladener DBC-Dateiname
         self._last_tx_count = 0
         self._last_rx_count = 0
@@ -375,6 +377,22 @@ class PcanCanPage(QWidget):
         self._tpl_load_btn.clicked.connect(self._load_tx_template)
         row1.addWidget(self._tpl_load_btn)
 
+        # Schedule Table Toggle
+        self._schedule_btn = QPushButton('Schedule')
+        self._schedule_btn.setCheckable(True)
+        self._schedule_btn.setMinimumWidth(80)
+        self._schedule_btn.setToolTip('Multi-Frame zyklisches Senden')
+        self._schedule_btn.toggled.connect(self._toggle_schedule)
+        row1.addWidget(self._schedule_btn)
+
+        # Statistics Toggle
+        self._stats_btn = QPushButton('Statistik')
+        self._stats_btn.setCheckable(True)
+        self._stats_btn.setMinimumWidth(80)
+        self._stats_btn.setToolTip('Echtzeit TX/RX Statistik-Diagramm')
+        self._stats_btn.toggled.connect(self._toggle_stats)
+        row1.addWidget(self._stats_btn)
+
         row1.addStretch()
 
         # Verbinden-Button
@@ -452,6 +470,53 @@ class PcanCanPage(QWidget):
         self._source_protos = protos
         self._source_iface_index = index
         self._last_shown_src = ""
+
+    # ── Schedule Table ──
+
+    def _toggle_schedule(self, checked: bool):
+        if checked:
+            if self._schedule_widget is None:
+                from ui.widgets.schedule_table_widget import ScheduleTableWidget
+                self._schedule_widget = ScheduleTableWidget('CAN', self)
+                self._schedule_widget.frame_to_send.connect(
+                    self._on_schedule_send)
+                # Nach TX-Tabelle einfuegen
+                self.layout().insertWidget(2, self._schedule_widget)
+            self._schedule_widget.show()
+        else:
+            if self._schedule_widget is not None:
+                self._schedule_widget.hide()
+
+    def _on_schedule_send(self, frame_dict: dict):
+        """Sendet einen Frame aus der Schedule-Tabelle."""
+        if self._bus is None:
+            return
+        try:
+            import can
+            msg = can.Message(
+                arbitration_id=frame_dict['frame_id'],
+                data=frame_dict['data'],
+                is_extended_id=frame_dict['frame_id'] > 0x7FF,
+            )
+            self._bus.send(msg)
+            self._tx_count += 1
+            if self._stats_widget:
+                self._stats_widget.record_tx()
+        except Exception as e:
+            _log.error("Schedule-Senden: %s", e)
+
+    # ── Statistics ──
+
+    def _toggle_stats(self, checked: bool):
+        if checked:
+            if self._stats_widget is None:
+                from ui.widgets.bus_statistics_widget import BusStatisticsWidget
+                self._stats_widget = BusStatisticsWidget('CAN', self)
+                self.layout().insertWidget(3, self._stats_widget)
+            self._stats_widget.show()
+        else:
+            if self._stats_widget is not None:
+                self._stats_widget.hide()
 
     # ── TX Templates ──
 
@@ -954,6 +1019,8 @@ class PcanCanPage(QWidget):
             self._bus.send(msg)
             self._tx_count += 1
             self._tx_reference[can_id] = bytes(data)
+            if self._stats_widget:
+                self._stats_widget.record_tx()
 
             elapsed = time.time() - (self._start_time or time.time())
             self._add_tx_row(can_id, data, elapsed)
@@ -1013,6 +1080,8 @@ class PcanCanPage(QWidget):
     def _on_frame_received(self, frame: dict):
         """Empfangener Frame → Signal fuer bus_queues[0]."""
         self._rx_count += 1
+        if self._stats_widget:
+            self._stats_widget.record_rx()
 
         ts = frame['timestamp']
         if self._start_time and ts > 1e9:
@@ -1348,6 +1417,10 @@ class PcanCanPage(QWidget):
         self._rate_timer.stop()
         self._bus_state_timer.stop()
         self._stop_periodic()
+        if self._schedule_widget is not None:
+            self._schedule_widget.cleanup()
+        if self._stats_widget is not None:
+            self._stats_widget.cleanup()
         if self._rx_thread is not None:
             self._rx_thread.stop()
             self._rx_thread.wait(2000)
