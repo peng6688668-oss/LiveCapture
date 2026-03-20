@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel,
     QLineEdit, QComboBox, QSpinBox, QCheckBox, QHeaderView,
-    QGroupBox, QMessageBox, QTableView, QFileDialog,
+    QGroupBox, QMessageBox, QTableView, QFileDialog, QInputDialog,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
 from PyQt6.QtGui import QColor, QFont
@@ -329,6 +329,19 @@ class PlinLinPage(QWidget):
         self._ldf_btn.clicked.connect(self._load_ldf)
         row1.addWidget(self._ldf_btn)
 
+        # Template Save/Load
+        self._tpl_save_btn = QPushButton('\U0001F4BE Speichern')
+        self._tpl_save_btn.setToolTip('TX-Konfiguration als Template speichern')
+        self._tpl_save_btn.setMinimumWidth(90)
+        self._tpl_save_btn.clicked.connect(self._save_tx_template)
+        row1.addWidget(self._tpl_save_btn)
+
+        self._tpl_load_btn = QPushButton('\U0001F4C2 Laden')
+        self._tpl_load_btn.setToolTip('TX-Template laden')
+        self._tpl_load_btn.setMinimumWidth(80)
+        self._tpl_load_btn.clicked.connect(self._load_tx_template)
+        row1.addWidget(self._tpl_load_btn)
+
         row1.addStretch()
 
         # Verbinden-Button
@@ -394,6 +407,43 @@ class PlinLinPage(QWidget):
         self._plp_counters = plp_pkt_counters
         self._plp_frame_counters = plp_can_counters
         self._plp_index = index
+
+    # ── TX Templates ──
+
+    def _save_tx_template(self):
+        from core.tx_template_manager import save_template
+        name, ok = QInputDialog.getText(
+            self, "Template speichern", "Template-Name:")
+        if not ok or not name.strip():
+            return
+        frame = {
+            'id': self._tx_id.text(),
+            'dlc': self._tx_dlc.value(),
+            'data': self._tx_data_edit.text(),
+            'cycle_ms': self._per_interval.value(),
+        }
+        path = save_template('LIN', name.strip(), [frame])
+        QMessageBox.information(
+            self, "Template", f"Template gespeichert:\n{path}")
+
+    def _load_tx_template(self):
+        from core.tx_template_manager import list_templates
+        templates = list_templates('LIN')
+        if not templates:
+            QMessageBox.information(
+                self, "Template", "Keine LIN-Templates vorhanden.")
+            return
+        names = [t['name'] for t in templates]
+        name, ok = QInputDialog.getItem(
+            self, "Template laden", "Template:", names, 0, False)
+        if not ok:
+            return
+        idx = names.index(name)
+        f = templates[idx].get('frames', [{}])[0]
+        self._tx_id.setText(f.get('id', '0x00'))
+        self._tx_dlc.setValue(f.get('dlc', 8))
+        self._tx_data_edit.setText(f.get('data', ''))
+        self._per_interval.setValue(f.get('cycle_ms', 100))
 
     def set_source_iface_ref(self, ifaces: list, protos: list, index: int):
         """Setzt Referenz auf bus_source_ifaces/protos fuer RX-Header."""

@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel,
     QLineEdit, QComboBox, QSpinBox, QCheckBox, QHeaderView,
-    QGroupBox, QMessageBox, QTableView, QFileDialog,
+    QGroupBox, QMessageBox, QTableView, QFileDialog, QInputDialog,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
 from PyQt6.QtGui import QColor, QFont
@@ -362,6 +362,19 @@ class PcanCanPage(QWidget):
         self._plot_btn.toggled.connect(self._toggle_signal_plot)
         row1.addWidget(self._plot_btn)
 
+        # Template Save/Load
+        self._tpl_save_btn = QPushButton('\U0001F4BE Speichern')
+        self._tpl_save_btn.setToolTip('TX-Konfiguration als Template speichern')
+        self._tpl_save_btn.setMinimumWidth(90)
+        self._tpl_save_btn.clicked.connect(self._save_tx_template)
+        row1.addWidget(self._tpl_save_btn)
+
+        self._tpl_load_btn = QPushButton('\U0001F4C2 Laden')
+        self._tpl_load_btn.setToolTip('TX-Template laden')
+        self._tpl_load_btn.setMinimumWidth(80)
+        self._tpl_load_btn.clicked.connect(self._load_tx_template)
+        row1.addWidget(self._tpl_load_btn)
+
         row1.addStretch()
 
         # Verbinden-Button
@@ -439,6 +452,53 @@ class PcanCanPage(QWidget):
         self._source_protos = protos
         self._source_iface_index = index
         self._last_shown_src = ""
+
+    # ── TX Templates ──
+
+    def _save_tx_template(self):
+        """Speichert die aktuelle TX-Konfiguration als Template."""
+        from core.tx_template_manager import save_template
+        name, ok = QInputDialog.getText(
+            self, "Template speichern", "Template-Name:")
+        if not ok or not name.strip():
+            return
+        frame = {
+            'id': self._tx_id.text(),
+            'dlc': self._tx_dlc.value(),
+            'data': self._tx_data_edit.text(),
+            'extended': self._tx_extended.isChecked(),
+            'fd': self._fd_check.isChecked(),
+            'cycle_ms': self._per_interval.value(),
+        }
+        path = save_template('CAN', name.strip(), [frame])
+        QMessageBox.information(
+            self, "Template", f"Template gespeichert:\n{path}")
+
+    def _load_tx_template(self):
+        """Laedt ein TX-Template und fuellt die Eingabefelder."""
+        from core.tx_template_manager import list_templates
+        templates = list_templates('CAN')
+        if not templates:
+            QMessageBox.information(
+                self, "Template", "Keine CAN-Templates vorhanden.")
+            return
+        names = [t['name'] for t in templates]
+        name, ok = QInputDialog.getItem(
+            self, "Template laden", "Template:", names, 0, False)
+        if not ok:
+            return
+        idx = names.index(name)
+        tpl = templates[idx]
+        frames = tpl.get('frames', [])
+        if not frames:
+            return
+        f = frames[0]
+        self._tx_id.setText(f.get('id', '0x123'))
+        self._tx_dlc.setValue(f.get('dlc', 8))
+        self._tx_data_edit.setText(f.get('data', ''))
+        self._tx_extended.setChecked(f.get('extended', False))
+        self._fd_check.setChecked(f.get('fd', False))
+        self._per_interval.setValue(f.get('cycle_ms', 100))
 
     def _on_config_toggle(self, expanded: bool):
         """Konfigurationspanel auf-/zuklappen."""

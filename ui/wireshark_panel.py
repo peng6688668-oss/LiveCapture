@@ -10950,33 +10950,36 @@ class WiresharkPanel(QWidget):
 
     def _on_bus_record_toggled(self, bus_index: int, checked: bool):
         """Record-Button: startet/stoppt Aufnahme der Bus-Daten."""
+        from core.recording_engine import (
+            export_bus_data, get_export_filter, get_default_filename)
+
         bus_names = ['CAN', 'LIN', 'Ethernet', 'FlexRay']
         bus_name = bus_names[bus_index] if bus_index < len(bus_names) else f"Bus-{bus_index}"
         if checked:
             self._bus_recorded_data[bus_index] = []
             self._bus_recording[bus_index] = True
-            self._bus_record_btns[bus_index].setText("⏺ Stop")
+            self._bus_record_btns[bus_index].setText("\u23f9 Stop")
         else:
             self._bus_recording[bus_index] = False
-            self._bus_record_btns[bus_index].setText("⏺ Record")
+            self._bus_record_btns[bus_index].setText("\u23fa Record")
             recorded = self._bus_recorded_data[bus_index]
             if not recorded:
-                QMessageBox.information(self, "Record", f"Keine {bus_name}-Daten aufgezeichnet.")
-                return
-            # Export-Dialog
-            path, _ = QFileDialog.getSaveFileName(
-                self, f"{bus_name}-Aufnahme speichern",
-                f"{bus_name}_record_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "CSV (*.csv);;Alle (*)")
-            if path:
-                headers = self._bus_models[bus_index]._headers
-                with open(path, 'w', encoding='utf-8') as f:
-                    f.write(';'.join(headers) + '\n')
-                    for row in recorded:
-                        f.write(';'.join(str(v) for v in row) + '\n')
                 QMessageBox.information(
                     self, "Record",
-                    f"{len(recorded)} {bus_name}-Frames gespeichert:\n{path}")
+                    f"Keine {bus_name}-Daten aufgezeichnet.")
+                return
+            # Export-Dialog mit Format-Auswahl
+            default_ext = 'blf' if bus_name in ('CAN', 'LIN') else 'csv'
+            path, _ = QFileDialog.getSaveFileName(
+                self, f"{bus_name}-Aufnahme speichern",
+                get_default_filename(bus_name, default_ext),
+                get_export_filter(bus_name))
+            if path:
+                headers = self._bus_models[bus_index]._headers
+                count = export_bus_data(path, bus_name, headers, recorded)
+                QMessageBox.information(
+                    self, "Record",
+                    f"{count} {bus_name}-Frames gespeichert:\n{path}")
 
     def _on_bus_filter_reset(self, bus_index: int):
         """Reset-Button: alle Filter einer Bus-Tabelle entfernen."""
