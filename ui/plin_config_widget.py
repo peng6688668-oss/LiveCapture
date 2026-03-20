@@ -9,6 +9,7 @@ Integriert sich in die bestehende Live LIN Seite des WiresharkPanels:
 
 import glob
 import logging
+import os
 import time
 from typing import Dict, Optional
 
@@ -22,6 +23,12 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
 from PyQt6.QtGui import QColor, QFont
 
 from ui.widgets.native_combo_box import NativeComboBox, NATIVE_COMBO_CSS
+
+try:
+    import cantools
+    CANTOOLS_AVAILABLE = True
+except ImportError:
+    CANTOOLS_AVAILABLE = False
 
 _log = logging.getLogger(__name__)
 
@@ -381,6 +388,13 @@ class PlinLinPage(QWidget):
         self._bus_row_counters = counters
         self._bus_index = index
 
+    def set_plp_counter_ref(self, plp_pkt_counters: list,
+                            plp_can_counters: list, index: int):
+        """Setzt Referenz auf PLP-Zaehler fuer Ratenberechnung."""
+        self._plp_counters = plp_pkt_counters
+        self._plp_frame_counters = plp_can_counters
+        self._plp_index = index
+
     def set_source_iface_ref(self, ifaces: list, protos: list, index: int):
         """Setzt Referenz auf bus_source_ifaces/protos fuer RX-Header."""
         self._source_ifaces = ifaces
@@ -732,8 +746,6 @@ class PlinLinPage(QWidget):
             return
         self._stop_periodic()
         self._periodic_count = 0
-        self._ldf = None  # cantools Database (LDF)
-        self._ldf_name = ''
         self._consecutive_errors = 0
         self._periodic_timer = QTimer(self)
         self._periodic_timer.timeout.connect(self._on_periodic_tick)

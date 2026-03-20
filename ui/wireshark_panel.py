@@ -6248,15 +6248,21 @@ class WiresharkPanel(QWidget):
             self._bus_proxies.append(proxy)
             self._bus_headers.append(filter_header)
             self._bus_tables.append(bus_table)
-            # CAN-Seite (bus_idx==0): PCAN-Integration
-            if bus_idx == 0:
+            # Bus-spezifische Seiten erstellen
+            if bus_idx == 0:  # CAN
                 from ui.pcan_config_widget import PcanCanPage
                 self._pcan_page = PcanCanPage(bus_table, self)
                 self._pcan_page.frame_for_bus_queue.connect(
                     lambda row_tuple: self._bus_queues[0].append(row_tuple))
-                self._live_content_stack.addWidget(self._pcan_page)  # Index 1
+                self._live_content_stack.addWidget(self._pcan_page)
+            elif bus_idx == 1:  # LIN
+                from ui.plin_config_widget import PlinLinPage
+                self._plin_page = PlinLinPage(bus_table, self)
+                self._plin_page.frame_for_bus_queue.connect(
+                    lambda row_tuple: self._bus_queues[1].append(row_tuple))
+                self._live_content_stack.addWidget(self._plin_page)
             else:
-                self._live_content_stack.addWidget(bus_table)  # Index 2-4
+                self._live_content_stack.addWidget(bus_table)  # Eth/FlexRay
 
         self._current_live_tab = 0
         video_layout.addWidget(self._live_content_stack, 1)
@@ -6264,11 +6270,16 @@ class WiresharkPanel(QWidget):
         # ── PLP/CAN 统计计数器 ──
         self._plp_pkt_counter = [0, 0, 0, 0]      # 每个 Bus 收到的 PLP 包数
         self._plp_can_frame_counter = [0, 0, 0, 0]  # 每个 Bus 从 PLP 解出的 CAN 帧数
-        if hasattr(self, '_pcan_page'):
-            self._pcan_page.set_plp_counter_ref(
-                self._plp_pkt_counter, self._plp_can_frame_counter, 0)
-            self._pcan_page.set_bus_row_counter_ref(
-                self._bus_row_counters, 0)
+        # Counter-Referenzen an alle Bus-Seiten uebergeben
+        for attr, idx in [('_pcan_page', 0), ('_plin_page', 1),
+                          ('_eth_page', 2), ('_flexray_page', 3)]:
+            page = getattr(self, attr, None)
+            if page is not None:
+                page.set_bus_row_counter_ref(self._bus_row_counters, idx)
+                if hasattr(page, 'set_plp_counter_ref'):
+                    page.set_plp_counter_ref(
+                        self._plp_pkt_counter,
+                        self._plp_can_frame_counter, idx)
 
         # ── Bus-Daten Batch-Timer (100ms Intervall → max 10 UI-Updates/s) ──
         self._bus_queues: List[list] = [[], [], [], []]
@@ -7971,9 +7982,11 @@ class WiresharkPanel(QWidget):
             self._video_decode_btn.setChecked(False)
             self._video_decode_btn.blockSignals(False)
 
-        # PCAN-Verbindung trennen
-        if hasattr(self, "_pcan_page") and self._pcan_page is not None:
-            self._pcan_page.cleanup()
+        # Bus-Seiten aufraeuemen
+        for attr in ('_pcan_page', '_plin_page', '_eth_page', '_flexray_page'):
+            page = getattr(self, attr, None)
+            if page is not None and hasattr(page, 'cleanup'):
+                page.cleanup()
 
         self.status_label.setText(f"Live-Capture gestoppt. {len(self.packets)} Pakete erfasst.")
 
