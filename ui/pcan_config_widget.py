@@ -668,9 +668,16 @@ class PcanCanPage(QWidget):
         def _toggle_tx_col(col):
             if self._tx_col_toggled.get(col, False):
                 if col in self._tx_default_widths:
-                    self._tx_table.setColumnWidth(col, self._tx_default_widths[col])
+                    if col == 6:  # Daten-Spalte: Stretch wiederherstellen
+                        h.setSectionResizeMode(
+                            col, QHeaderView.ResizeMode.Stretch)
+                    self._tx_table.setColumnWidth(
+                        col, self._tx_default_widths[col])
                 self._tx_col_toggled[col] = False
             else:
+                if col == 6:  # Daten-Spalte: Stretch aufheben
+                    h.setSectionResizeMode(
+                        col, QHeaderView.ResizeMode.Interactive)
                 self._tx_table.resizeColumnToContents(col)
                 self._tx_col_toggled[col] = True
 

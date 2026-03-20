@@ -4979,6 +4979,7 @@ class BusTableModel(QAbstractTableModel):
         self._headers = headers
         self._rows: List[tuple] = []
         self._max_rows = 200  # Nur sichtbarer Bereich, kein Akkumulieren
+        self._has_placeholder = False  # True wenn init_empty_rows aktiv
 
     def rowCount(self, parent=QModelIndex()):
         return len(self._rows)
@@ -5010,6 +5011,12 @@ class BusTableModel(QAbstractTableModel):
         """Batch-Update: Daten direkt ersetzen, nur dataChanged (kein Layout-Signal)."""
         if not new_rows:
             return
+        # Platzhalter-Zeilen beim ersten echten Dateneingang entfernen
+        if self._has_placeholder:
+            self.beginResetModel()
+            self._rows.clear()
+            self._has_placeholder = False
+            self.endResetModel()
         old_count = len(self._rows)
         self._rows.extend(new_rows)
         if len(self._rows) > self._max_rows:
@@ -5033,6 +5040,7 @@ class BusTableModel(QAbstractTableModel):
         self.beginResetModel()
         empty = tuple('' for _ in self._headers)
         self._rows = [empty for _ in range(count)]
+        self._has_placeholder = True
         self.endResetModel()
 
     def clear(self):
@@ -6129,16 +6137,24 @@ class WiresharkPanel(QWidget):
             # 1. Klick: an Inhalt anpassen, 2. Klick: Standardbreite
             _dw = dict(enumerate(_default_widths[:len(columns)]))
             _toggled = {}  # col → bool (True = content-fit)
+            _stretch_col = 6 if len(columns) > 6 else -1
 
             def _toggle_col_width(col, table=bus_table, defaults=_dw,
-                                  state=_toggled):
+                                  state=_toggled, hdr=header,
+                                  scol=_stretch_col):
                 if state.get(col, False):
                     # Zurueck zur Standardbreite
                     if col in defaults:
+                        if col == scol:
+                            hdr.setSectionResizeMode(
+                                col, QHeaderView.ResizeMode.Stretch)
                         table.setColumnWidth(col, defaults[col])
                     state[col] = False
                 else:
-                    # An Inhalt anpassen
+                    # Stretch temporaer aufheben fuer resizeColumnToContents
+                    if col == scol:
+                        hdr.setSectionResizeMode(
+                            col, QHeaderView.ResizeMode.Interactive)
                     table.resizeColumnToContents(col)
                     state[col] = True
 
