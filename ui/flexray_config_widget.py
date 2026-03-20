@@ -22,6 +22,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QSettings, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 
+from ui.widgets.native_combo_box import NativeComboBox, NATIVE_COMBO_CSS
+
 _log = logging.getLogger(__name__)
 
 _MONO = QFont("Consolas", 9)
@@ -152,13 +154,14 @@ class FlexRayLivePage(QWidget):
         wrapper_layout.addWidget(self._config_toggle)
 
         self._config_content = QWidget()
+        self._config_content.setStyleSheet(NATIVE_COMBO_CSS)
         cl = QHBoxLayout(self._config_content)
         cl.setContentsMargins(4, 2, 4, 2)
         cl.setSpacing(8)
 
         # Kanal-Filter
         cl.addWidget(QLabel("Kanal:"))
-        self._channel_combo = QComboBox()
+        self._channel_combo = NativeComboBox()
         self._channel_combo.addItems(["Alle", "A", "B"])
         self._channel_combo.setMaximumWidth(80)
         cl.addWidget(self._channel_combo)

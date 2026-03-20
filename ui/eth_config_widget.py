@@ -20,6 +20,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
+from ui.widgets.native_combo_box import NativeComboBox, NATIVE_COMBO_CSS
+
 _log = logging.getLogger(__name__)
 
 _MONO = QFont("Consolas", 9)
@@ -124,13 +126,14 @@ class EthLivePage(QWidget):
         wrapper_layout.addWidget(self._config_toggle)
 
         self._config_content = QWidget()
+        self._config_content.setStyleSheet(NATIVE_COMBO_CSS)
         cl = QHBoxLayout(self._config_content)
         cl.setContentsMargins(4, 2, 4, 2)
         cl.setSpacing(8)
 
         # EtherType-Filter
         cl.addWidget(QLabel("EtherType-Filter:"))
-        self._ethertype_combo = QComboBox()
+        self._ethertype_combo = NativeComboBox()
         self._ethertype_combo.addItem("Alle", 0x0000)
         self._ethertype_combo.addItem("IPv4 (0x0800)", 0x0800)
         self._ethertype_combo.addItem("ARP (0x0806)", 0x0806)

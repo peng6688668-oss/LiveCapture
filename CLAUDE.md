@@ -49,20 +49,19 @@ Alle neu erstellten Buttons **MUESSEN** ausreichend gross sein, damit der Text/I
 
 ## ComboBox-Stil — WICHTIG
 
-Alle `QComboBox` im gesamten Projekt **MUESSEN** den einheitlichen Dropdown-Pfeil verwenden:
-- Kein schwarzes Quadrat oder Standard-System-Pfeil
-- Immer den CSS-Dreieckspfeil wie bei Live CAN Bitrate:
+Alle Dropdown-Felder **MUESSEN** `NativeComboBox` verwenden, NICHT `QComboBox`:
+```python
+from ui.widgets.native_combo_box import NativeComboBox, NATIVE_COMBO_CSS
+
+# Parent-Container CSS setzen:
+self._config_content.setStyleSheet(NATIVE_COMBO_CSS)
+
+# NativeComboBox statt QComboBox verwenden:
+combo = NativeComboBox()
 ```
-QComboBox::drop-down { border: none; width: 20px; }
-QComboBox::down-arrow {
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid #555;
-    margin-right: 6px;
-}
-```
-- Bei neuen Widgets: entweder globales Theme uebernehmen lassen oder `_COMBO_STYLE` Konstante verwenden
+- `NativeComboBox` zeichnet den Dropdown-Pfeil per `paintEvent` (kein CSS)
+- Verhindert schwarze Quadrate die durch Qt-Fusion-Style entstehen
+- `NATIVE_COMBO_CSS` muss auf dem Parent-Container gesetzt werden
 
 ---
 

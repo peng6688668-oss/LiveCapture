@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 
+from ui.widgets.native_combo_box import NativeComboBox, NATIVE_COMBO_CSS
+
 try:
     import pyqtgraph as pg
     PG_AVAILABLE = True
@@ -30,12 +32,6 @@ except ImportError:
 _log = logging.getLogger(__name__)
 
 _MONO = QFont("Consolas", 9)
-_COMBO_STYLE = (
-    "QComboBox::drop-down { border: none; width: 20px; }"
-    "QComboBox::down-arrow { image: none;"
-    "  border-left: 4px solid transparent; border-right: 4px solid transparent;"
-    "  border-top: 5px solid #555; margin-right: 6px; }"
-)
 _MONO_BOLD = QFont("Consolas", 9, QFont.Weight.Bold)
 
 _MAX_SAMPLES = 15000  # 60s @ 250 Hz
@@ -290,14 +286,14 @@ class DigitalLivePage(QWidget):
         wrapper_layout.addWidget(self._config_toggle)
 
         self._config_content = QWidget()
+        self._config_content.setStyleSheet(NATIVE_COMBO_CSS)
         cl = QHBoxLayout(self._config_content)
         cl.setContentsMargins(4, 2, 4, 2)
         cl.setSpacing(8)
 
         # Channel select
         cl.addWidget(QLabel("Kanal:"))
-        self._channel_combo = QComboBox()
-        self._channel_combo.setStyleSheet(_COMBO_STYLE)
+        self._channel_combo = NativeComboBox()
         self._channel_combo.addItems(
             ["Alle"] + [f"CH{i}" for i in range(8)])
         self._channel_combo.setMinimumWidth(80)
@@ -307,8 +303,7 @@ class DigitalLivePage(QWidget):
 
         # Edge trigger
         cl.addWidget(QLabel("Flanke:"))
-        self._edge_combo = QComboBox()
-        self._edge_combo.setStyleSheet(_COMBO_STYLE)
+        self._edge_combo = NativeComboBox()
         self._edge_combo.addItems(["Both", "Rising", "Falling"])
         self._edge_combo.setMinimumWidth(90)
         self._edge_combo.currentTextChanged.connect(
