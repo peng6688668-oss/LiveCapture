@@ -506,6 +506,77 @@ class IEEE1722Decoder:
 
 
 # ---------------------------------------------------------------------------
+# ASAMCMPDecoder — ASAM Capture Module Protocol
+# ---------------------------------------------------------------------------
+
+class ASAMCMPDecoder:
+    """Decoder fuer ASAM CMP (Capture Module Protocol).
+
+    ASAM CMP teilt EtherType 0x99FE mit TECMP, hat aber ein anderes
+    Header-Format (8 Bytes statt 12).
+
+    Header:
+      [0]    CmpVersion   (0x01 = V1.0)
+      [1]    Reserved     (0x00)
+      [2-3]  DeviceId
+      [4]    MessageType
+      [5]    StreamId
+      [6-7]  StreamSequenceCounter
+    """
+
+    MESSAGE_TYPES = {
+        0x01: "Data",
+        0x02: "Status",
+        0x03: "Control",
+        0xFE: "Vendor Defined",
+        0xFF: "Vendor Reserved",
+    }
+
+    # Bekannte Vendor-IDs
+    VENDOR_IDS = {
+        0x019C: "Technica Engineering",
+    }
+
+    @classmethod
+    def decode(cls, data: bytes) -> Dict[str, Any]:
+        """Dekodiert ASAM CMP Header (8 Bytes)."""
+        result = {"protocol": "ASAM CMP", "fields": []}
+
+        if len(data) < 8:
+            result["error"] = "ASAM CMP header too short"
+            return result
+
+        cmp_version = data[0]
+        reserved = data[1]
+        device_id = int.from_bytes(data[2:4], 'big')
+        msg_type = data[4]
+        stream_id = data[5]
+        seq_counter = int.from_bytes(data[6:8], 'big')
+
+        result["cmp_version"] = cmp_version
+        result["device_id"] = device_id
+        result["msg_type"] = msg_type
+        result["stream_id"] = stream_id
+        result["seq_counter"] = seq_counter
+
+        msg_type_name = cls.MESSAGE_TYPES.get(msg_type, f"Unknown (0x{msg_type:02X})")
+
+        result["fields"].append(("CMP Version", f"0x{cmp_version:02X}"))
+        result["fields"].append(("Device ID", f"0x{device_id:04X}"))
+        result["fields"].append(("Message Type",
+                                 f"0x{msg_type:02X} ({msg_type_name})"))
+        result["fields"].append(("Stream ID", str(stream_id)))
+        result["fields"].append(("Sequence Counter", str(seq_counter)))
+
+        # Payload nach Header
+        if len(data) > 8:
+            payload_len = len(data) - 8
+            result["fields"].append(("Payload Length", f"{payload_len} bytes"))
+
+        return result
+
+
+# ---------------------------------------------------------------------------
 # PLPDecoder — Physical Layer Protocol
 # ---------------------------------------------------------------------------
 
@@ -832,7 +903,24 @@ class ProtocolDetector:
 
     @classmethod
     def _classify_tecmp_content(cls, data: bytes) -> str:
-        """Klassifiziert TECMP-Inhalt genauer (PLP, GMSL, FPD-Link, oder reines TECMP)."""
+        """Klassifiziert 0x99FE-Inhalt: ASAM CMP, PLP oder TECMP.
+
+        Erkennungslogik (alle teilen EtherType 0x99FE):
+          - ASAM CMP: byte[0]=0x01 (CmpVersion), byte[1]=0x00 (Reserved)
+          - TECMP:    byte[4] in (2, 3) → Version 2 oder 3
+          - PLP:      TECMP mit data_type 0x0100-0x01FF (Physical Layer)
+        """
+        if len(data) < 8:
+            return "TECMP"
+
+        # ASAM CMP: CmpVersion=0x01, Reserved=0x00
+        if data[0] == 0x01 and data[1] == 0x00:
+            # Zusaetzliche Plausibilitaet: TECMP hat an byte[0-1] die DeviceID,
+            # die selten genau 0x0100 ist. ASAM CMP hat MessageType an byte[4].
+            # TECMP hat Version (2 oder 3) an byte[4].
+            if data[4] not in (2, 3):
+                return "ASAM CMP"
+
         if len(data) < 12:
             return "TECMP"
 
@@ -897,6 +985,23 @@ class ProtocolDetector:
             subtype = decoded.get("subtype", -1)
             subtype_name = IEEE1722Decoder.SUBTYPES.get(subtype, "Unknown")
             info = f"AVTP {subtype_name}"
+
+        elif protocol == "ASAM CMP":
+            raw_payload = b""
+            if pkt.haslayer(Raw):
+                raw_payload = bytes(pkt[Raw].load)
+            if raw_payload:
+                decoded = ASAMCMPDecoder.decode(raw_payload)
+                decoded_fields = decoded.get("fields", [])
+                device_id = decoded.get("device_id", 0)
+                msg_type = decoded.get("msg_type", 0)
+                msg_type_name = ASAMCMPDecoder.MESSAGE_TYPES.get(
+                    msg_type, f"0x{msg_type:02X}")
+                stream_id = decoded.get("stream_id", 0)
+                info = (f"ASAM CMP {msg_type_name}"
+                        f" [Dev 0x{device_id:04X} Stream {stream_id}]")
+            else:
+                info = "ASAM CMP"
 
         elif protocol in ("TECMP", "PLP"):
             raw_payload = b""
