@@ -8468,12 +8468,8 @@ class WiresharkPanel(QWidget):
     def _route_cmp_to_bus_tables(self, pkt):
         """Extrahiert Bus-Daten aus ASAM CMP-Paketen und routet sie in die Bus-Tabellen."""
         try:
-            if Ether not in pkt or pkt[Ether].type != 0x99FE:
-                return
-            if Raw not in pkt:
-                return
-            raw = bytes(pkt[Raw].load)
-            if len(raw) < 8:
+            raw = self._extract_tecmp_payload(pkt)
+            if raw is None or len(raw) < 8:
                 return
             # ASAM CMP Erkennung: Version=0x01, Reserved=0x00
             if raw[0] != 0x01 or raw[1] != 0x00:
@@ -8550,8 +8546,10 @@ class WiresharkPanel(QWidget):
 
                 cur = payload_end if payload_end > cur + 16 else cur + 16
 
-        except Exception:
-            pass
+        except Exception as _cmp_err:
+            import traceback
+            logging.getLogger(__name__).error(
+                "CMP routing error: %s\n%s", _cmp_err, traceback.format_exc())
 
     def _extract_cmp_lin_fields(self, payload: bytes) -> dict:
         """Extrahiert LIN-Felder aus CMP LIN Payload fuer Per-ID Statistik."""
@@ -8744,8 +8742,10 @@ class WiresharkPanel(QWidget):
             # CAN-from-PLP 帧计数
             self._plp_can_frame_counter[bus_index] += can_in_this_plp
 
-        except Exception:
-            pass
+        except Exception as _tecmp_err:
+            import traceback
+            logging.getLogger(__name__).error(
+                "TECMP routing error: %s\n%s", _tecmp_err, traceback.format_exc())
 
     def _extract_tecmp_payload(self, pkt) -> Optional[bytes]:
         """Extrahiert TECMP-Payload aus einem Scapy-Paket (EtherType oder UDP)."""
