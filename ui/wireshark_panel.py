@@ -6283,7 +6283,7 @@ class WiresharkPanel(QWidget):
                 from ui.plin_config_widget import PlinLinPage
                 self._plin_page = PlinLinPage(bus_table, self)
                 self._plin_page.frame_for_bus_queue.connect(
-                    lambda row_tuple: self._bus_queues[1].append(row_tuple))
+                    lambda row_tuple: self._add_bus_data(1, row_tuple))
                 self._live_content_stack.addWidget(self._plin_page)
                 # Verbinden/Start/Stop in Toolbar verschieben
                 if hasattr(self, '_lin_toolbar_layout'):
