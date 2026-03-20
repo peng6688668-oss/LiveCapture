@@ -5028,6 +5028,13 @@ class BusTableModel(QAbstractTableModel):
                 self.index(0, 0),
                 self.index(new_count - 1, len(self._headers) - 1))
 
+    def init_empty_rows(self, count: int):
+        """Fuellt das Model mit leeren Zeilen fuer initiale Anzeige."""
+        self.beginResetModel()
+        empty = tuple('' for _ in self._headers)
+        self._rows = [empty for _ in range(count)]
+        self.endResetModel()
+
     def clear(self):
         self.beginResetModel()
         self._rows.clear()
@@ -6118,11 +6125,29 @@ class WiresharkPanel(QWidget):
             for col, w in enumerate(_default_widths):
                 if col < len(columns):
                     bus_table.setColumnWidth(col, w)
-            # Doppelklick auf Header → Spalte an Inhalt anpassen
-            header.sectionDoubleClicked.connect(
-                lambda col, t=bus_table: t.resizeColumnToContents(col))
+            # Doppelklick auf Header → Spalte umschalten:
+            # 1. Klick: an Inhalt anpassen, 2. Klick: Standardbreite
+            _dw = dict(enumerate(_default_widths[:len(columns)]))
+            _toggled = {}  # col → bool (True = content-fit)
+
+            def _toggle_col_width(col, table=bus_table, defaults=_dw,
+                                  state=_toggled):
+                if state.get(col, False):
+                    # Zurueck zur Standardbreite
+                    if col in defaults:
+                        table.setColumnWidth(col, defaults[col])
+                    state[col] = False
+                else:
+                    # An Inhalt anpassen
+                    table.resizeColumnToContents(col)
+                    state[col] = True
+
+            header.sectionDoubleClicked.connect(_toggle_col_width)
             bus_table.verticalHeader().setVisible(False)
             bus_table.verticalHeader().setDefaultSectionSize(22)
+
+            # Leere Zeilen fuer initiale Anzeige (wie TX-Tabelle)
+            model.init_empty_rows(30)
 
             self._bus_models.append(model)
             self._bus_proxies.append(proxy)
