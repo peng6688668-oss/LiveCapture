@@ -5280,7 +5280,12 @@ class FilterPopup(QDialog):
 
 
 class FilterHeaderView(QHeaderView):
-    """Header-View mit Filter-Indikator und Klick-Handler."""
+    """Header-View mit Filter-Indikator und Klick-Handler.
+
+    Unterscheidet Einzel- und Doppelklick:
+    - Einzelklick: Filter-Popup oeffnen
+    - Doppelklick: Spaltenbreite umschalten (sectionDoubleClicked)
+    """
 
     filter_requested = pyqtSignal(int, QPoint)  # (column, global_pos)
 
@@ -5288,7 +5293,14 @@ class FilterHeaderView(QHeaderView):
         super().__init__(orientation, parent)
         self._filtered_columns: set = set()
         self.setSectionsClickable(True)
+        # Einzelklick verzoegern, damit Doppelklick erkannt werden kann
+        self._pending_click_col = -1
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(300)  # ms — Standard-Doppelklick-Intervall
+        self._click_timer.timeout.connect(self._fire_pending_click)
         self.sectionClicked.connect(self._on_section_clicked)
+        self.sectionDoubleClicked.connect(self._on_section_double_clicked)
         self.setStyleSheet(
             "QHeaderView::section { background: #f5f5f7; color: #0d0d17;"
             "  padding: 4px 6px; border: none;"
@@ -5318,16 +5330,30 @@ class FilterHeaderView(QHeaderView):
             painter.restore()
 
     def _on_section_clicked(self, logical_index: int):
-        """Zeigt Filter-Popup unter dem Header (nur wenn nicht am Resize-Rand)."""
+        """Verzoegert Einzelklick — wartet ob Doppelklick folgt."""
+        self._pending_click_col = logical_index
+        self._click_timer.start()
+
+    def _on_section_double_clicked(self, logical_index: int):
+        """Doppelklick erkannt — Einzelklick abbrechen."""
+        self._click_timer.stop()
+        self._pending_click_col = -1
+
+    def _fire_pending_click(self):
+        """Einzelklick bestaetigt — Filter-Popup oeffnen."""
+        col = self._pending_click_col
+        self._pending_click_col = -1
+        if col < 0:
+            return
         # Mausposition prüfen: wenn nahe am Spaltenrand → Resize, kein Popup
         cursor_x = self.mapFromGlobal(self.cursor().pos()).x()
-        section_start = self.sectionViewportPosition(logical_index)
-        section_end = section_start + self.sectionSize(logical_index)
+        section_start = self.sectionViewportPosition(col)
+        section_end = section_start + self.sectionSize(col)
         margin = 8  # Pixel-Toleranz für Resize-Zone
         if cursor_x < section_start + margin or cursor_x > section_end - margin:
             return  # Resize-Zone → kein Filter-Popup
         pos = self.mapToGlobal(QPoint(section_start, self.height()))
-        self.filter_requested.emit(logical_index, pos)
+        self.filter_requested.emit(col, pos)
 
 
 class WiresharkPanel(QWidget):
