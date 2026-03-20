@@ -43,7 +43,7 @@ except ImportError:
 
 # ── Konstanten ─────────────────────────────────────────────────────────
 _BAUDRATES = ["2400", "4800", "9600", "19200"]
-_TX_HEADERS = ["Nr.", "Zeit", "Kanal", "ID", "Name", "DLC", "Daten", "Prüfsumme"]
+_TX_HEADERS = ["Nr.", "Zeit", "Kanal", "ID", "Name", "DLC", "Daten", "Prüfsumme", "Status"]
 
 _MONO = QFont("Consolas", 9)
 _MONO_BOLD = QFont("Consolas", 9, QFont.Weight.Bold)
@@ -643,7 +643,7 @@ class PlinLinPage(QWidget):
 
         # TX-Tabelle
         self._tx_table = QTableWidget()
-        self._tx_table.setColumnCount(8)
+        self._tx_table.setColumnCount(9)
         self._tx_table.setHorizontalHeaderLabels(_TX_HEADERS)
         self._tx_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
@@ -663,7 +663,7 @@ class PlinLinPage(QWidget):
         self._tx_table.verticalHeader().setVisible(False)
         self._tx_table.verticalHeader().setDefaultSectionSize(22)
         h = self._tx_table.horizontalHeader()
-        _widths = [180, 120, 70, 80, 100, 50, 800, 100]
+        _widths = [70, 120, 70, 60, 100, 50, 400, 100, 100]
         for col, w in enumerate(_widths):
             h.setSectionResizeMode(
                 col, QHeaderView.ResizeMode.Stretch
@@ -674,7 +674,7 @@ class PlinLinPage(QWidget):
         for r in range(30):
             self._tx_table.insertRow(r)
             bg = QColor("#e3f2fd") if r % 2 == 0 else QColor("#ffffff")
-            for c in range(8):
+            for c in range(9):
                 item = QTableWidgetItem("")
                 item.setBackground(bg)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
@@ -842,6 +842,7 @@ class PlinLinPage(QWidget):
     def _send_frame(self) -> bool:
         """Sendet einen LIN-Frame. Gibt True bei Erfolg zurueck."""
         if self._plin is None:
+            self._handle_device_lost("PLIN-Geraet nicht verbunden.")
             return False
 
         lin_id = self._parse_lin_id()
@@ -861,6 +862,18 @@ class PlinLinPage(QWidget):
 
         enhanced = self._is_enhanced_checksum()
         checksum = _calc_checksum(data, pid=lin_id, enhanced=enhanced)
+
+        # Geraet noch vorhanden?
+        device_path = self._iface_combo.currentText().strip()
+        if not os.path.exists(device_path):
+            self._tx_count += 1
+            elapsed = time.time() - (self._start_time or time.time())
+            self._add_tx_row(lin_id, data, elapsed, checksum,
+                             status="GETRENNT", ok=False)
+            self._handle_device_lost(
+                f"Geraet '{device_path}' nicht mehr verfuegbar.\n\n"
+                "Das PCAN-USB Pro FD wurde moeglicherweise abgezogen.")
+            return False
 
         try:
             checksum_type = (
@@ -882,6 +895,10 @@ class PlinLinPage(QWidget):
             try:
                 self._plin.write(msg)
             except BlockingIOError:
+                self._tx_count += 1
+                elapsed = time.time() - (self._start_time or time.time())
+                self._add_tx_row(lin_id, data, elapsed, checksum,
+                                 status="BLOCKIERT", ok=False)
                 _log.warning("LIN-Senden blockiert (Slave ohne Master?)")
                 return False
             finally:
@@ -907,15 +924,52 @@ class PlinLinPage(QWidget):
             self._id_stats[lin_id]['last_tx'] = time.time()
 
             elapsed = time.time() - (self._start_time or time.time())
-            self._add_tx_row(lin_id, data, elapsed, checksum)
+            self._add_tx_row(lin_id, data, elapsed, checksum,
+                             status="OK", ok=True)
             self._update_counters()
             self._consecutive_errors = 0
             return True
+        except OSError as e:
+            # OSError: Geraet nicht mehr erreichbar (z.B. USB abgezogen)
+            self._tx_count += 1
+            elapsed = time.time() - (self._start_time or time.time())
+            self._add_tx_row(lin_id, data, elapsed, checksum,
+                             status="FEHLER", ok=False)
+            _log.error("LIN-Senden OSError: %s", e)
+            if self._stats_widget:
+                self._stats_widget.record_error()
+            self._handle_device_lost(
+                f"Senden fehlgeschlagen: {e}\n\n"
+                "Das PCAN-USB Pro FD reagiert nicht mehr.\n"
+                "Bitte Verbindung pruefen und neu verbinden.")
+            return False
         except Exception as e:
+            self._tx_count += 1
+            elapsed = time.time() - (self._start_time or time.time())
+            self._add_tx_row(lin_id, data, elapsed, checksum,
+                             status="FEHLER", ok=False)
             _log.error("LIN-Senden: %s", e)
             if self._stats_widget:
                 self._stats_widget.record_error()
             return False
+
+    def _handle_device_lost(self, message: str):
+        """Behandelt Geraeteverlust: stoppt alles, UI zuruecksetzen, Warnung."""
+        was_periodic = self._periodic_timer is not None
+        self._stop_periodic()
+        self._disconnect_device()
+
+        # Status auf Fehler setzen
+        self._status_indicator.setText("\u25cf Verbindung verloren")
+        self._status_indicator.setStyleSheet(
+            "color: #FF9800; font-weight: bold;")
+
+        QMessageBox.warning(
+            self, "Verbindung verloren",
+            f"{message}\n\n"
+            + ("Zyklisches Senden wurde automatisch gestoppt.\n"
+               if was_periodic else "")
+            + "Verbindung wurde getrennt.")
 
     def _start_periodic(self):
         if self._plin is None:
@@ -947,17 +1001,26 @@ class PlinLinPage(QWidget):
         if ok:
             self._periodic_count += 1
             self._per_label.setText(f"Aktiv: {self._periodic_count}")
-
         else:
             self._consecutive_errors = getattr(self, '_consecutive_errors', 0) + 1
             if self._consecutive_errors >= 3:
-                self._stop_periodic()
-                self._per_label.setText("FEHLER: TX-Puffer voll")
-
                 _log.error(
                     "Zyklisches Senden gestoppt: %d aufeinanderfolgende"
-                    " Fehler (ENOBUFS / Error 105)",
-                    self._consecutive_errors)
+                    " Fehler", self._consecutive_errors)
+                # _handle_device_lost stoppt periodic automatisch,
+                # aber falls noch aktiv (z.B. BlockingIOError):
+                if self._periodic_timer is not None:
+                    self._stop_periodic()
+                    self._per_label.setText("FEHLER: gestoppt")
+                    QMessageBox.warning(
+                        self, "Senden fehlgeschlagen",
+                        f"{self._consecutive_errors} aufeinanderfolgende"
+                        " Sendefehler.\n\n"
+                        "Zyklisches Senden wurde gestoppt.\n"
+                        "Moegliche Ursachen:\n"
+                        "\u2022 TX-Puffer voll (kein Master auf dem Bus)\n"
+                        "\u2022 LIN-Bus nicht verbunden\n"
+                        "\u2022 Bitrate stimmt nicht ueberein")
 
     # ═══════════════════════════════════════════════════════════════════
     # Empfang → bus_queues
@@ -1029,22 +1092,37 @@ class PlinLinPage(QWidget):
     # ═══════════════════════════════════════════════════════════════════
 
     def _add_tx_row(self, lin_id: int, data: bytes,
-                    elapsed: float, checksum: int):
+                    elapsed: float, checksum: int,
+                    status: str = "OK", ok: bool = True):
         row = (self._tx_count - 1) % 30
 
         id_str = f"0x{lin_id:02X}"
         data_hex = ' '.join(f'{b:02X}' for b in data)
         channel = self._iface_combo.currentText()
         checksum_str = f"0x{checksum:02X}"
+        name = self.ldf_lookup(lin_id)
 
         cells = [
             str(self._tx_count), f"{elapsed:.6f}", channel,
-            id_str, "", str(len(data)), data_hex, checksum_str,
+            id_str, name, str(len(data)), data_hex, checksum_str, status,
         ]
+
+        # Farbkodierung: OK=gruen, Fehler=rot
+        if ok:
+            status_fg = QColor("#4CAF50")
+        else:
+            status_fg = QColor("#F44336")
+
         for col, text in enumerate(cells):
             item = self._tx_table.item(row, col)
             if item is not None:
                 item.setText(text)
+                # Status-Spalte farbig, Fehler-Zeilen rot
+                if col == 8:
+                    item.setForeground(status_fg)
+                    item.setFont(_MONO_BOLD)
+                elif not ok:
+                    item.setForeground(QColor("#F44336"))
 
     def _update_counters(self):
         rx = self._bus_row_counters[self._bus_index] if self._bus_row_counters else self._rx_count
