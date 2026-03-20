@@ -6043,6 +6043,7 @@ class WiresharkPanel(QWidget):
         self._bus_recorded_data: List[List[tuple]] = [[] for _ in range(6)]
         self._bus_recording: List[bool] = [False] * 6
         self._bus_filter_status_labels: List[QLabel] = []
+        self._bus_cmp_stats_labels: List[QLabel] = []
         _BUS_BTN_STYLE = (
             "QPushButton { background: #dcdce5; color: #333; border: 1px solid #c0c0c8;"
             "  border-radius: 3px; padding: 3px 8px; }"
@@ -6072,6 +6073,14 @@ class WiresharkPanel(QWidget):
             filter_status.setStyleSheet("color: #0078d4; background: transparent;")
             self._bus_filter_status_labels.append(filter_status)
             bus_h.addWidget(filter_status)
+
+            # --- CMP/PLP/TECMP Statistik-Label ---
+            cmp_stats_lbl = QLabel("")
+            cmp_stats_lbl.setFont(QFont("Consolas", 8))
+            cmp_stats_lbl.setStyleSheet(
+                "color: #6A1B9A; font-weight: bold; background: transparent;")
+            self._bus_cmp_stats_labels.append(cmp_stats_lbl)
+            bus_h.addWidget(cmp_stats_lbl)
 
             bus_h.addStretch()
 
@@ -6322,9 +6331,15 @@ class WiresharkPanel(QWidget):
         self._current_live_tab = 0
         video_layout.addWidget(self._live_content_stack, 1)
 
-        # ── PLP/CAN 统计计数器 ──
+        # ── PLP/TECMP/CMP 统计计数器 ──
         self._plp_pkt_counter = [0] * 6
         self._plp_can_frame_counter = [0] * 6
+        self._cmp_pkt_total = 0
+        self._cmp_msg_total = 0
+        self._cmp_last_pkt_total = 0
+        self._cmp_last_msg_total = 0
+        self._cmp_devices = {}  # {device_id: {'streams': set(), 'msgs': 0}}
+        self._cmp_proto_counter = {}  # {payload_type_name: count}
         # Counter-Referenzen an alle Bus-Seiten uebergeben
         for attr, idx in [('_pcan_page', 0), ('_plin_page', 1),
                           ('_eth_page', 2), ('_flexray_page', 3),
@@ -6343,6 +6358,12 @@ class WiresharkPanel(QWidget):
         self._bus_flush_timer.setInterval(200)
         self._bus_flush_timer.timeout.connect(self._flush_bus_queues)
         self._bus_flush_timer.start()
+
+        # ── CMP Statistik-Timer (1s Intervall) ──
+        self._cmp_stats_timer = QTimer(self)
+        self._cmp_stats_timer.setInterval(1000)
+        self._cmp_stats_timer.timeout.connect(self._update_cmp_stats)
+        self._cmp_stats_timer.start()
 
         # Video-Container initial sichtbar (schwarzer Hintergrund)
 
@@ -6944,6 +6965,224 @@ class WiresharkPanel(QWidget):
             else:
                 parent.addChild(QTreeWidgetItem([field_name, value]))
 
+    # ── ASAM CMP Detail-Tree ─────────────────────────────────────────────
+
+    _CMP_DATA_TYPE_NAMES = {
+        0x01: "CAN", 0x02: "CAN-FD", 0x03: "LIN", 0x04: "FlexRay",
+        0x05: "Digital", 0x06: "UART/RS-232", 0x07: "Analog",
+        0x08: "Ethernet", 0x09: "SPI", 0x0A: "I2C",
+        0x0B: "GigE Vision", 0x0C: "MIPI CSI-2",
+    }
+    _CMP_MSG_TYPE_NAMES = {
+        0x01: "Data Message", 0x02: "Control Message",
+        0x03: "Status Message", 0x0D: "Vendor-Defined",
+    }
+
+    def _show_cmp_detail_tree(self, data: bytes, base_off: int):
+        """Zeigt ASAM CMP Paketdetails im Detail-Tree an."""
+        import struct
+
+        # Frame Header (8 Bytes)
+        version = data[0]
+        device_id = struct.unpack('!H', data[2:4])[0]
+        msg_type = data[4]
+        stream_id = data[5]
+        seq_counter = struct.unpack('!H', data[6:8])[0]
+        msg_type_name = self._CMP_MSG_TYPE_NAMES.get(msg_type, f"0x{msg_type:02X}")
+
+        cmp_item = QTreeWidgetItem([
+            "ASAM CMP (Capture Module Protocol)",
+            f"[{msg_type_name}] Device: 0x{device_id:04X}"])
+        cmp_item.setData(0, Qt.ItemDataRole.UserRole, (base_off, base_off + len(data)))
+
+        o = base_off
+        hdr = QTreeWidgetItem(["Frame Header", ""])
+        hdr.setData(0, Qt.ItemDataRole.UserRole, (o, o + 8))
+        hdr.addChild(self._field_item("Version", str(version), o, o + 1))
+        hdr.addChild(self._field_item("Reserved", f"0x{data[1]:02X}", o + 1, o + 2))
+        hdr.addChild(self._field_item("Device ID", f"0x{device_id:04X}", o + 2, o + 4))
+        hdr.addChild(self._field_item("Message Type",
+                                       f"0x{msg_type:02X} [{msg_type_name}]", o + 4, o + 5))
+        hdr.addChild(self._field_item("Stream ID", str(stream_id), o + 5, o + 6))
+        hdr.addChild(self._field_item("Sequence Counter", str(seq_counter), o + 6, o + 8))
+        cmp_item.addChild(hdr)
+        hdr.setExpanded(True)
+
+        # Messages
+        cur = 8
+        msg_num = 1
+        while cur + 16 <= len(data):
+            mo = base_off + cur
+            ts_ns = struct.unpack('!Q', data[cur:cur + 8])[0]
+            iface_id = struct.unpack('!I', data[cur + 8:cur + 12])[0]
+            common_flags = data[cur + 12]
+            payload_type = data[cur + 13]
+            payload_len = struct.unpack('!H', data[cur + 14:cur + 16])[0]
+            ts_s = ts_ns / 1_000_000_000.0
+            pt_name = self._CMP_DATA_TYPE_NAMES.get(payload_type, f"0x{payload_type:02X}")
+
+            msg_item = QTreeWidgetItem([
+                f"Message #{msg_num} [{pt_name}]",
+                f"IF-{iface_id}, {ts_s:.6f}s"])
+            msg_item.setData(0, Qt.ItemDataRole.UserRole, (mo, mo + 16 + payload_len))
+
+            # Message Header
+            mh = QTreeWidgetItem(["Message Header", ""])
+            mh.setData(0, Qt.ItemDataRole.UserRole, (mo, mo + 16))
+            mh.addChild(self._field_item("Timestamp", f"{ts_ns} ns ({ts_s:.9f} s)", mo, mo + 8))
+            mh.addChild(self._field_item("Interface ID", f"0x{iface_id:08X}", mo + 8, mo + 12))
+            # Common Flags
+            flag_items = []
+            if common_flags & 0x01:
+                flag_items.append("Recalculated")
+            if common_flags & 0x02:
+                flag_items.append("Synchronized")
+            if common_flags & 0x10:
+                flag_items.append("Sent")
+            if common_flags & 0x20:
+                flag_items.append("Overflow")
+            if common_flags & 0x40:
+                flag_items.append("Error")
+            flags_str = ", ".join(flag_items) if flag_items else "None"
+            mh.addChild(self._field_item("Common Flags",
+                                          f"0x{common_flags:02X} [{flags_str}]", mo + 12, mo + 13))
+            mh.addChild(self._field_item("Payload Type",
+                                          f"0x{payload_type:02X} [{pt_name}]", mo + 13, mo + 14))
+            mh.addChild(self._field_item("Payload Length", str(payload_len), mo + 14, mo + 16))
+            msg_item.addChild(mh)
+
+            # Payload
+            po = mo + 16
+            payload_end = cur + 16 + payload_len
+            if payload_end <= len(data) and payload_len > 0:
+                payload = data[cur + 16:payload_end]
+                pl_item = self._format_cmp_payload_tree(
+                    payload_type, payload, po)
+                if pl_item:
+                    msg_item.addChild(pl_item)
+                    pl_item.setExpanded(True)
+
+            cmp_item.addChild(msg_item)
+            msg_item.setExpanded(True)
+            cur = payload_end if payload_end > cur + 16 else cur + 16
+            msg_num += 1
+
+        self.detail_tree.addTopLevelItem(cmp_item)
+        cmp_item.setExpanded(True)
+
+    def _format_cmp_payload_tree(self, payload_type: int, payload: bytes,
+                                  base: int) -> Optional[QTreeWidgetItem]:
+        """Erzeugt Sub-Tree fuer CMP Payload (LIN/CAN/FlexRay/Eth/Analog/Digital)."""
+        import struct
+
+        if payload_type == 0x03 and len(payload) >= 8:  # LIN
+            flags = struct.unpack('!H', payload[0:2])[0]
+            pid = payload[4]
+            lin_id = pid & 0x3F
+            checksum = payload[6]
+            data_len = payload[7]
+            data_bytes = payload[8:8 + data_len] if len(payload) >= 8 + data_len else b''
+            errors = [n for bit, n in self._CMP_LIN_ERROR_FLAGS.items() if flags & bit]
+
+            root = QTreeWidgetItem(["LIN", f"ID: 0x{lin_id:02X}, DLC: {data_len}"])
+            root.setData(0, Qt.ItemDataRole.UserRole, (base, base + 8 + data_len))
+            root.addChild(self._field_item("Flags", f"0x{flags:04X}"
+                                            + (f" [{', '.join(errors)}]" if errors else ""),
+                                            base, base + 2))
+            root.addChild(self._field_item("PID", f"0x{pid:02X} (ID: 0x{lin_id:02X})",
+                                            base + 4, base + 5))
+            root.addChild(self._field_item("Checksum", f"0x{checksum:02X}", base + 6, base + 7))
+            root.addChild(self._field_item("Data Length", str(data_len), base + 7, base + 8))
+            if data_bytes:
+                hex_str = " ".join(f"{b:02X}" for b in data_bytes)
+                root.addChild(self._field_item("Data", hex_str, base + 8, base + 8 + data_len))
+            return root
+
+        elif payload_type in (0x01, 0x02) and len(payload) >= 16:  # CAN / CAN FD
+            flags = struct.unpack('!H', payload[0:2])[0]
+            can_id_raw = struct.unpack('!I', payload[4:8])[0]
+            can_id = can_id_raw & 0x1FFFFFFF
+            ide = bool(can_id_raw & 0x80000000)
+            rtr = bool(can_id_raw & 0x40000000)
+            dlc = payload[14]
+            data_len = payload[15]
+            data_bytes = payload[16:16 + data_len] if len(payload) >= 16 + data_len else b''
+            errors = [n for bit, n in self._CMP_CAN_ERROR_FLAGS.items() if flags & bit]
+            id_str = f"0x{can_id:08X}" if ide else f"0x{can_id:03X}"
+            proto = "CAN FD" if payload_type == 0x02 else "CAN"
+
+            root = QTreeWidgetItem([proto, f"ID: {id_str}, DLC: {dlc}"])
+            root.setData(0, Qt.ItemDataRole.UserRole, (base, base + 16 + data_len))
+            root.addChild(self._field_item("Flags", f"0x{flags:04X}"
+                                            + (f" [{', '.join(errors)}]" if errors else ""),
+                                            base, base + 2))
+            root.addChild(self._field_item("CAN ID", f"{id_str} ({'EXT' if ide else 'STD'}"
+                                            + (', RTR' if rtr else '') + ")",
+                                            base + 4, base + 8))
+            root.addChild(self._field_item("DLC", str(dlc), base + 14, base + 15))
+            root.addChild(self._field_item("Data Length", str(data_len), base + 15, base + 16))
+            if data_bytes:
+                hex_str = " ".join(f"{b:02X}" for b in data_bytes)
+                root.addChild(self._field_item("Data", hex_str, base + 16, base + 16 + data_len))
+            return root
+
+        elif payload_type == 0x04 and len(payload) >= 14:  # FlexRay
+            channel = payload[4]
+            slot_id = struct.unpack('!H', payload[6:8])[0]
+            cycle = payload[8]
+            data_len = payload[13]
+            data_bytes = payload[14:14 + data_len] if len(payload) >= 14 + data_len else b''
+            ch_str = "A" if channel == 0 else "B" if channel == 1 else str(channel)
+
+            root = QTreeWidgetItem(["FlexRay", f"Slot: {slot_id}, Cycle: {cycle}"])
+            root.setData(0, Qt.ItemDataRole.UserRole, (base, base + 14 + data_len))
+            root.addChild(self._field_item("Channel", ch_str, base + 4, base + 5))
+            root.addChild(self._field_item("Slot ID", str(slot_id), base + 6, base + 8))
+            root.addChild(self._field_item("Cycle", str(cycle), base + 8, base + 9))
+            root.addChild(self._field_item("Data Length", str(data_len), base + 13, base + 14))
+            if data_bytes:
+                hex_str = " ".join(f"{b:02X}" for b in data_bytes)
+                root.addChild(self._field_item("Data", hex_str, base + 14, base + 14 + data_len))
+            return root
+
+        elif payload_type == 0x08 and len(payload) >= 14:  # Ethernet
+            dst_mac = ":".join(f"{b:02X}" for b in payload[0:6])
+            src_mac = ":".join(f"{b:02X}" for b in payload[6:12])
+            etype = struct.unpack('!H', payload[12:14])[0]
+            root = QTreeWidgetItem(["Ethernet", f"{src_mac} → {dst_mac}"])
+            root.setData(0, Qt.ItemDataRole.UserRole, (base, base + len(payload)))
+            root.addChild(self._field_item("Dst MAC", dst_mac, base, base + 6))
+            root.addChild(self._field_item("Src MAC", src_mac, base + 6, base + 12))
+            root.addChild(self._field_item("EtherType", f"0x{etype:04X}", base + 12, base + 14))
+            if len(payload) > 14:
+                root.addChild(self._field_item("Payload",
+                    " ".join(f"{b:02X}" for b in payload[14:]),
+                    base + 14, base + len(payload)))
+            return root
+
+        elif payload_type == 0x07 and len(payload) >= 2:  # Analog
+            raw_val = struct.unpack('!H', payload[0:2])[0]
+            voltage = raw_val * 5.0 / 4095
+            root = QTreeWidgetItem(["Analog", f"{voltage:.3f} V"])
+            root.setData(0, Qt.ItemDataRole.UserRole, (base, base + len(payload)))
+            root.addChild(self._field_item("Raw Value", str(raw_val), base, base + 2))
+            root.addChild(self._field_item("Voltage", f"{voltage:.3f} V", base, base + 2))
+            return root
+
+        elif payload_type == 0x05 and len(payload) >= 1:  # Digital
+            gpio_val = payload[0]
+            level = "HIGH" if gpio_val & 0x01 else "LOW"
+            root = QTreeWidgetItem(["Digital", level])
+            root.setData(0, Qt.ItemDataRole.UserRole, (base, base + len(payload)))
+            root.addChild(self._field_item("Level", level, base, base + 1))
+            root.addChild(self._field_item("Raw", f"0x{gpio_val:02X}", base, base + 1))
+            return root
+
+        # Fallback: Raw hex
+        root = QTreeWidgetItem(["Payload", payload.hex().upper()])
+        root.setData(0, Qt.ItemDataRole.UserRole, (base, base + len(payload)))
+        return root
+
     # ── Paketdetails anzeigen ─────────────────────────────────────────────
 
     def _show_packet_details(self, pkt: Packet):
@@ -7028,6 +7267,12 @@ class WiresharkPanel(QWidget):
 
                 self.detail_tree.addTopLevelItem(tecmp_item)
                 tecmp_item.setExpanded(True)
+
+            # ASAM CMP via EtherType 0x99FE
+            elif pkt[Ether].type == 0x99FE and Raw in pkt:
+                cmp_data = bytes(pkt[Raw].load)
+                if len(cmp_data) >= 8 and cmp_data[0] == 0x01 and cmp_data[1] == 0x00:
+                    self._show_cmp_detail_tree(cmp_data, off)
 
         # ── ARP ──────────────────────────────────────────────────────────
         if ARP in pkt:
@@ -8205,6 +8450,15 @@ class WiresharkPanel(QWidget):
                 return
 
             import struct
+
+            # CMP Statistik: Paket und Geraet zaehlen
+            self._cmp_pkt_total += 1
+            device_id = struct.unpack('!H', raw[2:4])[0]
+            stream_id = raw[5]
+            if device_id not in self._cmp_devices:
+                self._cmp_devices[device_id] = {'streams': set(), 'msgs': 0}
+            self._cmp_devices[device_id]['streams'].add(stream_id)
+
             cur = 8  # Nach dem 8-Byte Frame Header
             while cur + 16 <= len(raw):
                 # Message Header (16 Bytes)
@@ -8216,6 +8470,12 @@ class WiresharkPanel(QWidget):
 
                 payload_start = cur + 16
                 payload_end = payload_start + payload_len
+
+                # CMP Statistik: Message zaehlen
+                self._cmp_msg_total += 1
+                self._cmp_devices[device_id]['msgs'] += 1
+                pt_name = self._CMP_DATA_TYPE_NAMES.get(payload_type, f"0x{payload_type:02X}")
+                self._cmp_proto_counter[pt_name] = self._cmp_proto_counter.get(pt_name, 0) + 1
 
                 bus_index = self._CMP_BUS_MAP.get(payload_type)
                 if bus_index is not None and payload_end <= len(raw):
@@ -8324,6 +8584,50 @@ class WiresharkPanel(QWidget):
             ch_str = "A" if channel == 0 else "B" if channel == 1 else str(channel)
             return (zeit, ch_str, str(slot_id), str(cycle), str(data_len),
                     data_hex, "CMP FlexRay")
+
+        elif bus_index == 2 and payload_type == 0x08:  # Ethernet
+            if len(payload) < 14:
+                return None
+            dst_mac = ":".join(f"{b:02X}" for b in payload[0:6])
+            src_mac = ":".join(f"{b:02X}" for b in payload[6:12])
+            ethertype = struct.unpack('!H', payload[12:14])[0]
+            length = len(payload) - 14
+            return (zeit, src_mac, dst_mac, f"0x{ethertype:04X}",
+                    "CMP Ethernet", str(length), "")
+
+        elif bus_index == 4 and payload_type == 0x07:  # Analog
+            if len(payload) < 2:
+                return None
+            raw_val = struct.unpack('!H', payload[0:2])[0]
+            voltage = raw_val * 5.0 / 4095
+            # Waveform fuettern
+            if hasattr(self, '_analog_page') and self._analog_page is not None:
+                try:
+                    ch = int(kanal.replace('IF-', ''))
+                    ts = float(zeit)
+                    self._analog_page.feed_analog_sample(ch, ts, voltage)
+                except (ValueError, Exception):
+                    pass
+            return (zeit, kanal, f"{voltage:.3f}", "V", "", "",
+                    "CMP Analog")
+
+        elif bus_index == 5 and payload_type == 0x05:  # Digital
+            if len(payload) < 1:
+                return None
+            gpio_val = payload[0]
+            level = "HIGH" if gpio_val & 0x01 else "LOW"
+            edge_bits = (gpio_val >> 1) & 0x03
+            edge = {1: "Rising", 2: "Falling", 3: "Both"}.get(edge_bits, "")
+            # Waveform fuettern
+            if hasattr(self, '_digital_page') and self._digital_page is not None:
+                try:
+                    ch = int(kanal.replace('IF-', ''))
+                    ts = float(zeit)
+                    lv = 1 if level == "HIGH" else 0
+                    self._digital_page.feed_digital_sample(ch, ts, lv)
+                except (ValueError, Exception):
+                    pass
+            return (zeit, kanal, level, edge, "", "", "CMP Digital")
 
         return None
 
@@ -11204,6 +11508,46 @@ class WiresharkPanel(QWidget):
                     self._bus_flush_paused = True
                     self._bus_tables[i].scrollToBottom()
                     self._bus_flush_paused = False
+
+    def _update_cmp_stats(self):
+        """Timer-Callback: Aktualisiert CMP/PLP/TECMP Statistik-Labels in Bus-Toolbars."""
+        # Raten berechnen
+        cmp_pkt_rate = self._cmp_pkt_total - self._cmp_last_pkt_total
+        cmp_msg_rate = self._cmp_msg_total - self._cmp_last_msg_total
+        self._cmp_last_pkt_total = self._cmp_pkt_total
+        self._cmp_last_msg_total = self._cmp_msg_total
+
+        # Nur anzeigen wenn CMP-Daten vorhanden
+        if self._cmp_pkt_total == 0 and all(c == 0 for c in self._plp_pkt_counter):
+            return
+
+        # Pro-Bus Label aktualisieren
+        _bus_names = ['CAN', 'LIN', 'Eth', 'FR', 'Ana', 'Dig']
+        for i in range(min(6, len(self._bus_cmp_stats_labels))):
+            plp_count = self._plp_can_frame_counter[i]
+            if plp_count == 0 and self._cmp_pkt_total == 0:
+                continue
+            # Quelle bestimmen
+            parts = []
+            if plp_count > 0:
+                parts.append(f"PLP/CMP: {plp_count}")
+            if cmp_pkt_rate > 0 and i == (self._current_live_tab - 1):
+                # Geraete-Info fuer den aktiven Tab
+                devs = []
+                for did, info in self._cmp_devices.items():
+                    devs.append(f"0x{did:04X}")
+                if devs:
+                    parts.append(f"Dev: {','.join(devs[:3])}")
+                parts.append(f"{cmp_pkt_rate} pkt/s, {cmp_msg_rate} msg/s")
+                # Protokoll-Mix
+                proto_parts = []
+                for pname, cnt in sorted(self._cmp_proto_counter.items(),
+                                          key=lambda x: -x[1])[:4]:
+                    proto_parts.append(f"{pname}:{cnt}")
+                if proto_parts:
+                    parts.append(" ".join(proto_parts))
+            if parts:
+                self._bus_cmp_stats_labels[i].setText(" | ".join(parts))
 
     def _clear_bus_data(self, bus_index: Optional[int] = None):
         """Löscht Bus-Tabellen-Daten. None = alle löschen."""
