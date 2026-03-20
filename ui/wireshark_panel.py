@@ -8200,6 +8200,12 @@ class WiresharkPanel(QWidget):
                     self._add_bus_data(bus_index, row)
                     can_in_this_plp += 1
 
+                    # LIN Per-ID Statistik an PlinLinPage weiterleiten
+                    if bus_index == 1 and hasattr(self, '_plin_page'):
+                        fields = {f[0]: f[1] for f in bus_data.get("fields", [])}
+                        has_error = "Errors" in fields
+                        self._plin_page.record_plp_frame(fields, has_error)
+
             # CAN-from-PLP 帧计数
             self._plp_can_frame_counter[bus_index] += can_in_this_plp
 
@@ -8261,6 +8267,9 @@ class WiresharkPanel(QWidget):
             dlc = fields.get("DLC", "")
             data_hex = fields.get("Data", "")
             checksum = fields.get("Checksum", "")
+            errors = fields.get("Errors", "")
+            if errors:
+                checksum = f"{checksum} [ERR: {errors}]" if checksum else f"[ERR: {errors}]"
             return (zeit, kanal, lin_id, "", dlc, data_hex, checksum)
 
         elif bus_index == 2:  # Ethernet

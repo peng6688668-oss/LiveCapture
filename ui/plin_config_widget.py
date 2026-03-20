@@ -1087,6 +1087,34 @@ class PlinLinPage(QWidget):
         if self._stats_widget:
             self._stats_widget.record_error()
 
+    def record_plp_frame(self, fields: dict, has_error: bool):
+        """Wird von WiresharkPanel aufgerufen wenn ein LIN-Frame via PLP eintrifft.
+
+        Aktualisiert Per-ID Statistik und Fehler-Zaehler.
+        """
+        id_str = fields.get("LIN ID", "")
+        try:
+            lin_id = int(id_str, 16) if id_str.startswith("0x") else int(id_str)
+        except (ValueError, TypeError):
+            return
+
+        if self._stats_widget:
+            self._stats_widget.record_rx()
+            if has_error:
+                self._stats_widget.record_error()
+
+        if lin_id not in self._id_stats:
+            self._id_stats[lin_id] = {
+                'rx_count': 0, 'tx_count': 0, 'err_count': 0,
+                'last_rx': 0.0, 'last_tx': 0.0,
+                'last_rx_rate': 0.0, 'prev_rx_count': 0,
+            }
+        entry = self._id_stats[lin_id]
+        entry['rx_count'] += 1
+        entry['last_rx'] = time.time()
+        if has_error:
+            entry['err_count'] += 1
+
     # ═══════════════════════════════════════════════════════════════════
     # TX-Tabelle
     # ═══════════════════════════════════════════════════════════════════

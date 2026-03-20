@@ -136,7 +136,8 @@ class TECMPDecoder:
             else:
                 payload_bytes = data[payload_start:]
 
-            bus_info = cls._decode_bus_payload(data_type, payload_bytes)
+            bus_info = cls._decode_bus_payload(data_type, payload_bytes,
+                                                data_flags)
             if bus_info:
                 entry["bus_data"] = bus_info
             entry["payload"] = payload_bytes.hex().upper()
@@ -147,14 +148,15 @@ class TECMPDecoder:
         return entries
 
     @classmethod
-    def _decode_bus_payload(cls, data_type: int, data: bytes) -> Optional[Dict[str, Any]]:
+    def _decode_bus_payload(cls, data_type: int, data: bytes,
+                            data_flags: int = 0) -> Optional[Dict[str, Any]]:
         """Dispatcher: Ruft je nach data_type den passenden Sub-Protokoll-Decoder auf."""
         if data_type in (0x0001, 0x0002):
             return cls._decode_can(data)
         elif data_type == 0x0003:
             return cls._decode_can_fd(data)
         elif data_type == 0x0004:
-            return cls._decode_lin(data)
+            return cls._decode_lin(data, data_flags)
         elif data_type == 0x0008:
             return cls._decode_flexray(data)
         elif data_type in (0x0080, 0x0081):
@@ -216,9 +218,22 @@ class TECMPDecoder:
             ],
         }
 
+    # LIN DataFlags Fehlerbits (TECMP/PLP)
+    _LIN_ERROR_FLAGS = {
+        0x0001: "Checksum",
+        0x0002: "Collision",
+        0x0004: "Parity",
+        0x0008: "No Response",
+        0x0010: "Sync",
+        0x0020: "Framing",
+        0x0040: "Short Dominant",
+        0x0080: "Long Dominant",
+    }
+
     @classmethod
-    def _decode_lin(cls, data: bytes) -> Optional[Dict[str, Any]]:
-        """Dekodiert LIN (0x0004) Frames."""
+    def _decode_lin(cls, data: bytes,
+                    data_flags: int = 0) -> Optional[Dict[str, Any]]:
+        """Dekodiert LIN (0x0004) Frames inkl. Fehlerflags."""
         if len(data) < 3:
             return None
         lin_id = data[0] & 0x3F
@@ -227,6 +242,13 @@ class TECMPDecoder:
         data_hex = " ".join(f"{b:02X}" for b in payload)
         checksum_offset = 2 + dlc
         checksum = data[checksum_offset] if checksum_offset < len(data) else None
+
+        # Fehlerflags auswerten
+        errors = []
+        for bit, name in cls._LIN_ERROR_FLAGS.items():
+            if data_flags & bit:
+                errors.append(name)
+
         fields = [
             ("LIN ID", f"0x{lin_id:02X}"),
             ("DLC", str(dlc)),
@@ -234,8 +256,10 @@ class TECMPDecoder:
         ]
         if checksum is not None:
             fields.append(("Checksum", f"0x{checksum:02X}"))
+        if errors:
+            fields.append(("Errors", ", ".join(errors)))
         return {
-            "protocol": "LIN Frame",
+            "protocol": "LIN Error" if errors else "LIN Frame",
             "fields": fields,
         }
 
