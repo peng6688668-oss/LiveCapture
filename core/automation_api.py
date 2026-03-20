@@ -70,6 +70,8 @@ class AutomationAPI:
         self._can_sender: Optional[Callable] = None
         self._lin_sender: Optional[Callable] = None
         self._uds_sender: Optional[Callable] = None
+        self._analog_page = None
+        self._digital_page = None
         self._rx_buffer: deque = deque(maxlen=10000)
         self._rx_lock = threading.Lock()
         self._rx_event = threading.Event()
@@ -304,3 +306,79 @@ class AutomationAPI:
             f.write(f"{'=' * 60}\n")
 
         _log.info("Report gespeichert: %s", path)
+
+    # ── Analog/Digital API ──
+
+    def set_analog_page(self, page):
+        """Registriert die Analog-Live-Seite fuer Messwert-Zugriff."""
+        self._analog_page = page
+
+    def set_digital_page(self, page):
+        """Registriert die Digital-Live-Seite fuer Messwert-Zugriff."""
+        self._digital_page = page
+
+    def analog_read(self, channel: int) -> Optional[float]:
+        """Gibt den letzten Spannungswert eines Analog-Kanals zurueck."""
+        if self._analog_page is None:
+            return None
+        bufs = getattr(self._analog_page, '_channel_buffers', {})
+        buf = bufs.get(channel)
+        if buf is None or not buf.voltages:
+            return None
+        return buf.voltages[-1]
+
+    def analog_stats(self, channel: int) -> Dict[str, Any]:
+        """Gibt Min/Max/Mean/RMS eines Analog-Kanals zurueck."""
+        if self._analog_page is None:
+            return {}
+        bufs = getattr(self._analog_page, '_channel_buffers', {})
+        buf = bufs.get(channel)
+        if buf is None:
+            return {}
+        return buf.stats()
+
+    def digital_read(self, channel: int) -> Optional[int]:
+        """Gibt den letzten Pegel (0/1) eines Digital-Kanals zurueck."""
+        if self._digital_page is None:
+            return None
+        bufs = getattr(self._digital_page, '_channel_buffers', {})
+        buf = bufs.get(channel)
+        if buf is None or not buf.levels:
+            return None
+        return int(buf.levels[-1])
+
+    def digital_stats(self, channel: int) -> Dict[str, Any]:
+        """Gibt Frequenz/Duty/Edges/Pulsbreite eines Digital-Kanals zurueck."""
+        if self._digital_page is None:
+            return {}
+        bufs = getattr(self._digital_page, '_channel_buffers', {})
+        buf = bufs.get(channel)
+        if buf is None:
+            return {}
+        return buf.stats()
+
+    def wait_for_analog(self, channel: int, threshold: float,
+                        condition: str = 'above',
+                        timeout: float = 5.0) -> bool:
+        """Wartet bis Analog-Kanal den Schwellwert ueber/unterschreitet."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            val = self.analog_read(channel)
+            if val is not None:
+                if condition == 'above' and val > threshold:
+                    return True
+                elif condition == 'below' and val < threshold:
+                    return True
+            time.sleep(0.05)
+        return False
+
+    def wait_for_digital(self, channel: int, level: int,
+                         timeout: float = 5.0) -> bool:
+        """Wartet bis Digital-Kanal den angegebenen Pegel erreicht."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            val = self.digital_read(channel)
+            if val is not None and val == level:
+                return True
+            time.sleep(0.05)
+        return False
