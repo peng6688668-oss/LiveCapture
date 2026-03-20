@@ -5926,6 +5926,8 @@ class WiresharkPanel(QWidget):
             ('🔗 Live LIN', '#FF9800'),
             ('🌐 Live Eth', '#9C27B0'),
             ('⚡ Live FlexRay', '#F44336'),
+            ('📈 Live Analog', '#FF9800'),
+            ('🔲 Live Digital', '#009688'),
         ]
         for i, (label, _color) in enumerate(_tab_defs):
             btn = QPushButton(label)
@@ -6025,11 +6027,13 @@ class WiresharkPanel(QWidget):
             ('LIN', '#FF9800', '🔗'),
             ('Ethernet', '#9C27B0', '🌐'),
             ('FlexRay', '#F44336', '⚡'),
+            ('Analog', '#FF9800', '📈'),
+            ('Digital', '#009688', '🔲'),
         ]
         self._bus_pause_btns: List[QPushButton] = []
         self._bus_record_btns: List[QPushButton] = []
-        self._bus_recorded_data: List[List[tuple]] = [[], [], [], []]  # 4 Bus-Typen
-        self._bus_recording: List[bool] = [False, False, False, False]
+        self._bus_recorded_data: List[List[tuple]] = [[] for _ in range(6)]
+        self._bus_recording: List[bool] = [False] * 6
         self._bus_filter_status_labels: List[QLabel] = []
         _BUS_BTN_STYLE = (
             "QPushButton { background: #dcdce5; color: #333; border: 1px solid #c0c0c8;"
@@ -6163,8 +6167,10 @@ class WiresharkPanel(QWidget):
             'LIN':      ['Nr.', 'Zeit', 'Kanal', 'ID', 'Name', 'DLC', 'Daten', 'Prüfsumme'],
             'Ethernet': ['Nr.', 'Zeit', 'Src MAC', 'Dst MAC', 'EtherType', 'Protokoll', 'Länge', 'Info'],
             'FlexRay':  ['Nr.', 'Zeit', 'Kanal', 'Slot', 'Zyklus', 'DLC', 'Daten', 'Info'],
+            'Analog':   ['Nr.', 'Zeit', 'Kanal', 'Spannung', 'Einheit', 'Min', 'Max', 'Info'],
+            'Digital':  ['Nr.', 'Zeit', 'Kanal', 'Pegel', 'Flanke', 'Pulsbreite', 'Frequenz', 'Info'],
         }
-        self._bus_row_counters = [0, 0, 0, 0]  # 每个 Bus 的序号计数器
+        self._bus_row_counters = [0] * 6  # 每个 Bus 的序号计数器
         # Flush-Pause für Column-Resize (muss VOR Header-Erstellung existieren)
         self._bus_flush_paused = False
         self._bus_flush_resume_timer = QTimer(self)
@@ -6283,6 +6289,14 @@ class WiresharkPanel(QWidget):
                 from ui.flexray_config_widget import FlexRayLivePage
                 self._flexray_page = FlexRayLivePage(bus_table, self)
                 self._live_content_stack.addWidget(self._flexray_page)
+            elif bus_idx == 4:  # Analog
+                from ui.analog_live_widget import AnalogLivePage
+                self._analog_page = AnalogLivePage(bus_table, self)
+                self._live_content_stack.addWidget(self._analog_page)
+            elif bus_idx == 5:  # Digital
+                from ui.digital_live_widget import DigitalLivePage
+                self._digital_page = DigitalLivePage(bus_table, self)
+                self._live_content_stack.addWidget(self._digital_page)
             else:
                 self._live_content_stack.addWidget(bus_table)
 
@@ -6290,11 +6304,12 @@ class WiresharkPanel(QWidget):
         video_layout.addWidget(self._live_content_stack, 1)
 
         # ── PLP/CAN 统计计数器 ──
-        self._plp_pkt_counter = [0, 0, 0, 0]      # 每个 Bus 收到的 PLP 包数
-        self._plp_can_frame_counter = [0, 0, 0, 0]  # 每个 Bus 从 PLP 解出的 CAN 帧数
+        self._plp_pkt_counter = [0] * 6
+        self._plp_can_frame_counter = [0] * 6
         # Counter-Referenzen an alle Bus-Seiten uebergeben
         for attr, idx in [('_pcan_page', 0), ('_plin_page', 1),
-                          ('_eth_page', 2), ('_flexray_page', 3)]:
+                          ('_eth_page', 2), ('_flexray_page', 3),
+                          ('_analog_page', 4), ('_digital_page', 5)]:
             page = getattr(self, attr, None)
             if page is not None:
                 page.set_bus_row_counter_ref(self._bus_row_counters, idx)
@@ -6304,7 +6319,7 @@ class WiresharkPanel(QWidget):
                         self._plp_can_frame_counter, idx)
 
         # ── Bus-Daten Batch-Timer (100ms Intervall → max 10 UI-Updates/s) ──
-        self._bus_queues: List[list] = [[], [], [], []]
+        self._bus_queues: List[list] = [[] for _ in range(6)]
         self._bus_flush_timer = QTimer(self)
         self._bus_flush_timer.setInterval(200)
         self._bus_flush_timer.timeout.connect(self._flush_bus_queues)
@@ -8113,7 +8128,7 @@ class WiresharkPanel(QWidget):
     # TECMP → Bus-Tabellen Routing
     # ═══════════════════════════════════════════════════════════════════════
 
-    # data_type → bus_index Mapping (0=CAN, 1=LIN, 2=Ethernet, 3=FlexRay)
+    # data_type → bus_index Mapping
     _TECMP_BUS_MAP = {
         0x0001: 0,  # CAN Raw    → Live CAN
         0x0002: 0,  # CAN Data   → Live CAN
@@ -8122,6 +8137,8 @@ class WiresharkPanel(QWidget):
         0x0080: 2,  # Ethernet   → Live Eth
         0x0081: 2,  # Eth Raw    → Live Eth
         0x0008: 3,  # FlexRay    → Live FlexRay
+        0x0020: 4,  # Analog     → Live Analog
+        0x000A: 5,  # GPIO       → Live Digital
     }
 
     def _route_tecmp_to_bus_tables(self, pkt):
@@ -8248,6 +8265,47 @@ class WiresharkPanel(QWidget):
             cycle = fields.get("Cycle", "")
             data_hex = fields.get("Data", "")
             return (zeit, channel, slot_id, cycle, str(len(data_hex.split())), data_hex, protocol)
+
+        elif bus_index == 4:  # Analog
+            # Payload: Rohwert als Spannung interpretieren
+            voltage = "0.000"
+            if raw_payload and len(raw_payload) >= 4:
+                try:
+                    raw_val = int(raw_payload[:4], 16)
+                    voltage = f"{raw_val * 5.0 / 4095:.3f}"  # 12-bit ADC, 0-5V
+                except (ValueError, Exception):
+                    pass
+            # Waveform fuettern
+            if hasattr(self, '_analog_page') and self._analog_page is not None:
+                try:
+                    ch = int(kanal.replace('IF-', ''))
+                    ts = float(zeit)
+                    self._analog_page.feed_analog_sample(ch, ts, float(voltage))
+                except (ValueError, Exception):
+                    pass
+            return (zeit, kanal, voltage, "V", "", "", protocol)
+
+        elif bus_index == 5:  # Digital / GPIO
+            level = "0"
+            edge = ""
+            if raw_payload and len(raw_payload) >= 2:
+                try:
+                    gpio_val = int(raw_payload[:2], 16)
+                    level = "HIGH" if gpio_val & 0x01 else "LOW"
+                    edge_bits = (gpio_val >> 1) & 0x03
+                    edge = {1: "Rising", 2: "Falling", 3: "Both"}.get(edge_bits, "")
+                except (ValueError, Exception):
+                    pass
+            # Waveform fuettern
+            if hasattr(self, '_digital_page') and self._digital_page is not None:
+                try:
+                    ch = int(kanal.replace('IF-', ''))
+                    ts = float(zeit)
+                    lv = 1 if level == "HIGH" else 0
+                    self._digital_page.feed_digital_sample(ch, ts, lv)
+                except (ValueError, Exception):
+                    pass
+            return (zeit, kanal, level, edge, "", "", protocol)
 
         return None
 
@@ -10933,8 +10991,8 @@ class WiresharkPanel(QWidget):
         if self._bus_flush_paused:
             return  # Während Column-Resize keine Updates
         # Nur den aktuell sichtbaren Bus-Tab updaten (Performance)
-        visible = self._current_live_tab - 1  # 0=Video, 1-4=Bus
-        for i in range(4):
+        visible = self._current_live_tab - 1  # 0=Video, 1-6=Bus
+        for i in range(6):
             queue = self._bus_queues[i]
             if not queue:
                 continue

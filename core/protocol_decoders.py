@@ -159,6 +159,10 @@ class TECMPDecoder:
             return cls._decode_flexray(data)
         elif data_type in (0x0080, 0x0081):
             return cls._decode_ethernet(data)
+        elif data_type == 0x0020:
+            return cls._decode_analog(data)
+        elif data_type == 0x000A:
+            return cls._decode_gpio(data)
         return None
 
     @classmethod
@@ -274,6 +278,42 @@ class TECMPDecoder:
                 ("Payload Length", str(len(payload))),
             ],
         }
+
+    @classmethod
+    def _decode_analog(cls, data: bytes) -> Optional[Dict[str, Any]]:
+        """Dekodiert Analog (0x0020) Messdaten."""
+        if len(data) < 2:
+            return None
+        raw_value = int.from_bytes(data[0:2], 'big')
+        voltage = raw_value * 5.0 / 4095  # 12-bit ADC, 0-5V Referenz
+        fields = [
+            ("Raw Value", str(raw_value)),
+            ("Voltage", f"{voltage:.3f} V"),
+        ]
+        if len(data) >= 4:
+            sample_rate = int.from_bytes(data[2:4], 'big')
+            fields.append(("Sample Rate", f"{sample_rate} Hz"))
+        return {"protocol": "Analog Sample", "fields": fields}
+
+    @classmethod
+    def _decode_gpio(cls, data: bytes) -> Optional[Dict[str, Any]]:
+        """Dekodiert GPIO (0x000A) Digitale I/O Daten."""
+        if len(data) < 1:
+            return None
+        gpio_byte = data[0]
+        level = "HIGH" if gpio_byte & 0x01 else "LOW"
+        edge_bits = (gpio_byte >> 1) & 0x03
+        edge = {0: "None", 1: "Rising", 2: "Falling", 3: "Both"}.get(
+            edge_bits, "Unknown")
+        fields = [
+            ("Level", level),
+            ("Edge", edge),
+            ("Raw", f"0x{gpio_byte:02X}"),
+        ]
+        if len(data) >= 5:
+            pulse_width_us = int.from_bytes(data[1:5], 'big')
+            fields.append(("Pulse Width", f"{pulse_width_us} µs"))
+        return {"protocol": "GPIO Event", "fields": fields}
 
 
 # ---------------------------------------------------------------------------
