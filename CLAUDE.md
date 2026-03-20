@@ -49,19 +49,19 @@ Alle neu erstellten Buttons **MUESSEN** ausreichend gross sein, damit der Text/I
 
 ## ComboBox-Stil — WICHTIG
 
-Alle Dropdown-Felder **MUESSEN** `NativeComboBox` verwenden, NICHT `QComboBox`:
-```python
-from ui.widgets.native_combo_box import NativeComboBox, NATIVE_COMBO_CSS
+**Zwei Varianten** je nach Kontext:
 
-# Parent-Container CSS setzen:
-self._config_content.setStyleSheet(NATIVE_COMBO_CSS)
+1. **Standard `QComboBox`** (bevorzugt fuer neue Widgets):
+   - Globales Theme (theme.py) liefert automatisch den Dreieckspfeil
+   - KEIN lokales `setStyleSheet()` auf ComboBox oder Parent setzen
+   - Funktioniert zuverlaessig in allen Kontexten
 
-# NativeComboBox statt QComboBox verwenden:
-combo = NativeComboBox()
-```
-- `NativeComboBox` zeichnet den Dropdown-Pfeil per `paintEvent` (kein CSS)
-- Verhindert schwarze Quadrate die durch Qt-Fusion-Style entstehen
-- `NATIVE_COMBO_CSS` muss auf dem Parent-Container gesetzt werden
+2. **`NativeComboBox`** (nur in pcan_config_widget + plin_config_widget):
+   - Zeichnet Pfeil per `paintEvent` — benoetigt `NATIVE_COMBO_CSS` auf Parent
+   - NUR verwenden wenn Standard-QComboBox Artefakte zeigt UND getestet
+
+**NIEMALS** `QComboBox::down-arrow { image: none; ... }` per Widget-CSS setzen —
+das zerstoert die Klick-Zone des Dropdown-Buttons.
 
 ---
 

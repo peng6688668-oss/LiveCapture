@@ -174,13 +174,6 @@ class EthLivePage(QWidget):
         for name in _PROTOCOLS:
             self._proto_combo.addItem(name)
         self._proto_combo.setMinimumWidth(180)
-        self._proto_combo.setStyleSheet(
-            "QComboBox { min-height: 22px; }"
-            "QComboBox::drop-down { border: none; width: 20px; }"
-            "QComboBox::down-arrow { image: none;"
-            "  border-left: 4px solid transparent;"
-            "  border-right: 4px solid transparent;"
-            "  border-top: 5px solid #555; margin-right: 6px; }")
         row1.addWidget(self._proto_combo)
 
         # Capture-Modul Anzeige
