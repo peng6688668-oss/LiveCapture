@@ -1898,12 +1898,24 @@ class WindowsCaptureThread(QThread):
             except Exception:
                 pass  # Nicht kritisch, funktioniert auch ohne
 
-            # PCAP Global Header lesen (24 Bytes)
-            global_header = self._read_exact(24)
-            if global_header is None:
+            # Format erkennen: erste 4 Bytes lesen
+            magic_bytes = self._read_exact(4)
+            if magic_bytes is None:
                 return
 
-            magic = struct.unpack("<I", global_header[:4])[0]
+            magic = struct.unpack("<I", magic_bytes)[0]
+
+            # ── pcapng Stream (0x0A0D0D0A = Section Header Block) ──
+            if magic == 0x0A0D0D0A:
+                self._run_pcapng_stream(magic_bytes)
+                return
+
+            # ── pcap Stream ──
+            rest = self._read_exact(20)
+            if rest is None:
+                return
+            global_header = magic_bytes + rest
+
             if magic == 0xa1b2c3d4:
                 endian = "<"
             elif magic == 0xd4c3b2a1:
@@ -1912,47 +1924,176 @@ class WindowsCaptureThread(QThread):
                 self.error.emit(f"Ungueltiger PCAP Magic: 0x{magic:08x}")
                 return
 
-            self.started_capture.emit()
-            packet_count = 0
-            vq_append = self._video_queue.append  # Lokale Referenz = schneller
+            self._run_pcap_stream(endian)
 
-            while self._running:
-                # Paket-Header lesen (16 Bytes: ts_sec, ts_usec, incl_len, orig_len)
-                pkt_header = self._read_exact(16)
-                if pkt_header is None:
+        except Exception as e:
+            if self._running:
+                self.error.emit(str(e))
+        finally:
+            self._terminate_process()
+
+    def _run_pcap_stream(self, endian: str):
+        """Verarbeitet einen pcap-Stream (nach Global Header)."""
+        self.started_capture.emit()
+        packet_count = 0
+        vq_append = self._video_queue.append
+
+        while self._running:
+            pkt_header = self._read_exact(16)
+            if pkt_header is None:
+                break
+
+            ts_sec, ts_usec, incl_len, orig_len = struct.unpack(
+                endian + "IIII", pkt_header
+            )
+
+            pkt_data = self._read_exact(incl_len)
+            if pkt_data is None:
+                break
+
+            # Schnellpfad: 0x2090 Pakete
+            if len(pkt_data) >= 14 and pkt_data[12:14] == b'\x20\x90':
+                is_bus_data = False
+                dt = 0
+                if len(pkt_data) >= 22:
+                    dt = int.from_bytes(pkt_data[20:22], 'big')
+                    if dt in (0x0001, 0x0002, 0x0003, 0x0004,
+                              0x0008, 0x0080, 0x0081):
+                        is_bus_data = True
+                if is_bus_data:
+                    try:
+                        pkt = Ether(pkt_data)
+                        pkt.time = ts_sec + ts_usec / 1_000_000
+                        if self._running:
+                            self.packet_received.emit(pkt)
+                    except Exception:
+                        pass
+                else:
+                    vq_append(pkt_data)
+                self._video_pkt_count += 1
+                packet_count += 1
+                if self.packet_limit > 0 and packet_count >= self.packet_limit:
                     break
+                continue
 
-                ts_sec, ts_usec, incl_len, orig_len = struct.unpack(
-                    endian + "IIII", pkt_header
+            try:
+                pkt = Ether(pkt_data)
+                pkt.time = ts_sec + ts_usec / 1_000_000
+            except Exception:
+                continue
+
+            if self._running:
+                self.packet_received.emit(pkt)
+
+            packet_count += 1
+            if self.packet_limit > 0 and packet_count >= self.packet_limit:
+                break
+
+    def _run_pcapng_stream(self, shb_magic_bytes: bytes):
+        """Verarbeitet einen pcapng-Stream (Section Header Block bereits erkannt).
+
+        pcapng Block-Format:
+          Block Type (4) | Block Total Length (4) | Block Body (...) | Block Total Length (4)
+
+        Relevante Block-Typen:
+          0x0A0D0D0A = Section Header Block (SHB)
+          0x00000001 = Interface Description Block (IDB)
+          0x00000006 = Enhanced Packet Block (EPB)
+          0x00000003 = Simple Packet Block (SPB)
+        """
+        # ── SHB fertig lesen ──
+        blk_len_bytes = self._read_exact(4)
+        if blk_len_bytes is None:
+            return
+        blk_len = struct.unpack("<I", blk_len_bytes)[0]
+        # Rest des SHB lesen (blk_len - 8 bereits gelesene Bytes - 4 Trailing Length)
+        shb_body = self._read_exact(blk_len - 12)
+        if shb_body is None:
+            return
+        # Trailing Block Total Length
+        self._read_exact(4)
+
+        # Byte-Order aus SHB Byte-Order Magic bestimmen
+        bom = struct.unpack("<I", shb_body[:4])[0]
+        endian = "<" if bom == 0x1A2B3C4D else ">"
+
+        # Interface-Timestamp-Aufloesung (Standard: Mikrosekunden)
+        if_tsresol = 1_000_000
+
+        self.started_capture.emit()
+        packet_count = 0
+        vq_append = self._video_queue.append
+
+        while self._running:
+            # Block Header lesen: Block Type (4) + Block Total Length (4)
+            blk_hdr = self._read_exact(8)
+            if blk_hdr is None:
+                break
+
+            blk_type, blk_len = struct.unpack(endian + "II", blk_hdr)
+
+            # Block Body + Trailing Length lesen
+            remaining = blk_len - 12  # 8 Header + 4 Trailing bereits abgezogen
+            if remaining < 0:
+                break
+            blk_body = self._read_exact(remaining + 4)  # +4 fuer Trailing Length
+            if blk_body is None:
+                break
+            blk_body = blk_body[:remaining]  # Trailing Length abschneiden
+
+            if blk_type == 0x00000001:
+                # ── Interface Description Block ──
+                if len(blk_body) >= 8:
+                    # Optionen nach if_tsresol durchsuchen
+                    opts_data = blk_body[8:]
+                    i = 0
+                    while i + 4 <= len(opts_data):
+                        opt_code, opt_len = struct.unpack(endian + "HH", opts_data[i:i+4])
+                        if opt_code == 0:  # opt_endofopt
+                            break
+                        if opt_code == 9 and opt_len >= 1:  # if_tsresol
+                            tsresol_byte = opts_data[i+4]
+                            if tsresol_byte & 0x80:
+                                if_tsresol = 2 ** (tsresol_byte & 0x7F)
+                            else:
+                                if_tsresol = 10 ** tsresol_byte
+                        padded = (opt_len + 3) & ~3
+                        i += 4 + padded
+
+            elif blk_type == 0x00000006:
+                # ── Enhanced Packet Block ──
+                if len(blk_body) < 20:
+                    continue
+                _iface_id, ts_high, ts_low, cap_len, orig_len = struct.unpack(
+                    endian + "IIIII", blk_body[:20]
                 )
+                pkt_data = blk_body[20:20 + cap_len]
+                if len(pkt_data) < cap_len:
+                    continue
 
-                # Paketdaten lesen
-                pkt_data = self._read_exact(incl_len)
-                if pkt_data is None:
-                    break
+                # Timestamp berechnen
+                ts_raw = (ts_high << 32) | ts_low
+                ts_sec = ts_raw // if_tsresol
+                ts_frac = ts_raw % if_tsresol
+                timestamp = ts_sec + ts_frac / if_tsresol
 
                 # Schnellpfad: 0x2090 Pakete
                 if len(pkt_data) >= 14 and pkt_data[12:14] == b'\x20\x90':
-                    # PLP 0x2090 kann Bus-Daten enthalten (CAN/LIN/FlexRay/Eth)
-                    # → data_type aus TECMP-Header prüfen (Byte 20-21 nach Ethernet-Header)
                     is_bus_data = False
-                    dt = 0
                     if len(pkt_data) >= 22:
                         dt = int.from_bytes(pkt_data[20:22], 'big')
                         if dt in (0x0001, 0x0002, 0x0003, 0x0004,
                                   0x0008, 0x0080, 0x0081):
                             is_bus_data = True
                     if is_bus_data:
-                        # Bus-Daten: als Scapy-Paket weiterleiten
                         try:
                             pkt = Ether(pkt_data)
-                            pkt.time = ts_sec + ts_usec / 1_000_000
+                            pkt.time = timestamp
                             if self._running:
                                 self.packet_received.emit(pkt)
                         except Exception:
                             pass
                     else:
-                        # Video-Daten: in Queue für Frame-Assembly
                         vq_append(pkt_data)
                     self._video_pkt_count += 1
                     packet_count += 1
@@ -1960,10 +2101,9 @@ class WindowsCaptureThread(QThread):
                         break
                     continue
 
-                # Alle anderen Protokolle: Scapy Ether-Paket erstellen
                 try:
                     pkt = Ether(pkt_data)
-                    pkt.time = ts_sec + ts_usec / 1_000_000
+                    pkt.time = timestamp
                 except Exception:
                     continue
 
@@ -1974,11 +2114,13 @@ class WindowsCaptureThread(QThread):
                 if self.packet_limit > 0 and packet_count >= self.packet_limit:
                     break
 
-        except Exception as e:
-            if self._running:
-                self.error.emit(str(e))
-        finally:
-            self._terminate_process()
+            elif blk_type == 0x0A0D0D0A:
+                # Neuer Section Header Block — Interface-State zuruecksetzen
+                if len(blk_body) >= 4:
+                    bom = struct.unpack("<I", blk_body[:4])[0]
+                    endian = "<" if bom == 0x1A2B3C4D else ">"
+                if_tsresol = 1_000_000
+            # Alle anderen Block-Typen werden uebersprungen
 
     def _read_exact(self, n: int) -> bytes:
         """Liest exakt n Bytes aus dem Prozess-stdout."""
