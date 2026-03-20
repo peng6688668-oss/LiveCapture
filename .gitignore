@@ -4,3 +4,6 @@ venv/
 *.pcapng
 *.pcap
 .env
+app.log
+online data/
+Technica CM Serdes/

@@ -30,6 +30,7 @@ from ui.dialogs.framework_api_comparison_dialog import FrameworkApiComparisonDia
 from ui.dialogs.autosar_architecture_dialog import AutosarArchitectureDialog
 from ui.dialogs.network_architecture_dialog import NetworkArchitectureDialog
 from ui.dialogs.raw12_knowledge_dialog import Raw12KnowledgeDialog
+from ui.dialogs.dataflow_analysis_dialog import DataFlowAnalysisDialog
 from ui.dialogs.split_dialog import FileSplitDialog
 from ui.dialogs.convert_dialog import ConvertDialog
 from ui.video_player import VideoPlayerTab
@@ -2026,6 +2027,12 @@ class MainWindow(QMainWindow):
         network_action.triggered.connect(self._show_network_architecture)
         help_menu.addAction(network_action)
 
+        # Datenfluss-Analyse Submenu
+        dataflow_menu = help_menu.addMenu(Icons.protocol(palette.text_primary), '数据流全链路分析')
+        can_tecmp_action = QAction('CAN帧 → TECMP/PLP 以太网帧...', self)
+        can_tecmp_action.triggered.connect(self._show_dataflow_can_tecmp)
+        dataflow_menu.addAction(can_tecmp_action)
+
         wissen_menu = help_menu.addMenu(Icons.protocol(palette.text_primary), 'Wissen')
         raw12_action = QAction('RAW12-Format & Sensor-Grundlagen...', self)
         raw12_action.triggered.connect(self._show_raw12_knowledge)
@@ -3352,6 +3359,10 @@ class MainWindow(QMainWindow):
     def _show_network_architecture(self):
         """Zeigt den Netzwerk-Architektur-Dialog (OSI/TCP-IP)."""
         dlg = NetworkArchitectureDialog(self)
+        dlg.exec()
+
+    def _show_dataflow_can_tecmp(self):
+        dlg = DataFlowAnalysisDialog(self)
         dlg.exec()
 
     def _show_raw12_knowledge(self):

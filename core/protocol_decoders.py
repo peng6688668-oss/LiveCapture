@@ -100,26 +100,32 @@ class TECMPDecoder:
 
     @classmethod
     def _decode_entry_header(cls, data: bytes, data_type: int = 0) -> List[Dict[str, Any]]:
-        """Dekodiert TECMP Payload Entry Header (16 Bytes pro Entry)."""
+        """Dekodiert TECMP Payload Entry Header (16 Bytes pro Entry).
+
+        Format: CM_ID(2) + InterfaceID(2) + Timestamp(8) + DataLength(2) + DataFlags(2)
+        """
         entries = []
         offset = 0
 
         while offset + 16 <= len(data):
             entry = {}
-            interface_id = int.from_bytes(data[offset:offset+2], 'big')
-            timestamp_ns = int.from_bytes(data[offset+2:offset+10], 'big')
-            data_length = int.from_bytes(data[offset+10:offset+12], 'big')
-            data_flags = int.from_bytes(data[offset+12:offset+16], 'big')
+            cm_id = int.from_bytes(data[offset:offset+2], 'big')
+            interface_id = int.from_bytes(data[offset+2:offset+4], 'big')
+            timestamp_ns = int.from_bytes(data[offset+4:offset+12], 'big')
+            data_length = int.from_bytes(data[offset+12:offset+14], 'big')
+            data_flags = int.from_bytes(data[offset+14:offset+16], 'big')
 
+            entry["cm_id"] = cm_id
             entry["interface_id"] = interface_id
             entry["timestamp_ns"] = timestamp_ns
             entry["data_length"] = data_length
 
             entry["fields"] = [
+                ("CM ID", f"0x{cm_id:04X}"),
                 ("Interface ID", f"0x{interface_id:04X}"),
                 ("Timestamp (ns)", str(timestamp_ns)),
                 ("Data Length", str(data_length)),
-                ("Data Flags", f"0x{data_flags:08X}"),
+                ("Data Flags", f"0x{data_flags:04X}"),
             ]
 
             # Sub-Protokoll-Payload

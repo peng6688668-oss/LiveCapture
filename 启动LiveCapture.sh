@@ -1,3 +1,3 @@
 #!/bin/bash
 cd /home/localadm/LiveCapture
-./venv/bin/python run.py
+gnome-terminal -- bash -c 'sudo ./venv/bin/python run.py 2>&1 | tee /tmp/livecapture_output.log; echo "Beendet. Enter drücken..."; read'
