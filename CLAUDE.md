@@ -36,6 +36,17 @@ Nicht warten bis der Nutzer darum bittet.
 
 ---
 
+## Button-Groesse — WICHTIG
+
+Alle neu erstellten Buttons **MUESSEN** ausreichend gross sein, damit der Text/Icon vollstaendig sichtbar bleibt.
+- `setMinimumWidth()` / `setMinimumHeight()` passend zum Inhalt setzen
+- Text darf NICHT abgeschnitten oder ueberlappt werden
+- Bei Icon + Text: genuegend Platz fuer beides einplanen
+- Im Zweifel `sizePolicy(Expanding/Preferred)` verwenden statt fester Groesse
+- Vor Abgabe visuell pruefen, dass kein Inhalt verdeckt wird
+
+---
+
 ## PLP / TECMP / CMP — Protokoll-Kurzreferenz
 
 | Protokoll | EtherType | Quelle | Version-Byte |
