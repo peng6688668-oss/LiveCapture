@@ -12409,6 +12409,17 @@ class WiresharkPanel(QWidget):
             # Recording: Daten separat speichern
             if self._bus_recording[bus_index]:
                 self._bus_recorded_data[bus_index].append(numbered_row)
+            # RTT: CAN-Frame an Simulator melden (fuer RTT-Berechnung)
+            if bus_index == 0 and hasattr(self, '_pcan_page'):
+                try:
+                    # row_data: (zeit, kanal, id_hex, name, dlc, ...)
+                    id_hex = row_data[2] if len(row_data) > 2 else ""
+                    cid = int(id_hex, 16) if id_hex.startswith(
+                        '0x') else int(id_hex) if id_hex.isdigit() else -1
+                    if cid >= 0:
+                        self._pcan_page.on_rx_can_frame(cid)
+                except (ValueError, IndexError):
+                    pass
 
     def _pause_bus_flush(self, *args):
         """Pausiert Bus-Flush während Column-Resize (verhindert UI-Freeze)."""

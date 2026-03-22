@@ -12,8 +12,11 @@ import math
 import os
 import random
 import re
+import socket
+import struct
 import subprocess
 import time
+from collections import deque
 from typing import Dict, Optional
 
 from PyQt6.QtWidgets import (
@@ -52,6 +55,8 @@ _BTN_CONNECT_CHECKED = (
     "QPushButton:checked { background: #2E7D32; color: white; font-weight: bold; }"
 )
 _TX_ROW_BG = QColor(200, 220, 255)  # Helles Blau fuer TX-Zeilen
+_SIM_ROW_PURPLE = QColor("#F3E5F5")  # Material Purple-50 (淡紫)
+_SIM_ROW_WHITE = QColor("#FFFFFF")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -150,6 +155,11 @@ class PcanCanPage(QWidget):
         self._sim_dbc_name = ''
         self._sim_seq_index = 0
         self._sim_pattern_counter = 0
+        self._sim_cca_enabled = False
+        self._sim_cca_socket: Optional[socket.socket] = None
+        self._sim_cca_counter = 0
+        # RTT: can_id → deque of (send_time, sim_frame_nr)
+        self._sim_rtt_sent: Dict[int, deque] = {}
         self._init_ui()
 
     def _init_ui(self):
@@ -777,6 +787,45 @@ class PcanCanPage(QWidget):
         row0.addStretch()
         clayout.addLayout(row0)
 
+        # Zeile 0b: CCA Senden + RTT
+        row_cca = QHBoxLayout()
+        row_cca.setSpacing(6)
+
+        self._sim_cca_toggle = QPushButton("\u2192 CCA senden")
+        self._sim_cca_toggle.setCheckable(True)
+        self._sim_cca_toggle.setMinimumWidth(120)
+        self._sim_cca_toggle.setStyleSheet(
+            "QPushButton { background: #dcdce5; color: #555;"
+            "  border: 1px solid #c0c0c8; border-radius: 3px;"
+            "  padding: 3px 8px; font-weight: bold; }"
+            "QPushButton:checked { background: #2E7D32;"
+            "  color: white; }"
+            "QPushButton:hover { background: #d0d0dc; }")
+        self._sim_cca_toggle.toggled.connect(self._sim_toggle_cca)
+        row_cca.addWidget(self._sim_cca_toggle)
+
+        row_cca.addWidget(QLabel("CCA IP:"))
+        self._sim_cca_ip = QLineEdit("192.168.178.254")
+        self._sim_cca_ip.setMaximumWidth(140)
+        self._sim_cca_ip.setFont(_MONO)
+        row_cca.addWidget(self._sim_cca_ip)
+
+        row_cca.addWidget(QLabel("Port:"))
+        self._sim_cca_port = QSpinBox()
+        self._sim_cca_port.setRange(1, 65535)
+        self._sim_cca_port.setValue(50000)
+        self._sim_cca_port.setMaximumWidth(80)
+        row_cca.addWidget(self._sim_cca_port)
+
+        self._sim_rtt_label = QLabel("RTT: ---")
+        self._sim_rtt_label.setStyleSheet(
+            "color: #6A1B9A; font-weight: bold; font-size: 11px;")
+        self._sim_rtt_label.setMinimumWidth(120)
+        row_cca.addWidget(self._sim_rtt_label)
+
+        row_cca.addStretch()
+        clayout.addLayout(row_cca)
+
         # Zeile 1: Modus + Intervall + Anzahl
         row1 = QHBoxLayout()
         row1.setSpacing(6)
@@ -942,6 +991,17 @@ class PcanCanPage(QWidget):
             " background: transparent;")
         sim_h.addWidget(self._sim_rate_label)
 
+        self._sim_clear_btn = QPushButton("\U0001f5d1 Leeren")
+        self._sim_clear_btn.setStyleSheet(
+            "QPushButton { background: transparent; color: #FFD54F;"
+            "  border: 1px solid #FFD54F; border-radius: 3px;"
+            "  padding: 1px 8px; font-size: 10px; font-weight: bold; }"
+            "QPushButton:hover { background: rgba(255,213,79,0.2); }")
+        self._sim_clear_btn.setFixedHeight(18)
+        self._sim_clear_btn.setMinimumWidth(70)
+        self._sim_clear_btn.clicked.connect(self._sim_clear_table)
+        sim_h.addWidget(self._sim_clear_btn)
+
         page_layout.addWidget(sim_header)
 
         # ── Simulator Tabelle (淡紫/白 交替行) ──
@@ -957,11 +1017,9 @@ class PcanCanPage(QWidget):
         self._sim_table.verticalHeader().setVisible(False)
         self._sim_table.verticalHeader().setDefaultSectionSize(22)
         self._sim_table.setShowGrid(True)
-        self._sim_table.setAlternatingRowColors(True)
         self._sim_table.setStyleSheet(
-            "QTableWidget { background-color: #ffffff;"
-            "  alternate-background-color: #F3E5F5;"
-            "  color: #1a1a1a; gridline-color: #ce93d8; }"
+            "QTableWidget { background-color: #ffffff; color: #1a1a1a;"
+            "  gridline-color: #ce93d8; }"
             "QTableWidget::item:selected { background-color: #6A1B9A;"
             "  color: #ffffff; }"
             "QHeaderView::section { background: #f5f5f7; color: #0d0d17;"
@@ -976,6 +1034,18 @@ class PcanCanPage(QWidget):
                 col, QHeaderView.ResizeMode.Stretch
                 if col == 5 else QHeaderView.ResizeMode.Interactive)
             self._sim_table.setColumnWidth(col, w)
+
+        # 预填充30行空行 (淡紫/白 交替背景)
+        for r in range(30):
+            self._sim_table.insertRow(r)
+            bg = _SIM_ROW_PURPLE if r % 2 == 0 else _SIM_ROW_WHITE
+            for c in range(7):
+                item = QTableWidgetItem("")
+                item.setBackground(bg)
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignCenter
+                    | Qt.AlignmentFlag.AlignVCenter)
+                self._sim_table.setItem(r, c, item)
 
         page_layout.addWidget(self._sim_table, 1)
         return page
@@ -1028,34 +1098,39 @@ class PcanCanPage(QWidget):
 
         # Pattern anwenden
         data_bytes = self._sim_apply_pattern(data_bytes, dlc)
+        is_ext = self._sim_ext.isChecked()
+
+        # An CCA senden (TECMP/UDP)
+        self._sim_send_to_cca(can_id, dlc, data_bytes, is_ext)
 
         self._sim_frame_count += 1
         elapsed = time.time() - self._sim_start_time
         data_str = ' '.join(f'{b:02X}' for b in data_bytes)
         name = self._sim_dbc_lookup(can_id)
+        cca_tag = "SIM \u2192 CCA" if self._sim_cca_enabled else "SIM"
 
-        # In Simulator-Tabelle einfuegen (淡紫/白 交替)
-        row = self._sim_table.rowCount()
-        if row >= _MAX_TX_ROWS:
-            self._sim_table.removeRow(0)
-            row = self._sim_table.rowCount()
-        self._sim_table.insertRow(row)
+        # 写入 SIM 表格 (循环覆盖预填充行, 淡紫/白 交替)
+        row = (self._sim_frame_count - 1) % 30
+        bg = _SIM_ROW_PURPLE if row % 2 == 0 else _SIM_ROW_WHITE
 
-        items = [
+        cells = [
             str(self._sim_frame_count),
             f"{elapsed:.6f}",
             f"0x{can_id:03X}",
             name,
             str(len(data_bytes)),
             data_str,
-            "SIM",
+            cca_tag,
         ]
-        for col, text in enumerate(items):
-            item = QTableWidgetItem(text)
-            item.setFont(_MONO)
-            self._sim_table.setItem(row, col, item)
-
-        self._sim_table.scrollToBottom()
+        for col, text in enumerate(cells):
+            item = self._sim_table.item(row, col)
+            if item is not None:
+                item.setText(text)
+            else:
+                item = QTableWidgetItem(text)
+                item.setFont(_MONO)
+                item.setBackground(bg)
+                self._sim_table.setItem(row, col, item)
         self._sim_count_label.setText(f"{self._sim_frame_count} Frames")
 
         # Anzahl-Limit pruefen (zyklischer Modus)
@@ -1091,32 +1166,38 @@ class PcanCanPage(QWidget):
         # Pattern anwenden
         data_bytes = self._sim_apply_pattern(data_bytes, dlc)
 
+        # An CCA senden (TECMP/UDP)
+        self._sim_send_to_cca(can_id, dlc, data_bytes)
+
         self._sim_frame_count += 1
         elapsed = time.time() - self._sim_start_time
         data_str = ' '.join(f'{b:02X}' for b in data_bytes)
         name = self._sim_dbc_lookup(can_id)
+        cca_tag = f"SEQ[{r}] \u2192 CCA" if self._sim_cca_enabled \
+            else f"SEQ[{r}]"
 
-        row = self._sim_table.rowCount()
-        if row >= _MAX_TX_ROWS:
-            self._sim_table.removeRow(0)
-            row = self._sim_table.rowCount()
-        self._sim_table.insertRow(row)
+        # 写入 SIM 表格 (循环覆盖, 淡紫/白 交替)
+        sim_row = (self._sim_frame_count - 1) % 30
+        bg = _SIM_ROW_PURPLE if sim_row % 2 == 0 else _SIM_ROW_WHITE
 
-        items = [
+        cells = [
             str(self._sim_frame_count),
             f"{elapsed:.6f}",
             f"0x{can_id:03X}",
             name,
             str(len(data_bytes)),
             data_str,
-            f"SEQ[{r}]",
+            cca_tag,
         ]
-        for col, text in enumerate(items):
-            item = QTableWidgetItem(text)
-            item.setFont(_MONO)
-            self._sim_table.setItem(row, col, item)
-
-        self._sim_table.scrollToBottom()
+        for col, text in enumerate(cells):
+            item = self._sim_table.item(sim_row, col)
+            if item is not None:
+                item.setText(text)
+            else:
+                item = QTableWidgetItem(text)
+                item.setFont(_MONO)
+                item.setBackground(bg)
+                self._sim_table.setItem(sim_row, col, item)
         self._sim_count_label.setText(f"{self._sim_frame_count} Frames")
 
         self._sim_seq_index += 1
@@ -1218,6 +1299,127 @@ class PcanCanPage(QWidget):
         elif table.rowCount() > 0:
             table.removeRow(table.rowCount() - 1)
 
+    def _sim_clear_table(self):
+        """Leert die SIM-Tabelle und setzt Zaehler zurueck."""
+        self._sim_frame_count = 0
+        self._sim_pattern_counter = 0
+        self._sim_start_time = time.time()
+        self._sim_rtt_sent.clear()
+        self._sim_count_label.setText("0 Frames")
+        self._sim_rtt_label.setText("RTT: ---")
+        # Alle Zellen leeren, Hintergrundfarben beibehalten
+        for r in range(self._sim_table.rowCount()):
+            for c in range(self._sim_table.columnCount()):
+                item = self._sim_table.item(r, c)
+                if item is not None:
+                    item.setText("")
+
+    # ── CCA Senden (TECMP/UDP) ────────────────────────────────────────
+
+    def _sim_toggle_cca(self, checked: bool):
+        """Aktiviert/deaktiviert TECMP-UDP Senden an CCA."""
+        self._sim_cca_enabled = checked
+        if checked:
+            try:
+                self._sim_cca_socket = socket.socket(
+                    socket.AF_INET, socket.SOCK_DGRAM)
+                _log.info("CCA UDP-Socket geoeffnet -> %s:%d",
+                          self._sim_cca_ip.text(),
+                          self._sim_cca_port.value())
+            except Exception as e:
+                _log.error("CCA Socket-Fehler: %s", e)
+                self._sim_cca_enabled = False
+                self._sim_cca_toggle.setChecked(False)
+        else:
+            if self._sim_cca_socket:
+                self._sim_cca_socket.close()
+                self._sim_cca_socket = None
+
+    def _sim_build_tecmp_can(self, can_id: int, dlc: int,
+                             data_bytes: bytes,
+                             is_ext: bool = False) -> bytes:
+        """Baut ein TECMP-Paket mit CAN-Frame Payload.
+
+        TECMP Header (12 Bytes):
+          DeviceID(2) + Counter(2) + Version(1) + MsgType(1)
+          + DataType(2) + Flags(4)
+
+        Entry Header (16 Bytes):
+          CM_ID(2) + InterfaceID(2) + Timestamp(8)
+          + DataLength(2) + DataFlags(2)
+
+        CAN Payload:
+          CAN_ID(4) + DLC(1) + Data(DLC)
+        """
+        self._sim_cca_counter = (self._sim_cca_counter + 1) & 0xFFFF
+
+        # TECMP Header
+        device_id = 0xFFFF  # Simulator
+        version = 3
+        msg_type = 0x0A     # Replay Data
+        data_type = 0x0002  # CAN Data
+        header = struct.pack('>HH BB HI',
+                             device_id, self._sim_cca_counter,
+                             version, msg_type,
+                             data_type, 0)
+
+        # CAN Payload
+        id_raw = can_id | (0x80000000 if is_ext else 0)
+        can_payload = struct.pack('>IB', id_raw, dlc) + data_bytes[:dlc]
+
+        # Entry Header
+        ts_ns = int(time.time() * 1_000_000_000) & 0xFFFFFFFFFFFFFFFF
+        entry = struct.pack('>HH QH H',
+                            0x0000,             # CM_ID
+                            0x0001,             # InterfaceID (CAN-1)
+                            ts_ns,
+                            len(can_payload),   # DataLength
+                            0x0000)             # DataFlags
+
+        return header + entry + can_payload
+
+    def _sim_send_to_cca(self, can_id: int, dlc: int,
+                         data_bytes: bytes, is_ext: bool = False):
+        """Sendet einen CAN-Frame als TECMP/UDP an die CCA."""
+        if not self._sim_cca_enabled or not self._sim_cca_socket:
+            return
+        try:
+            packet = self._sim_build_tecmp_can(
+                can_id, dlc, data_bytes, is_ext)
+            ip = self._sim_cca_ip.text().strip()
+            port = self._sim_cca_port.value()
+            self._sim_cca_socket.sendto(packet, (ip, port))
+
+            # RTT: Zeitstempel fuer diesen CAN-ID merken
+            send_time = time.monotonic()
+            if can_id not in self._sim_rtt_sent:
+                self._sim_rtt_sent[can_id] = deque(maxlen=100)
+            self._sim_rtt_sent[can_id].append(
+                (send_time, self._sim_frame_count))
+        except Exception as e:
+            _log.error("CCA-Senden: %s", e)
+
+    # ── RTT Tracking ──────────────────────────────────────────────────
+
+    def on_rx_can_frame(self, can_id: int):
+        """Wird von WiresharkPanel aufgerufen wenn ein CAN-Frame
+        im RX-Stream (bus_queues[0]) ankommt.
+        Prueft ob dieser Frame einem gesendeten SIM-Frame entspricht
+        und berechnet die RTT.
+        """
+        q = self._sim_rtt_sent.get(can_id)
+        if not q:
+            return
+        send_time, frame_nr = q.popleft()
+        rtt_ms = (time.monotonic() - send_time) * 1000
+        self._sim_rtt_label.setText(
+            f"RTT: {rtt_ms:.1f} ms (#{frame_nr})")
+
+        # Info-Spalte im SIM-Table aktualisieren
+        sim_row = (frame_nr - 1) % 30
+        item = self._sim_table.item(sim_row, 6)
+        if item is not None:
+            item.setText(f"RTT {rtt_ms:.1f}ms")
 
     def _load_dbc(self):
         """DBC-Datei laden fuer CAN-ID → Nachrichtenname Dekodierung."""
