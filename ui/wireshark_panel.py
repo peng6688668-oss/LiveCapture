@@ -4799,11 +4799,15 @@ class USBCameraCaptureThread(QThread):
             self.error.emit("OpenCV (cv2) ist nicht installiert.")
             return
 
-        # Capture-Prozess starten (isoliert von Qt)
-        self._stop_event = multiprocessing.Event()
-        frame_queue = multiprocessing.Queue(maxsize=3)
+        # WICHTIG: spawn statt fork — fork erbt Qt Event-Loop State,
+        # der V4L2 select() stoert → select() timeout
+        ctx = multiprocessing.get_context('spawn')
 
-        self._process = multiprocessing.Process(
+        # Capture-Prozess starten (isoliert von Qt)
+        self._stop_event = ctx.Event()
+        frame_queue = ctx.Queue(maxsize=3)
+
+        self._process = ctx.Process(
             target=_usb_capture_worker,
             args=(self._source, frame_queue, self._stop_event),
             daemon=True, name='USBCapture')
