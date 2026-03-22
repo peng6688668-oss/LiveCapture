@@ -4705,15 +4705,31 @@ class USBCameraCaptureThread(QThread):
         """Oeffnet die Video-Quelle (UDP-Stream oder lokale Kamera)."""
         src = self._source.strip()
 
-        # UDP/TCP/RTSP Stream
+        # UDP/TCP/RTSP Stream — mit Retry (ffmpeg braucht Anlaufzeit)
         if '://' in src:
-            return cv2.VideoCapture(src, cv2.CAP_FFMPEG), src, "Stream"
+            log = logging.getLogger(__name__)
+            for attempt in range(10):
+                # Zuerst mit FFMPEG-Backend, dann ohne
+                cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+                if cap.isOpened():
+                    log.info("Stream geoeffnet (Versuch %d): %s",
+                             attempt + 1, src)
+                    return cap, src, "Stream"
+                cap.release()
+                if attempt < 9:
+                    log.info("Stream noch nicht bereit (Versuch %d/10), "
+                             "warte 1s...", attempt + 1)
+                    time.sleep(1)
+            # Letzter Versuch ohne explizites Backend
+            cap = cv2.VideoCapture(src)
+            if cap.isOpened():
+                return cap, src, "Stream"
+            return cap, src, "Stream"
 
         # /dev/videoN
         if src.startswith('/dev/video'):
             idx = int(src.replace('/dev/video', ''))
             cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-            # Buffer-Groesse minimieren fuer niedrigste Latenz
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             return cap, src, "V4L2"
 
@@ -10034,9 +10050,9 @@ class WiresharkPanel(QWidget):
         is_usb = (index == 9)
         self._usb_cam_label.setVisible(is_usb)
         self._usb_cam_name_entry.setVisible(is_usb)
-        # Port-Feld nur auf WSL2 (ffmpeg Bridge), nicht auf nativem Linux
-        self._usb_port_label.setVisible(is_usb and IS_WSL)
-        self._usb_port_entry.setVisible(is_usb and IS_WSL)
+        # Port-Feld immer anzeigen (beide Plattformen nutzen ffmpeg → UDP)
+        self._usb_port_label.setVisible(is_usb)
+        self._usb_port_entry.setVisible(is_usb)
 
         # USB-Kamera braucht kein Netzwerk-Capture → Button immer aktivieren
         if is_usb:
