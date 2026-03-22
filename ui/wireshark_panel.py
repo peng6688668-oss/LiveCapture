@@ -9427,11 +9427,36 @@ class WiresharkPanel(QWidget):
             pass
         return cameras
 
+    def _kill_stale_ffmpeg(self, device: str):
+        """Toetet residuale ffmpeg-Prozesse die das V4L2-Geraet blockieren."""
+        log = logging.getLogger(__name__)
+        try:
+            result = subprocess.run(
+                ['fuser', device], capture_output=True, text=True, timeout=3)
+            pids = result.stdout.strip().split()
+            own_pid = str(os.getpid())
+            for pid_str in pids:
+                pid_str = pid_str.strip()
+                if not pid_str or pid_str == own_pid:
+                    continue
+                try:
+                    pid = int(pid_str)
+                    os.kill(pid, 9)
+                    log.warning("Residualen Prozess %d auf %s gekillt",
+                                pid, device)
+                except (ValueError, ProcessLookupError, PermissionError):
+                    pass
+            if pids:
+                time.sleep(0.5)
+        except Exception:
+            pass
+
     def _start_linux_ffmpeg(self, device: str, port: int) -> bool:
         """Startet ffmpeg auf Linux fuer V4L2 → H.264 → UDP Streaming."""
         log = logging.getLogger(__name__)
 
         self._stop_win_ffmpeg()  # Wiederverwendung: stoppt auch Linux ffmpeg
+        self._kill_stale_ffmpeg(device)  # Residuale Prozesse aufraemen
 
         ffmpeg_bin = shutil.which('ffmpeg')
         if not ffmpeg_bin:
