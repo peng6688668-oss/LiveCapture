@@ -9588,6 +9588,11 @@ class WiresharkPanel(QWidget):
             display_name = matched[2]
             log.info("V4L2 Kamera erkannt: %s (%s)", display_name, source)
 
+            # Residuale ffmpeg/OpenCV Prozesse aufraemen
+            self._kill_stale_ffmpeg(source)
+
+        self._usb_diag_count = 0  # Diagnose-Zaehler zuruecksetzen
+
         # Render-Threads starten (1 Slot fuer USB-Kamera)
         self._render_threads = []
         rt = _VideoRenderThread(0, parent=self)
@@ -9645,8 +9650,24 @@ class WiresharkPanel(QWidget):
                 rts[0].submit_frame(frame, ds.width(), ds.height())
             else:
                 self._render_frame_direct(frame, target)
-        except Exception:
-            pass
+
+            # Diagnose: erste 3 Frames loggen
+            _usb_fc = getattr(self, '_usb_diag_count', 0) + 1
+            self._usb_diag_count = _usb_fc
+            if _usb_fc <= 3:
+                h, w = frame.shape[:2]
+                logging.getLogger(__name__).info(
+                    "USB Frame %d empfangen: %dx%d, "
+                    "target_visible=%s, target_size=%dx%d, "
+                    "render_threads=%d",
+                    _usb_fc, w, h,
+                    target.isVisible(),
+                    ds.width() if rts else 0,
+                    ds.height() if rts else 0,
+                    len(rts))
+        except Exception as e:
+            logging.getLogger(__name__).error(
+                "USB Frame Fehler: %s", e)
 
     def _on_usb_stream_info(self, info: dict):
         """Aktualisiert die USB-Kamera Stream-Info."""
@@ -9654,7 +9675,11 @@ class WiresharkPanel(QWidget):
         fps = info.get('fps', '?')
         codec = info.get('codec', '?')
         frames = info.get('frames', 0)
+        # Kameraname: aus Label (Auto-Erkennung) oder Eingabefeld
         cam_name = self._usb_cam_name_entry.text().strip()
+        if not cam_name:
+            lbl_text = self._video_id_labels[0].text()
+            cam_name = lbl_text.replace("USB: ", "") if lbl_text else "USB"
         self._video_info_label.setText(
             f"USB Kamera: {cam_name}   {res}   {fps} FPS   {codec}   #{frames}")
 
