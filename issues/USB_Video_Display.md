@@ -132,6 +132,28 @@ spawn 虽然不继承 Qt 状态，但可能继承了某些内核层面的 socket
 - Qt WebEngine 的 Chromium 渲染器触发了软件 OpenGL
 - 系统负载 11.0（16 核机器），USB 中断无法及时处理
 
-### 修复: LP_NUM_THREADS=2
+### 修复尝试 A: LP_NUM_THREADS=2
 **方法:** 在 `run.py` 中设置 `os.environ.setdefault('LP_NUM_THREADS', '2')`
-**预期:** llvmpipe 从 12 线程降到 2 线程，释放 ~100% CPU，USB 中断恢复正常
+**结果:** ⚠️ LiveCapture 的 llvmpipe 从 12 降到 0，但效果不明显
+**原因:** LiveCapture 只占 133% CPU，真正的瓶颈是 gnome-shell
+
+### 根因确认 (最终): gnome-shell 625% CPU
+**发现:** `top` 显示 gnome-shell 消耗 **625% CPU**
+- 远程机器无 GPU，GNOME 桌面合成器全部软件渲染
+- gnome-shell (625%) + LiveCapture (133%) + kworker (58%) + Xwayland (17%) = 833% CPU
+- 系统负载 10.69（16 核机器 67% 满载）
+- USB 控制器中断在如此高的 CPU 竞争下无法及时处理
+
+**这不是 LiveCapture 的 bug，是系统环境问题。**
+
+### 最终解决: 切换到 Openbox
+**方法:** 用 Openbox 轻量窗口管理器替代 GNOME Shell
+**结果:** ✅ **USB 视频流畅显示，问题完全解决**
+**原因:** Openbox 不需要合成器，CPU 占用接近 0%，USB 中断正常响应
+
+### 总结
+整个排查过程的核心教训：问题不在 LiveCapture 代码，不在 OpenCV，不在 V4L2 驱动，
+而在于 **GNOME Shell 桌面合成器在无 GPU 机器上消耗 625% CPU**，
+导致 USB 控制器中断无法及时处理，V4L2 select() 超时。
+
+独立脚本测试（无 GNOME 负载时）确认摄像头本身能稳定输出 22fps。
