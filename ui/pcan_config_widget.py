@@ -15,7 +15,7 @@ import time
 from typing import Dict, Optional
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
+    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QStackedWidget,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel,
     QLineEdit, QComboBox, QSpinBox, QCheckBox, QHeaderView,
     QGroupBox, QMessageBox, QTableView, QFileDialog, QInputDialog,
@@ -140,6 +140,10 @@ class PcanCanPage(QWidget):
         self._smoothed_tx_rate = 0.0   # EMA-geglaettete TX-Rate
         self._last_plp_can_count = 0
         self._last_rate_time = 0.0     # Zeitstempel fuer Rate-Berechnung
+        self._current_sub_tab = 0
+        self._sim_frame_count = 0
+        self._sim_start_time = time.time()
+        self._sim_periodic_timer: Optional[QTimer] = None
         self._init_ui()
 
     def _init_ui(self):
@@ -147,17 +151,31 @@ class PcanCanPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # ── Faltbares Konfigurationspanel ───────────────────────────
-        self._config_widget = self._create_config_panel()
-        layout.addWidget(self._config_widget)
+        # ── Sub-Tab-Leiste (PCAN USB PRO FD | CAN Simulator) ──
+        layout.addWidget(self._create_sub_tab_bar())
 
-        # ── TX/RX Splitter ──────────────────────────────────────────
+        # ── Stacked Widget fuer Config+TX Bereich ──
+        self._sub_content_stack = QStackedWidget()
+
+        # Page 0: PCAN USB PRO FD (Config + TX)
+        pcan_page = QWidget()
+        pcan_layout = QVBoxLayout(pcan_page)
+        pcan_layout.setContentsMargins(0, 0, 0, 0)
+        pcan_layout.setSpacing(0)
+        pcan_config = self._create_pcan_config()
+        pcan_config.setStyleSheet(NATIVE_COMBO_CSS)
+        pcan_layout.addWidget(pcan_config)
+        pcan_layout.addWidget(self._create_tx_section())
+        self._sub_content_stack.addWidget(pcan_page)
+
+        # Page 1: CAN Simulator
+        self._sub_content_stack.addWidget(self._create_simulator_page())
+
+        # ── Splitter: Config+TX (stacked) + RX (shared) ──
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.setStyleSheet(
             "QSplitter::handle { background: #d0d0d8; height: 3px; }")
-
-        # TX-Bereich
-        splitter.addWidget(self._create_tx_section())
+        splitter.addWidget(self._sub_content_stack)
 
         # RX-Bereich: bestehendes CAN-TableView
         rx_wrapper = QWidget()
@@ -246,42 +264,10 @@ class PcanCanPage(QWidget):
 
     # ── Konfigurationspanel ─────────────────────────────────────────────
 
-    def _create_config_panel(self) -> QWidget:
-        wrapper = QWidget()
-        wrapper_layout = QVBoxLayout(wrapper)
-        wrapper_layout.setContentsMargins(0, 0, 0, 0)
-        wrapper_layout.setSpacing(0)
-
-        # ── Toggle-Button zum Auf-/Zuklappen ──
-        # ── Toggle-Zeile: Konfiguration + PCAN USB PRO FD ──
-        toggle_row = QHBoxLayout()
-        toggle_row.setContentsMargins(0, 0, 0, 0)
-        toggle_row.setSpacing(0)
-
-        self._config_toggle = QPushButton("\u25bc Konfiguration")
-        self._config_toggle.setCheckable(True)
-        self._config_toggle.setChecked(True)
-        self._config_toggle.setStyleSheet(
-            "QPushButton { text-align: left; padding: 3px 8px;"
-            "  font-weight: bold; font-size: 11px; border: none;"
-            "  border-bottom: 1px solid palette(mid); }"
-            "QPushButton:hover { background: palette(midlight); }")
-        self._config_toggle.toggled.connect(self._on_config_toggle)
-        toggle_row.addWidget(self._config_toggle)
-
-        self._device_label = QLabel("PCAN USB PRO FD")
-        self._device_label.setStyleSheet(
-            "color: #e8560a; font-weight: bold; font-size: 11px;"
-            "  padding: 3px 8px; background: transparent;")
-        toggle_row.addWidget(self._device_label)
-        toggle_row.addStretch()
-
-        wrapper_layout.addLayout(toggle_row)
-
-        # ── Faltbarer Inhalt ──
-        self._config_content = QWidget()
-        self._config_content.setStyleSheet(NATIVE_COMBO_CSS)
-        clayout = QVBoxLayout(self._config_content)
+    def _create_pcan_config(self) -> QWidget:
+        """Erstellt den PCAN USB PRO FD Konfigurationsinhalt."""
+        config = QWidget()
+        clayout = QVBoxLayout(config)
         clayout.setContentsMargins(8, 4, 8, 4)
         clayout.setSpacing(4)
 
@@ -472,9 +458,7 @@ class PcanCanPage(QWidget):
         row2.addWidget(self._send_btn)
 
         clayout.addLayout(row2)
-
-        wrapper_layout.addWidget(self._config_content)
-        return wrapper
+        return config
 
     def add_bus_button(self, widget):
         """Fuegt ein Widget (z.B. Record, Pause) in die Konfig-Zeile ein."""
@@ -694,11 +678,290 @@ class PcanCanPage(QWidget):
         self._fd_check.setChecked(f.get('fd', False))
         self._per_interval.setValue(f.get('cycle_ms', 100))
 
-    def _on_config_toggle(self, expanded: bool):
-        """Konfigurationspanel auf-/zuklappen."""
-        self._config_content.setVisible(expanded)
-        self._config_toggle.setText(
-            "\u25bc Konfiguration" if expanded else "\u25b6 Konfiguration")
+    # ── Sub-Tab-Leiste + Umschaltung ─────────────────────────────────────
+
+    def _create_sub_tab_bar(self) -> QWidget:
+        """Erstellt die Sub-Tab-Leiste (PCAN USB PRO FD | CAN Simulator)."""
+        bar = QWidget()
+        bar.setStyleSheet('background-color: #e8e8f0;')
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(4, 2, 4, 0)
+        bar_layout.setSpacing(2)
+
+        _ACTIVE = (
+            'QPushButton { background: #ffffff; color: #0d47a1;'
+            '  border: 1px solid #c0c0c8; border-bottom: 2px solid #ffffff;'
+            '  border-radius: 4px 4px 0 0; padding: 4px 12px;'
+            '  font-size: 11px; font-weight: bold; }')
+        _INACTIVE = (
+            'QPushButton { background: #dcdce5; color: #555555;'
+            '  border: 1px solid #c0c0c8; border-bottom: none;'
+            '  border-radius: 4px 4px 0 0; padding: 4px 12px; font-size: 11px; }'
+            'QPushButton:hover { background: #d0d0dc; color: #333333; }')
+
+        self._sub_tab_buttons: list = []
+        self._sub_tab_active_style = _ACTIVE
+        self._sub_tab_inactive_style = _INACTIVE
+
+        _sub_tabs = [
+            '\U0001f50c PCAN USB PRO FD',
+            '\U0001f916 CAN Simulator',
+        ]
+        for i, label in enumerate(_sub_tabs):
+            btn = QPushButton(label)
+            btn.setMinimumWidth(160)
+            btn.setStyleSheet(_ACTIVE if i == 0 else _INACTIVE)
+            btn.clicked.connect(
+                lambda checked, idx=i: self._switch_sub_tab(idx))
+            bar_layout.addWidget(btn)
+            self._sub_tab_buttons.append(btn)
+
+        bar_layout.addStretch()
+        return bar
+
+    def _switch_sub_tab(self, index: int):
+        """Wechselt zwischen PCAN USB PRO FD und CAN Simulator."""
+        if index == self._current_sub_tab:
+            return
+        self._current_sub_tab = index
+        for i, btn in enumerate(self._sub_tab_buttons):
+            btn.setStyleSheet(
+                self._sub_tab_active_style if i == index
+                else self._sub_tab_inactive_style)
+        self._sub_content_stack.setCurrentIndex(index)
+
+    # ── CAN Simulator Seite ───────────────────────────────────────────────
+
+    def _create_simulator_page(self) -> QWidget:
+        """Erstellt die CAN Simulator Seite (softwaregenerierte CAN-Frames)."""
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+
+        # ── Konfigurations-Bereich ──
+        config = QWidget()
+        clayout = QVBoxLayout(config)
+        clayout.setContentsMargins(8, 4, 8, 4)
+        clayout.setSpacing(4)
+
+        # Zeile 1: Modus + Intervall
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+
+        row1.addWidget(QLabel("Modus:"))
+        self._sim_mode_combo = QComboBox()
+        self._sim_mode_combo.addItems(["Einzeln", "Zyklisch", "Sequenz"])
+        self._sim_mode_combo.setMinimumWidth(100)
+        row1.addWidget(self._sim_mode_combo)
+
+        row1.addWidget(QLabel("Intervall:"))
+        self._sim_interval = QSpinBox()
+        self._sim_interval.setRange(1, 60000)
+        self._sim_interval.setValue(100)
+        self._sim_interval.setSuffix(" ms")
+        self._sim_interval.setMaximumWidth(100)
+        row1.addWidget(self._sim_interval)
+
+        self._sim_count_spin = QSpinBox()
+        self._sim_count_spin.setRange(0, 1000000)
+        self._sim_count_spin.setValue(0)
+        self._sim_count_spin.setSpecialValueText("Endlos")
+        self._sim_count_spin.setPrefix("Anzahl: ")
+        self._sim_count_spin.setMinimumWidth(120)
+        row1.addWidget(self._sim_count_spin)
+
+        row1.addStretch()
+        clayout.addLayout(row1)
+
+        # Zeile 2: Frame-Definition
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+
+        row2.addWidget(QLabel("ID:"))
+        self._sim_id = QLineEdit("0x100")
+        self._sim_id.setMaximumWidth(90)
+        self._sim_id.setFont(_MONO)
+        row2.addWidget(self._sim_id)
+
+        self._sim_ext = QCheckBox("Ext")
+        row2.addWidget(self._sim_ext)
+
+        row2.addWidget(QLabel("DLC:"))
+        self._sim_dlc = QSpinBox()
+        self._sim_dlc.setRange(0, 8)
+        self._sim_dlc.setValue(8)
+        self._sim_dlc.setMaximumWidth(55)
+        row2.addWidget(self._sim_dlc)
+
+        row2.addWidget(QLabel("Daten:"))
+        self._sim_data = QLineEdit("00 00 00 00 00 00 00 00")
+        self._sim_data.setFont(_MONO)
+        self._sim_data.setPlaceholderText("00 11 22 33 ...")
+        row2.addWidget(self._sim_data, 1)
+
+        self._sim_send_btn = QPushButton("\u25b6 Generieren")
+        self._sim_send_btn.setMinimumWidth(110)
+        self._sim_send_btn.clicked.connect(self._sim_generate_frame)
+        row2.addWidget(self._sim_send_btn)
+
+        self._sim_start_btn = QPushButton("\u25b6 Start")
+        self._sim_start_btn.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white;"
+            "  font-weight: bold; }"
+            "QPushButton:disabled { background-color: #a0a0a0;"
+            "  color: #666666; }")
+        self._sim_start_btn.setMinimumWidth(80)
+        self._sim_start_btn.clicked.connect(self._sim_start_periodic)
+        row2.addWidget(self._sim_start_btn)
+
+        self._sim_stop_btn = QPushButton("\u2b1b Stop")
+        self._sim_stop_btn.setStyleSheet(
+            "QPushButton { background-color: #f44336; color: white;"
+            "  font-weight: bold; }"
+            "QPushButton:disabled { background-color: #a0a0a0;"
+            "  color: #666666; }")
+        self._sim_stop_btn.setMinimumWidth(80)
+        self._sim_stop_btn.setEnabled(False)
+        self._sim_stop_btn.clicked.connect(self._sim_stop_periodic)
+        row2.addWidget(self._sim_stop_btn)
+
+        clayout.addLayout(row2)
+        page_layout.addWidget(config)
+
+        # ── Simulator TX Header ──
+        sim_header = QWidget()
+        sim_header.setFixedHeight(22)
+        sim_header.setStyleSheet("background-color: #6A1B9A; color: white;")
+        sim_h = QHBoxLayout(sim_header)
+        sim_h.setContentsMargins(4, 0, 4, 0)
+        sim_h.setSpacing(8)
+
+        sim_title = QLabel("SIM \u2014 Simulierte CAN-Frames")
+        sim_title.setStyleSheet(
+            "font-weight: bold; font-size: 11px; background: transparent;")
+        sim_h.addWidget(sim_title)
+        sim_h.addStretch()
+
+        self._sim_count_label = QLabel("0 Frames")
+        self._sim_count_label.setStyleSheet(
+            "color: #FFD54F; font-weight: bold; font-size: 10px;"
+            " background: transparent;")
+        sim_h.addWidget(self._sim_count_label)
+
+        self._sim_rate_label = QLabel("0 Frames/s")
+        self._sim_rate_label.setStyleSheet(
+            "color: #B9F6CA; font-weight: bold; font-size: 10px;"
+            " background: transparent;")
+        sim_h.addWidget(self._sim_rate_label)
+
+        page_layout.addWidget(sim_header)
+
+        # ── Simulator Tabelle ──
+        self._sim_table = QTableWidget()
+        self._sim_table.setColumnCount(7)
+        self._sim_table.setHorizontalHeaderLabels(
+            ["Nr.", "Zeit", "ID", "Name", "DLC", "Daten", "Info"])
+        self._sim_table.setFont(QFont("Consolas", 9))
+        self._sim_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers)
+        self._sim_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self._sim_table.verticalHeader().setVisible(False)
+        self._sim_table.verticalHeader().setDefaultSectionSize(22)
+        self._sim_table.setShowGrid(True)
+        self._sim_table.setStyleSheet(
+            "QTableWidget { background-color: #ffffff; color: #1a1a1a;"
+            "  gridline-color: #ce93d8; }"
+            "QTableWidget::item:selected { background-color: #6A1B9A;"
+            "  color: #ffffff; }"
+            "QHeaderView::section { background: #f5f5f7; color: #0d0d17;"
+            "  padding: 4px 6px; border: none;"
+            "  border-right: 1px solid #d0d0d8;"
+            "  border-bottom: 1px solid #333333;"
+            "  font-weight: bold; }")
+        sh = self._sim_table.horizontalHeader()
+        _sim_widths = [60, 120, 80, 100, 50, 400, 100]
+        for col, w in enumerate(_sim_widths):
+            sh.setSectionResizeMode(
+                col, QHeaderView.ResizeMode.Stretch
+                if col == 5 else QHeaderView.ResizeMode.Interactive)
+            self._sim_table.setColumnWidth(col, w)
+
+        page_layout.addWidget(self._sim_table, 1)
+        return page
+
+    def _sim_generate_frame(self):
+        """Generiert einen einzelnen CAN-Frame und speist ihn in bus_queues."""
+        try:
+            id_text = self._sim_id.text().strip()
+            can_id = int(id_text, 16) if id_text.lower().startswith(
+                '0x') else int(id_text)
+            dlc = self._sim_dlc.value()
+            raw = self._sim_data.text().strip().replace(' ', '')
+            data_bytes = bytes.fromhex(raw)[:dlc]
+        except (ValueError, Exception) as e:
+            _log.error("CAN Simulator Eingabefehler: %s", e)
+            return
+
+        self._sim_frame_count += 1
+        elapsed = time.time() - self._sim_start_time
+        data_str = ' '.join(f'{b:02X}' for b in data_bytes)
+
+        # In Simulator-Tabelle einfuegen
+        row = self._sim_table.rowCount()
+        if row >= _MAX_TX_ROWS:
+            self._sim_table.removeRow(0)
+            row = self._sim_table.rowCount()
+        self._sim_table.insertRow(row)
+
+        items = [
+            str(self._sim_frame_count),
+            f"{elapsed:.6f}",
+            f"0x{can_id:03X}",
+            "",
+            str(len(data_bytes)),
+            data_str,
+            "SIM",
+        ]
+        for col, text in enumerate(items):
+            item = QTableWidgetItem(text)
+            item.setFont(_MONO)
+            self._sim_table.setItem(row, col, item)
+
+        self._sim_table.scrollToBottom()
+        self._sim_count_label.setText(f"{self._sim_frame_count} Frames")
+
+        # Frame in gemeinsamen RX-Stream einspeisen
+        row_tuple = (
+            f"{elapsed:.6f}",
+            "SIM",
+            f"0x{can_id:03X}",
+            "",
+            str(len(data_bytes)),
+            data_str,
+            "SIM CAN",
+        )
+        self.frame_for_bus_queue.emit(row_tuple)
+
+    def _sim_start_periodic(self):
+        """Startet periodische Frame-Generierung."""
+        self._sim_periodic_timer = QTimer(self)
+        self._sim_periodic_timer.setInterval(self._sim_interval.value())
+        self._sim_periodic_timer.timeout.connect(self._sim_generate_frame)
+        self._sim_periodic_timer.start()
+        self._sim_start_btn.setEnabled(False)
+        self._sim_stop_btn.setEnabled(True)
+        self._sim_send_btn.setEnabled(False)
+
+    def _sim_stop_periodic(self):
+        """Stoppt periodische Frame-Generierung."""
+        if self._sim_periodic_timer:
+            self._sim_periodic_timer.stop()
+            self._sim_periodic_timer = None
+        self._sim_start_btn.setEnabled(True)
+        self._sim_stop_btn.setEnabled(False)
+        self._sim_send_btn.setEnabled(True)
 
 
     def _load_dbc(self):
