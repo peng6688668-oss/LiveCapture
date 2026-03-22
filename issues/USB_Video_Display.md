@@ -75,7 +75,14 @@ Messtechnik `video_player.py` 在 WSL2 上流畅运行：
 
 ### 尝试 7: 修改 LiveCapture 用 spawn 替代 fork
 **方法:** `ctx = multiprocessing.get_context('spawn')` 创建 Process/Queue/Event
-**结果:** 🔄 部署中...
+**结果:** ❌ 仍然 `select() timeout` @11s, @21s, @42s。/dev/video0 最终消失。
+**原因:** spawn 子进程的 stderr 中仍有 V4L2 timeout，UVC 驱动再次进入坏状态。
+spawn 虽然不继承 Qt 状态，但可能继承了某些内核层面的 socket/fd 状态。
+
+### 尝试 8: subprocess.Popen 完全独立脚本 (计划中)
+**方法:** 用 subprocess.Popen 启动独立 Python 脚本，通过 Unix socket 传帧。
+完全独立的进程，无任何继承关系。
+独立脚本测试已确认 22fps 可用。
 
 ---
 

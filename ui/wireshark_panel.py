@@ -4679,104 +4679,12 @@ class _VideoRenderThread(QThread):
 #  USB-Kamera Capture-Thread: OpenCV VideoCapture
 # ════════════════════════════════════════════════════════════════
 
-def _usb_capture_worker(source: str, frame_queue, stop_event):
-    """Eigenstaendiger Prozess fuer V4L2-Capture (isoliert von Qt Event-Loop).
-
-    Qt's Event-Loop stoert select() in V4L2 → Capture MUSS in
-    eigenem Prozess laufen, nicht in QThread.
-    """
-    import cv2
-    import time
-    import logging
-    log = logging.getLogger("USBCaptureWorker")
-
-    src = source.strip()
-    # /dev/videoN → Index extrahieren
-    if src.startswith('/dev/video'):
-        idx = int(src.replace('/dev/video', ''))
-        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        backend = "V4L2"
-    elif '://' in src:
-        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-        backend = "Stream"
-    else:
-        try:
-            idx = int(src)
-            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            backend = "V4L2"
-        except ValueError:
-            frame_queue.put(('error', f"Ungueltige Quelle: {src}"))
-            return
-
-    if not cap.isOpened():
-        frame_queue.put(('error', f"Quelle '{src}' konnte nicht geoeffnet werden."))
-        if cap:
-            cap.release()
-        return
-
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
-    fourcc_str = "".join([chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)])
-    codec = f"{backend}/{fourcc_str}" if fourcc_str.strip('\x00') else backend
-
-    frame_queue.put(('started', {'resolution': f"{w}x{h}",
-                                  'fps': f"{fps:.0f}", 'codec': codec}))
-
-    frame_count = 0
-    fps_counter = 0
-    fps_last = time.time()
-    current_fps = 0.0
-
-    while not stop_event.is_set():
-        ret, frame = cap.read()
-        if not ret:
-            continue  # V4L2: einfach weiter versuchen
-
-        frame_count += 1
-        fps_counter += 1
-
-        now = time.time()
-        elapsed = now - fps_last
-        if elapsed >= 1.0:
-            current_fps = fps_counter / elapsed
-            fps_counter = 0
-            fps_last = now
-
-        # Frame in Queue legen (maxsize=2 → alte Frames verwerfen)
-        try:
-            if frame_queue.full():
-                try:
-                    frame_queue.get_nowait()
-                except Exception:
-                    pass
-            frame_queue.put_nowait(('frame', frame))
-        except Exception:
-            pass
-
-        if frame_count % 10 == 0:
-            try:
-                frame_queue.put_nowait(('info', {
-                    'resolution': f"{frame.shape[1]}x{frame.shape[0]}",
-                    'fps': f"{current_fps:.1f}",
-                    'codec': codec,
-                    'frames': frame_count,
-                }))
-            except Exception:
-                pass
-
-    cap.release()
-
-
 class USBCameraCaptureThread(QThread):
-    """Bridge zwischen USB-Capture-Prozess und Qt UI.
+    """Bridge zwischen USB-Capture-Subprocess und Qt UI.
 
-    V4L2 Capture laeuft in eigenem Prozess (multiprocessing) um
-    Interferenz mit Qt Event-Loop zu vermeiden.
-    Dieser QThread pollt nur die Queue und emittiert Qt-Signale.
+    V4L2 Capture laeuft als voellig unabhaengiges Python-Skript
+    (subprocess.Popen), kommuniziert ueber Unix Domain Socket.
+    Weder fork noch spawn — komplett eigener Prozess.
     """
 
     frame_ready = pyqtSignal(object)          # numpy BGR-Array
@@ -4784,68 +4692,136 @@ class USBCameraCaptureThread(QThread):
     error = pyqtSignal(str)
     started_capture = pyqtSignal()
 
-    def __init__(self, source: str = "udp://0.0.0.0:5004", parent=None):
+    def __init__(self, source: str = "/dev/video0", parent=None):
         super().__init__(parent)
         self._source = source
         self._running = True
-        self._process = None
-        self._stop_event = None
+        self._proc = None
+        self._sock_path = f"/tmp/livecapture_usb_{os.getpid()}.sock"
 
     def run(self):
-        import multiprocessing
         log = logging.getLogger(__name__)
 
         if not CV2_AVAILABLE:
             self.error.emit("OpenCV (cv2) ist nicht installiert.")
             return
 
-        # WICHTIG: spawn statt fork — fork erbt Qt Event-Loop State,
-        # der V4L2 select() stoert → select() timeout
-        ctx = multiprocessing.get_context('spawn')
+        # Worker-Skript finden
+        worker_script = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'core', 'usb_capture_worker.py')
+        if not os.path.exists(worker_script):
+            self.error.emit(f"Worker-Skript nicht gefunden: {worker_script}")
+            return
 
-        # Capture-Prozess starten (isoliert von Qt)
-        self._stop_event = ctx.Event()
-        frame_queue = ctx.Queue(maxsize=3)
+        # Unix Socket Server erstellen
+        if os.path.exists(self._sock_path):
+            os.unlink(self._sock_path)
+        server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server_sock.bind(self._sock_path)
+        server_sock.listen(1)
+        server_sock.settimeout(10)
 
-        self._process = ctx.Process(
-            target=_usb_capture_worker,
-            args=(self._source, frame_queue, self._stop_event),
-            daemon=True, name='USBCapture')
-        self._process.start()
-        log.info("USB-Capture Prozess gestartet (PID %d): %s",
-                 self._process.pid, self._source)
+        # Python-Pfad: gleicher Interpreter wie Hauptprozess
+        python_bin = sys.executable
 
-        # Queue pollen und Qt-Signale emittieren
-        while self._running and self._process.is_alive():
+        # Subprocess starten (voellig unabhaengig)
+        self._proc = subprocess.Popen(
+            [python_bin, worker_script, self._source, self._sock_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        log.info("USB-Capture Subprocess gestartet (PID %d): %s",
+                 self._proc.pid, self._source)
+
+        # Auf Verbindung warten
+        try:
+            conn, _ = server_sock.accept()
+            conn.settimeout(5)
+        except socket.timeout:
+            stderr = self._proc.stderr.read().decode(errors='replace')[-300:]
+            self.error.emit(
+                f"USB-Capture Subprocess hat sich nicht verbunden.\n{stderr}")
+            self._cleanup()
+            return
+
+        # Daten empfangen und Qt-Signale emittieren
+        buf = b''
+        while self._running:
             try:
-                msg = frame_queue.get(timeout=0.1)
-            except Exception:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            except socket.timeout:
+                if self._proc.poll() is not None:
+                    break
                 continue
-
-            msg_type = msg[0]
-            if msg_type == 'frame':
-                self.frame_ready.emit(msg[1])
-            elif msg_type == 'info':
-                self.stream_info_updated.emit(msg[1])
-            elif msg_type == 'started':
-                self.started_capture.emit()
-                self.stream_info_updated.emit(msg[1])
-            elif msg_type == 'error':
-                self.error.emit(msg[1])
+            except Exception:
                 break
 
-        # Aufraemen
-        if self._process and self._process.is_alive():
-            self._stop_event.set()
-            self._process.join(timeout=3)
-            if self._process.is_alive():
-                self._process.kill()
-        log.info("USB-Capture Prozess beendet")
+            # Nachrichten aus Buffer parsen
+            while buf and self._running:
+                msg_type = chr(buf[0])
+
+                if msg_type in ('S', 'I', 'E'):
+                    # Text-Nachricht bis Newline
+                    nl = buf.find(b'\n', 1)
+                    if nl < 0:
+                        break  # Unvollstaendig, auf mehr Daten warten
+                    payload = buf[1:nl].decode(errors='replace')
+                    buf = buf[nl + 1:]
+
+                    if msg_type == 'S':
+                        info = json.loads(payload)
+                        self.started_capture.emit()
+                        self.stream_info_updated.emit(info)
+                    elif msg_type == 'I':
+                        info = json.loads(payload)
+                        self.stream_info_updated.emit(info)
+                    elif msg_type == 'E':
+                        self.error.emit(payload)
+
+                elif msg_type == 'F':
+                    # Frame: 'F' + 4 Byte Laenge + JPEG-Daten
+                    if len(buf) < 5:
+                        break
+                    jpeg_len = struct.unpack('<I', buf[1:5])[0]
+                    if len(buf) < 5 + jpeg_len:
+                        break  # Unvollstaendig
+                    jpeg_data = buf[5:5 + jpeg_len]
+                    buf = buf[5 + jpeg_len:]
+
+                    # JPEG → BGR numpy array
+                    arr = np.frombuffer(jpeg_data, dtype=np.uint8)
+                    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        self.frame_ready.emit(frame)
+
+                else:
+                    # Unbekannter Typ, 1 Byte ueberspringen
+                    buf = buf[1:]
+
+        conn.close()
+        self._cleanup()
+        log.info("USB-Capture Subprocess beendet")
+
+    def _cleanup(self):
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except Exception:
+                self._proc.kill()
+        self._proc = None
+        try:
+            os.unlink(self._sock_path)
+        except Exception:
+            pass
 
     def stop(self):
         self._running = False
-        if self._stop_event:
-            self._stop_event.set()
+        self._cleanup()
 
 
 # ════════════════════════════════════════════════════════════════
