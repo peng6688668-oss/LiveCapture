@@ -4676,6 +4676,139 @@ class _VideoRenderThread(QThread):
 
 
 # ════════════════════════════════════════════════════════════════
+#  USB-Kamera Capture-Thread: OpenCV VideoCapture
+# ════════════════════════════════════════════════════════════════
+
+class USBCameraCaptureThread(QThread):
+    """Thread fuer USB-Kamera-Capture via OpenCV.
+
+    Unterstuetzt:
+    - UDP-Stream: udp://0.0.0.0:5004  (z.B. von Windows ffmpeg)
+    - Lokale Kamera: /dev/video0 oder numerischer Index
+    """
+
+    frame_ready = pyqtSignal(object)          # numpy BGR-Array
+    stream_info_updated = pyqtSignal(dict)    # Resolution, FPS, Codec, Frame-Count
+    error = pyqtSignal(str)
+    started_capture = pyqtSignal()
+
+    def __init__(self, source: str = "udp://0.0.0.0:5004", parent=None):
+        super().__init__(parent)
+        self._source = source
+        self._running = True
+        self._frame_count = 0
+        self._fps_counter = 0
+        self._fps_last_time = 0.0
+        self._current_fps = 0.0
+
+    def _open_capture(self):
+        """Oeffnet die Video-Quelle (UDP-Stream oder lokale Kamera)."""
+        src = self._source.strip()
+
+        # UDP/TCP/RTSP Stream
+        if '://' in src:
+            return cv2.VideoCapture(src, cv2.CAP_FFMPEG), src, "Stream"
+
+        # /dev/videoN
+        if src.startswith('/dev/video'):
+            idx = int(src.replace('/dev/video', ''))
+            return cv2.VideoCapture(idx), src, "V4L2"
+
+        # Numerischer Index
+        try:
+            idx = int(src)
+            return cv2.VideoCapture(idx), f"/dev/video{idx}", "V4L2"
+        except ValueError:
+            pass
+
+        return None, src, ""
+
+    def run(self):
+        log = logging.getLogger(__name__)
+
+        if not CV2_AVAILABLE:
+            self.error.emit("OpenCV (cv2) ist nicht installiert.")
+            return
+
+        cap, source_name, backend = self._open_capture()
+        if cap is None or not cap.isOpened():
+            self.error.emit(
+                f"Quelle '{self._source}' konnte nicht geoeffnet werden.")
+            if cap:
+                cap.release()
+            return
+
+        # Kamera-Parameter lesen
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+        fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
+        fourcc_str = "".join(
+            [chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)])
+
+        codec_str = (f"{backend}/{fourcc_str}"
+                     if fourcc_str.strip('\x00') else backend)
+
+        log.info(
+            "USB-Kamera gestartet: %s  %dx%d  %.1f FPS  %s",
+            source_name, actual_w, actual_h, actual_fps, codec_str)
+
+        self.started_capture.emit()
+        self.stream_info_updated.emit({
+            'resolution': f"{actual_w}x{actual_h}",
+            'fps': f"{actual_fps:.0f}",
+            'codec': codec_str,
+            'frames': 0,
+        })
+
+        self._fps_last_time = time.time()
+        fail_count = 0
+        is_stream = '://' in self._source
+
+        while self._running:
+            ret, frame = cap.read()
+            if not ret:
+                fail_count += 1
+                # Bei Streams: Initiale Sync-Phase tolerieren
+                if is_stream and fail_count <= 50:
+                    continue
+                if self._running:
+                    self.error.emit("Frame konnte nicht gelesen werden.")
+                break
+            fail_count = 0
+
+            self._frame_count += 1
+            self._fps_counter += 1
+
+            # Aufloesung beim ersten echten Frame aktualisieren
+            if self._frame_count == 1:
+                actual_h, actual_w = frame.shape[:2]
+
+            now = time.time()
+            elapsed = now - self._fps_last_time
+            if elapsed >= 1.0:
+                self._current_fps = self._fps_counter / elapsed
+                self._fps_counter = 0
+                self._fps_last_time = now
+
+            self.frame_ready.emit(frame)
+
+            if self._frame_count % 10 == 0:
+                self.stream_info_updated.emit({
+                    'resolution': f"{actual_w}x{actual_h}",
+                    'fps': f"{self._current_fps:.1f}",
+                    'codec': codec_str,
+                    'frames': self._frame_count,
+                })
+
+        cap.release()
+        log.info("USB-Kamera gestoppt: %s", source_name)
+
+    def stop(self):
+        self._running = False
+
+
+# ════════════════════════════════════════════════════════════════
 #  Frame-Dispatch-Thread: SHM-Lesen + Weiterleitung an RenderThreads
 #  Umgeht den Qt Event-Loop komplett → kein Stau durch Paket-Tabelle
 # ════════════════════════════════════════════════════════════════
@@ -5554,12 +5687,43 @@ class WiresharkPanel(QWidget):
             "Auto", "PLP/TECMP (GMSL)", "PLP/TECMP (FPD-Link)",
             "PLP/TECMP \u2192 RTP",
             "RTP MJPEG", "RTP H.264", "IEEE 1722 AVTP", "GigE Vision (GVSP)",
-            "CSI-2 (0x2090)"
+            "CSI-2 (0x2090)", "USB Kamera"
         ]
         for i, label in enumerate(_proto_items):
             action = self._video_protocol_menu.addAction(label)
             action.triggered.connect(lambda checked, idx=i, lbl=label: self._on_video_protocol_selected(idx, lbl))
         live_capture_layout.addWidget(self._video_protocol_btn)
+
+        # ── USB-Kamera Controls (nur sichtbar wenn "USB Kamera" gewaehlt) ──
+        self._usb_cam_label = QLabel("Kamera:")
+        live_capture_layout.addWidget(self._usb_cam_label)
+
+        self._usb_cam_name_entry = QLineEdit()
+        self._usb_cam_name_entry.setText("LI-GW5200")
+        self._usb_cam_name_entry.setMinimumWidth(120)
+        self._usb_cam_name_entry.setToolTip(
+            "DirectShow-Geraetename der Kamera in Windows.\n"
+            "Tipp: ffmpeg -list_devices true -f dshow -i dummy")
+        live_capture_layout.addWidget(self._usb_cam_name_entry)
+
+        self._usb_port_label = QLabel("Port:")
+        live_capture_layout.addWidget(self._usb_port_label)
+
+        self._usb_port_entry = QLineEdit()
+        self._usb_port_entry.setText("5004")
+        self._usb_port_entry.setFixedWidth(60)
+        self._usb_port_entry.setToolTip("UDP-Port fuer den Video-Stream von Windows ffmpeg")
+        live_capture_layout.addWidget(self._usb_port_entry)
+
+        # Initial versteckt (nur sichtbar bei USB Kamera Protokoll)
+        self._usb_cam_label.hide()
+        self._usb_cam_name_entry.hide()
+        self._usb_port_label.hide()
+        self._usb_port_entry.hide()
+
+        # USB-Kamera Zustandsvariablen
+        self._usb_capture_thread: Optional[USBCameraCaptureThread] = None
+        self._win_ffmpeg_proc = None
 
         # Daten-Anzeige Pause/Fortsetzen Button
         self._packet_display_btn = QPushButton("▶ Daten")
@@ -9079,6 +9243,11 @@ class WiresharkPanel(QWidget):
             self._video_decode_btn.setChecked(False)
             return
 
+        # ── USB-Kamera Modus (Index 9) ──
+        if self._video_protocol_index == 9:
+            self._start_usb_camera_decode()
+            return
+
         # Protokoll-Mapping
         proto_map = {
             0: 'auto',
@@ -9200,6 +9369,109 @@ class WiresharkPanel(QWidget):
         self._video_display.setText("Warte auf Video-Signal...")
         backend = "AF_PACKET/MMAP" if self._afpacket_workers else "Software"
         self._video_info_label.setText(f"Live Video [{backend}]  —  Warte auf Signal...")
+
+    def _start_usb_camera_decode(self):
+        """Startet USB-Kamera Capture via Windows ffmpeg → UDP → OpenCV."""
+        log = logging.getLogger(__name__)
+
+        cam_name = self._usb_cam_name_entry.text().strip()
+        port_str = self._usb_port_entry.text().strip()
+
+        if not cam_name:
+            QMessageBox.warning(self, "Fehler",
+                                "Bitte einen Kamera-Namen eingeben.")
+            self._video_decode_btn.setChecked(False)
+            return
+
+        try:
+            port = int(port_str)
+        except ValueError:
+            QMessageBox.warning(self, "Fehler",
+                                "Ungueltige Port-Nummer.")
+            self._video_decode_btn.setChecked(False)
+            return
+
+        # Windows ffmpeg starten (DirectShow → UDP Stream)
+        if not self._start_win_ffmpeg(cam_name, port):
+            self._video_decode_btn.setChecked(False)
+            return
+
+        # Render-Threads starten (1 Slot fuer USB-Kamera)
+        self._render_threads = []
+        rt = _VideoRenderThread(0, parent=self)
+        rt.image_ready.connect(self._on_render_ready)
+        rt.start()
+        self._render_threads.append(rt)
+
+        # USB Capture Thread starten
+        source = f"udp://0.0.0.0:{port}"
+        self._usb_capture_thread = USBCameraCaptureThread(source, parent=self)
+        self._usb_capture_thread.frame_ready.connect(self._on_usb_frame_received)
+        self._usb_capture_thread.stream_info_updated.connect(
+            self._on_usb_stream_info)
+        self._usb_capture_thread.error.connect(self._on_usb_capture_error)
+        self._usb_capture_thread.started_capture.connect(
+            lambda: self._video_info_label.setText(
+                f"USB Kamera: {cam_name}  —  Verbunden"))
+        self._usb_capture_thread.start()
+
+        self._video_decode_active = True
+        self._video_decoder = None
+
+        # AF_PACKET nicht benoetigt
+        self._afpacket_workers = []
+        self._afpacket_shms = []
+        self._afpacket_notifiers = []
+        self._afpacket_conns = []
+        self._afpacket_stop = None
+        self._frame_dispatch = None
+
+        # Video-Container anzeigen
+        self._video_container.show()
+        self._bottom_splitter.hide()
+        self._main_splitter.setSizes([360, 540, 0])
+        self._video_panels[0].setVisible(True)
+        self._video_id_labels[0].setText(f"USB: {cam_name}")
+        self._video_display.setText("Warte auf USB-Kamera...")
+        self._video_info_label.setText(
+            f"USB Kamera: {cam_name}  —  Starte Stream...")
+
+        # Controls deaktivieren
+        self._usb_cam_name_entry.setEnabled(False)
+        self._usb_port_entry.setEnabled(False)
+
+        log.info("USB-Kamera Decode gestartet: %s auf Port %d", cam_name, port)
+
+    def _on_usb_frame_received(self, frame):
+        """Empfaengt BGR-Frame von USB-Kamera und leitet an RenderThread."""
+        try:
+            target = self._video_displays[0]
+            if not target.isVisible():
+                return
+            rts = getattr(self, '_render_threads', [])
+            if rts:
+                ds = target.size()
+                rts[0].submit_frame(frame, ds.width(), ds.height())
+            else:
+                self._render_frame_direct(frame, target)
+        except Exception:
+            pass
+
+    def _on_usb_stream_info(self, info: dict):
+        """Aktualisiert die USB-Kamera Stream-Info."""
+        res = info.get('resolution', '?')
+        fps = info.get('fps', '?')
+        codec = info.get('codec', '?')
+        frames = info.get('frames', 0)
+        cam_name = self._usb_cam_name_entry.text().strip()
+        self._video_info_label.setText(
+            f"USB Kamera: {cam_name}   {res}   {fps} FPS   {codec}   #{frames}")
+
+    def _on_usb_capture_error(self, msg: str):
+        """Behandelt USB-Kamera Fehler."""
+        log = logging.getLogger(__name__)
+        log.error("USB-Kamera Fehler: %s", msg)
+        self._video_info_label.setText(f"USB Kamera Fehler: {msg}")
 
     def _kill_stale_capture_workers(self):
         """Toetet verwaiste CaptureWorker-Prozesse aus vorherigen Sitzungen.
@@ -9477,6 +9749,15 @@ class WiresharkPanel(QWidget):
         if self._detection_active:
             self._detect_toggle_btn.setChecked(False)
 
+        # ── USB-Kamera stoppen ──
+        if self._usb_capture_thread is not None:
+            self._usb_capture_thread.stop()
+            self._usb_capture_thread.wait(3000)
+            self._usb_capture_thread = None
+        self._stop_win_ffmpeg()
+        self._usb_cam_name_entry.setEnabled(True)
+        self._usb_port_entry.setEnabled(True)
+
         # Render-Threads stoppen
         for rt in getattr(self, '_render_threads', []):
             try:
@@ -9513,10 +9794,123 @@ class WiresharkPanel(QWidget):
         if self._view_mode_index != 0:
             self._on_view_mode_selected(0, "Paketanzeige")
 
+    # ── USB-Kamera: Windows ffmpeg Bridge ──
+
+    def _get_wsl_ip(self) -> str:
+        """Ermittelt die WSL2-IP-Adresse."""
+        try:
+            result = subprocess.run(
+                ['hostname', '-I'], capture_output=True, text=True, timeout=3)
+            return result.stdout.strip().split()[0]
+        except Exception:
+            return "127.0.0.1"
+
+    def _start_win_ffmpeg(self, cam_name: str, port: int) -> bool:
+        """Startet ffmpeg.exe auf der Windows-Seite fuer USB-Kamera-Streaming."""
+        log = logging.getLogger(__name__)
+
+        self._stop_win_ffmpeg()
+
+        wsl_ip = self._get_wsl_ip()
+
+        cmd = [
+            'ffmpeg.exe',
+            '-f', 'dshow',
+            '-video_size', '2880x1860',
+            '-i', f'video={cam_name}',
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-b:v', '8M',
+            '-g', '10',
+            '-bsf:v', 'dump_extra',
+            '-f', 'mpegts',
+            f'udp://{wsl_ip}:{port}?pkt_size=1316',
+        ]
+
+        log.info("Starte Windows ffmpeg: %s", ' '.join(cmd))
+        self._video_info_label.setText("Live Video  —  Starte Windows ffmpeg...")
+
+        try:
+            self._win_ffmpeg_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            QMessageBox.critical(
+                self, "Fehler",
+                "ffmpeg.exe wurde nicht gefunden.\n\n"
+                "Bitte sicherstellen, dass ffmpeg auf der "
+                "Windows-Seite installiert und im PATH ist.")
+            return False
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Fehler",
+                f"Windows ffmpeg konnte nicht gestartet werden:\n{e}")
+            return False
+
+        # Kurz warten bis ffmpeg initialisiert ist
+        time.sleep(2)
+
+        # Pruefen ob ffmpeg noch laeuft
+        if self._win_ffmpeg_proc.poll() is not None:
+            stderr = self._win_ffmpeg_proc.stderr.read().decode(
+                errors='replace')[-500:]
+            QMessageBox.critical(
+                self, "Fehler",
+                f"Windows ffmpeg wurde sofort beendet.\n\n"
+                f"Kamera '{cam_name}' nicht gefunden?\n\n"
+                f"Fehler:\n{stderr}")
+            self._win_ffmpeg_proc = None
+            return False
+
+        log.info("Windows ffmpeg laeuft (PID %d)", self._win_ffmpeg_proc.pid)
+        return True
+
+    def _stop_win_ffmpeg(self):
+        """Stoppt den Windows ffmpeg-Prozess."""
+        if self._win_ffmpeg_proc is None:
+            return
+
+        log = logging.getLogger(__name__)
+
+        try:
+            if self._win_ffmpeg_proc.stdin:
+                self._win_ffmpeg_proc.stdin.write(b'q')
+                self._win_ffmpeg_proc.stdin.flush()
+            self._win_ffmpeg_proc.wait(timeout=3)
+            log.info("Windows ffmpeg sauber beendet")
+        except Exception:
+            try:
+                self._win_ffmpeg_proc.terminate()
+                self._win_ffmpeg_proc.wait(timeout=2)
+                log.info("Windows ffmpeg terminiert")
+            except Exception:
+                self._win_ffmpeg_proc.kill()
+                log.warning("Windows ffmpeg gekillt")
+
+        self._win_ffmpeg_proc = None
+
     def _on_video_protocol_selected(self, index: int, label: str):
         """Protokoll-Auswahl im Menü geändert."""
         self._video_protocol_index = index
         self._video_protocol_btn.setText(label)
+
+        # USB-Kamera Controls ein-/ausblenden (Index 9 = USB Kamera)
+        is_usb = (index == 9)
+        self._usb_cam_label.setVisible(is_usb)
+        self._usb_cam_name_entry.setVisible(is_usb)
+        self._usb_port_label.setVisible(is_usb)
+        self._usb_port_entry.setVisible(is_usb)
+
+        # USB-Kamera braucht kein Netzwerk-Capture → Button immer aktivieren
+        if is_usb:
+            self._video_decode_btn.setEnabled(True)
+        elif not self._is_capturing:
+            self._video_decode_btn.setEnabled(False)
+
         if self._video_decoder:
             proto_map = {
                 0: 'auto', 1: 'tecmp', 2: 'fpdlink', 3: 'tecmp_rtp',
