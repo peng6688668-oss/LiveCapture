@@ -158,6 +158,8 @@ class PcanCanPage(QWidget):
         self._sim_send_enabled = False
         self._sim_send_socket: Optional[socket.socket] = None
         self._sim_send_counter = 0
+        self._sim_last_frame_count = 0
+        self._smoothed_sim_rate = 0.0
         # RTT: can_id → deque of (send_time, sim_frame_nr)
         self._sim_rtt_sent: Dict[int, deque] = {}
         self._init_ui()
@@ -1306,9 +1308,12 @@ class PcanCanPage(QWidget):
         """Leert die SIM-Tabelle und setzt Zaehler zurueck."""
         self._sim_frame_count = 0
         self._sim_pattern_counter = 0
+        self._sim_last_frame_count = 0
+        self._smoothed_sim_rate = 0.0
         self._sim_start_time = time.time()
         self._sim_rtt_sent.clear()
         self._sim_count_label.setText("0 Frames")
+        self._sim_rate_label.setText("0 Frames/s")
         self._sim_rtt_label.setText("RTT: ---")
         # Alle Zellen leeren, Hintergrundfarben beibehalten
         for r in range(self._sim_table.rowCount()):
@@ -2150,6 +2155,16 @@ class PcanCanPage(QWidget):
                 parts = [x for x in (iface, proto) if x]
                 self._rx_title.setText(
                     f"RX \u2014 Empfangene Daten ({', '.join(parts)})")
+
+        # ── SIM-Rate (Simulator Frames/s) ──
+        sim_delta = self._sim_frame_count - self._sim_last_frame_count
+        self._sim_last_frame_count = self._sim_frame_count
+        instant_sim = sim_delta / elapsed
+        self._smoothed_sim_rate = (
+            alpha * instant_sim
+            + (1 - alpha) * self._smoothed_sim_rate)
+        sim_display = round(self._smoothed_sim_rate)
+        self._sim_rate_label.setText(f"{sim_display} Frames/s")
 
     # ═══════════════════════════════════════════════════════════════════
     # Bus-State-Ueberwachung (ERROR-ACTIVE / ERROR-PASSIVE / BUS-OFF)
