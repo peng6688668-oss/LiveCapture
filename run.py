@@ -97,25 +97,29 @@ class LiveCaptureWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(12)
 
-        mono = QFont("Consolas", 8)
+        mono = QFont("Consolas", 9)
 
-        self._cpu_label = QLabel("CPU: ---%")
+        self._cpu_label = QLabel("CPU: --- %")
         self._cpu_label.setFont(mono)
+        self._cpu_label.setMinimumWidth(90)
         self._cpu_label.setStyleSheet("color: #1565c0;")
         layout.addWidget(self._cpu_label)
 
-        self._ram_label = QLabel("RAM: ---MB")
+        self._ram_label = QLabel("RAM: --- MB")
         self._ram_label.setFont(mono)
+        self._ram_label.setMinimumWidth(220)
         self._ram_label.setStyleSheet("color: #2e7d32;")
         layout.addWidget(self._ram_label)
 
         self._top_proc_label = QLabel("")
-        self._top_proc_label.setFont(QFont("Consolas", 7))
+        self._top_proc_label.setFont(QFont("Consolas", 8))
+        self._top_proc_label.setMinimumWidth(160)
         self._top_proc_label.setStyleSheet("color: #888;")
         layout.addWidget(self._top_proc_label)
 
         # Vorherige CPU-Werte fuer Delta-Berechnung
         self._prev_cpu_times = None
+        self._prev_per_cpu_times = {}  # Pro-Kern Delta
 
         # Timer: alle 2 Sekunden aktualisieren
         self._sysmon_timer = QTimer(self)
@@ -129,13 +133,16 @@ class LiveCaptureWindow(QMainWindow):
     def _update_system_monitor(self):
         """Liest CPU/RAM aus /proc und aktualisiert die Anzeige."""
         try:
-            # ── CPU-Auslastung (Delta seit letztem Aufruf) ──
+            # ── CPU-Auslastung (Gesamt + pro Kern) ──
+            per_cpu_pcts = []
             with open('/proc/stat') as f:
-                parts = f.readline().split()
-            # user, nice, system, idle, iowait, irq, softirq, steal
+                lines = f.readlines()
+
+            # Erste Zeile: Gesamt-CPU
+            parts = lines[0].split()
             times = [int(x) for x in parts[1:9]]
             total = sum(times)
-            idle = times[3] + times[4]  # idle + iowait
+            idle = times[3] + times[4]
 
             if self._prev_cpu_times is not None:
                 prev_total, prev_idle = self._prev_cpu_times
@@ -146,14 +153,33 @@ class LiveCaptureWindow(QMainWindow):
                 cpu_pct = 0.0
             self._prev_cpu_times = (total, idle)
 
-            # Farbe nach Auslastung
+            # Pro-Kern Auslastung (fuer Tooltip)
+            for line in lines[1:]:
+                if not line.startswith('cpu'):
+                    break
+                p = line.split()
+                core_id = p[0]  # cpu0, cpu1, ...
+                t = [int(x) for x in p[1:9]]
+                t_total = sum(t)
+                t_idle = t[3] + t[4]
+                prev = self._prev_per_cpu_times.get(core_id)
+                if prev:
+                    dt = t_total - prev[0]
+                    di = t_idle - prev[1]
+                    pct = 100.0 * (1.0 - di / max(dt, 1))
+                else:
+                    pct = 0.0
+                self._prev_per_cpu_times[core_id] = (t_total, t_idle)
+                per_cpu_pcts.append((core_id, pct))
+
+            # CPU Label + Farbe
             if cpu_pct > 80:
-                cpu_color = "#d32f2f"  # Rot
+                cpu_color = "#d32f2f"
             elif cpu_pct > 50:
-                cpu_color = "#f57c00"  # Orange
+                cpu_color = "#f57c00"
             else:
-                cpu_color = "#1565c0"  # Blau
-            self._cpu_label.setText(f"CPU: {cpu_pct:.0f}%")
+                cpu_color = "#1565c0"
+            self._cpu_label.setText(f"CPU: {cpu_pct:.0f} %")
             self._cpu_label.setStyleSheet(f"color: {cpu_color};")
 
             # ── RAM-Auslastung ──
@@ -161,7 +187,7 @@ class LiveCaptureWindow(QMainWindow):
             with open('/proc/meminfo') as f:
                 for line in f:
                     key, val = line.split(':')
-                    mem_info[key.strip()] = int(val.split()[0])  # kB
+                    mem_info[key.strip()] = int(val.split()[0])
             total_mb = mem_info.get('MemTotal', 0) / 1024
             avail_mb = mem_info.get('MemAvailable', 0) / 1024
             used_mb = total_mb - avail_mb
@@ -174,32 +200,68 @@ class LiveCaptureWindow(QMainWindow):
             else:
                 ram_color = "#2e7d32"
             self._ram_label.setText(
-                f"RAM: {used_mb:.0f}/{total_mb:.0f}MB ({ram_pct:.0f}%)")
+                f"RAM: {used_mb:.0f}/{total_mb:.0f} MB ({ram_pct:.0f}%)")
             self._ram_label.setStyleSheet(f"color: {ram_color};")
 
-            # ── Top-Prozess (hoechster CPU-Verbrauch) ──
-            top_name = ""
-            top_cpu = 0.0
+            # ── Top 5 Prozesse ──
+            top5_lines = []
             try:
                 import subprocess
                 result = subprocess.run(
-                    ['ps', '-eo', 'comm,%cpu', '--sort=-%cpu', '--no-headers'],
+                    ['ps', '-eo', 'comm,%cpu,%mem', '--sort=-%cpu',
+                     '--no-headers'],
                     capture_output=True, text=True, timeout=2)
-                for line in result.stdout.strip().split('\n')[:1]:
-                    parts = line.rsplit(None, 1)
-                    if len(parts) == 2:
-                        top_name = parts[0].strip()[:15]
-                        top_cpu = float(parts[1])
+                for line in result.stdout.strip().split('\n')[:5]:
+                    p = line.rsplit(None, 2)
+                    if len(p) == 3:
+                        name = p[0].strip()[:18]
+                        c = float(p[1])
+                        m = float(p[2])
+                        top5_lines.append((name, c, m))
             except Exception:
                 pass
-            if top_name:
+
+            # Top-Prozess Label
+            if top5_lines:
                 self._top_proc_label.setText(
-                    f"Top: {top_name} {top_cpu:.0f}%")
+                    f"Top: {top5_lines[0][0]} {top5_lines[0][1]:.0f}%")
             else:
                 self._top_proc_label.setText("")
 
+            # ── Tooltip: Pro-Kern + Top 5 ──
+            tip_parts = ["─── CPU pro Kern ───"]
+            # 2 Spalten: links Kern 0-7, rechts Kern 8-15
+            half = (len(per_cpu_pcts) + 1) // 2
+            for i in range(half):
+                left = per_cpu_pcts[i]
+                l_bar = self._pct_bar(left[1])
+                line = f"  {left[0]:>5s}: {l_bar} {left[1]:5.1f}%"
+                if i + half < len(per_cpu_pcts):
+                    right = per_cpu_pcts[i + half]
+                    r_bar = self._pct_bar(right[1])
+                    line += f"    {right[0]:>5s}: {r_bar} {right[1]:5.1f}%"
+                tip_parts.append(line)
+
+            if top5_lines:
+                tip_parts.append("")
+                tip_parts.append("─── Top 5 Prozesse ───")
+                tip_parts.append(f"  {'Prozess':<18s} {'CPU':>5s} {'RAM':>5s}")
+                for name, c, m in top5_lines:
+                    tip_parts.append(f"  {name:<18s} {c:5.1f}% {m:5.1f}%")
+
+            tooltip = "\n".join(tip_parts)
+            self._cpu_label.setToolTip(tooltip)
+            self._ram_label.setToolTip(tooltip)
+            self._top_proc_label.setToolTip(tooltip)
+
         except Exception:
             pass
+
+    @staticmethod
+    def _pct_bar(pct: float, width: int = 10) -> str:
+        """Erzeugt einen Text-Fortschrittsbalken: [████░░░░░░]"""
+        filled = int(pct / 100 * width)
+        return "█" * filled + "░" * (width - filled)
 
     def _show_about(self):
         """Zeigt den Über-Dialog."""
