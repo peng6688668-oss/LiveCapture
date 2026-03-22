@@ -5691,23 +5691,39 @@ class WiresharkPanel(QWidget):
         self._video_decode_btn.setEnabled(False)
         live_capture_layout.addWidget(self._video_decode_btn)
 
-        # Protokoll-Dropdown (QPushButton + QMenu — Wayland-kompatibel)
+        # Protokoll-Auswahl (QPushButton + QMenu mit Checkboxen — Mehrfachauswahl)
         live_capture_layout.addWidget(QLabel("Protokoll:"))
         self._video_protocol_btn = QPushButton("Auto")
-        self._video_protocol_btn.setMinimumWidth(100)
+        self._video_protocol_btn.setMinimumWidth(160)
         self._video_protocol_btn.setStyleSheet("text-align: left; padding: 3px 8px;")
         self._video_protocol_menu = QMenu(self)
         self._video_protocol_btn.setMenu(self._video_protocol_menu)
-        self._video_protocol_index = 0
-        _proto_items = [
-            "Auto", "PLP/TECMP (GMSL)", "PLP/TECMP (FPD-Link)",
-            "PLP/TECMP \u2192 RTP",
-            "RTP MJPEG", "RTP H.264", "IEEE 1722 AVTP", "GigE Vision (GVSP)",
-            "CSI-2 (0x2090)", "USB Kamera"
+        self._video_protocol_index = 0  # Legacy: primaeres Netzwerk-Protokoll
+
+        # Netzwerk-Protokolle (Einzelauswahl via Radio-Logik)
+        self._proto_net_actions: Dict[int, QAction] = {}
+        _net_proto_items = [
+            (0, "Auto"), (1, "PLP/TECMP (GMSL)"), (2, "PLP/TECMP (FPD-Link)"),
+            (3, "PLP/TECMP \u2192 RTP"),
+            (4, "RTP MJPEG"), (5, "RTP H.264"), (6, "IEEE 1722 AVTP"),
+            (7, "GigE Vision (GVSP)"), (8, "CSI-2 (0x2090)"),
         ]
-        for i, label in enumerate(_proto_items):
+        for idx, label in _net_proto_items:
             action = self._video_protocol_menu.addAction(label)
-            action.triggered.connect(lambda checked, idx=i, lbl=label: self._on_video_protocol_selected(idx, lbl))
+            action.setCheckable(True)
+            action.setChecked(idx == 0)  # Auto ist Standard
+            action.triggered.connect(
+                lambda checked, i=idx, lbl=label: self._on_net_proto_toggled(i, lbl))
+            self._proto_net_actions[idx] = action
+
+        self._video_protocol_menu.addSeparator()
+
+        # USB Kamera (unabhaengig, kann zusaetzlich aktiviert werden)
+        self._usb_proto_action = self._video_protocol_menu.addAction("USB Kamera")
+        self._usb_proto_action.setCheckable(True)
+        self._usb_proto_action.setChecked(False)
+        self._usb_proto_action.triggered.connect(self._on_usb_proto_toggled)
+
         live_capture_layout.addWidget(self._video_protocol_btn)
 
         # ── USB-Kamera Controls (nur sichtbar wenn "USB Kamera" gewaehlt) ──
@@ -9265,9 +9281,13 @@ class WiresharkPanel(QWidget):
             self._video_decode_btn.setChecked(False)
             return
 
-        # ── USB-Kamera Modus (Index 9) ──
-        if self._video_protocol_index == 9:
+        # ── USB-Kamera zusaetzlich starten (wenn angewaehlt) ──
+        usb_selected = self._usb_proto_action.isChecked()
+        if usb_selected:
             self._start_usb_camera_decode()
+
+        # Wenn NUR USB (kein Netzwerk-Capture aktiv), hier beenden
+        if usb_selected and not self._is_capturing:
             return
 
         # Protokoll-Mapping
@@ -9571,16 +9591,22 @@ class WiresharkPanel(QWidget):
 
         self._usb_diag_count = 0  # Diagnose-Zaehler zuruecksetzen
 
-        # Render-Threads starten (1 Slot fuer USB-Kamera)
-        self._render_threads = []
-        rt = _VideoRenderThread(0, parent=self)
-        rt.image_ready.connect(self._on_render_ready)
-        rt.start()
-        self._render_threads.append(rt)
+        # USB bekommt den letzten Video-Slot (3), Netzwerk-Streams nutzen 0-2
+        usb_slot = 3
+
+        # RenderThread fuer USB-Slot starten (falls noch nicht vorhanden)
+        rts = getattr(self, '_render_threads', [])
+        while len(rts) <= usb_slot:
+            rt = _VideoRenderThread(len(rts), parent=self)
+            rt.image_ready.connect(self._on_render_ready)
+            rt.start()
+            rts.append(rt)
+        self._render_threads = rts
 
         # USB Capture Thread starten
         self._usb_capture_thread = USBCameraCaptureThread(source, parent=self)
-        self._usb_capture_thread.frame_ready.connect(self._on_usb_frame_received)
+        self._usb_capture_thread.frame_ready.connect(
+            lambda frame: self._on_usb_frame_received(frame, usb_slot))
         self._usb_capture_thread.stream_info_updated.connect(
             self._on_usb_stream_info)
         self._usb_capture_thread.error.connect(self._on_usb_capture_error)
@@ -9590,23 +9616,23 @@ class WiresharkPanel(QWidget):
         self._usb_capture_thread.start()
 
         self._video_decode_active = True
-        self._video_decoder = None
-
-        # AF_PACKET nicht benoetigt
-        self._afpacket_workers = []
-        self._afpacket_shms = []
-        self._afpacket_notifiers = []
-        self._afpacket_conns = []
-        self._afpacket_stop = None
-        self._frame_dispatch = None
 
         # Video-Container anzeigen
         self._video_container.show()
         self._bottom_splitter.hide()
         self._main_splitter.setSizes([360, 540, 0])
-        self._video_panels[0].setVisible(True)
-        self._video_id_labels[0].setText(f"USB: {display_name}")
-        self._video_display.setText("Warte auf USB-Kamera...")
+
+        # USB-Panel sichtbar machen und Grid anpassen
+        self._video_panels[usb_slot].setVisible(True)
+        self._video_id_labels[usb_slot].setText(f"USB: {display_name}")
+        self._video_displays[usb_slot].setText("Warte auf USB-Kamera...")
+
+        # Grid Layout aktualisieren: sichtbare Panels zaehlen
+        visible = [i for i in range(4) if self._video_panels[i].isVisible()]
+        if len(visible) > self._video_stream_count:
+            self._video_stream_count = len(visible)
+            self._rearrange_video_grid(len(visible))
+
         self._video_info_label.setText(
             f"USB Kamera: {display_name}  —  Starte Stream...")
 
@@ -9614,38 +9640,24 @@ class WiresharkPanel(QWidget):
         self._usb_cam_name_entry.setEnabled(False)
         self._usb_port_entry.setEnabled(False)
 
-        log.info("USB-Kamera Decode gestartet: %s auf Port %d", cam_name, port)
+        log.info("USB-Kamera Decode gestartet: %s (Slot %d)", display_name, usb_slot)
 
-    def _on_usb_frame_received(self, frame):
+    def _on_usb_frame_received(self, frame, slot: int = 3):
         """Empfaengt BGR-Frame von USB-Kamera und leitet an RenderThread."""
         try:
-            target = self._video_displays[0]
+            if slot >= len(self._video_displays):
+                return
+            target = self._video_displays[slot]
             if not target.isVisible():
                 return
             rts = getattr(self, '_render_threads', [])
-            if rts:
+            if slot < len(rts):
                 ds = target.size()
-                rts[0].submit_frame(frame, ds.width(), ds.height())
+                rts[slot].submit_frame(frame, ds.width(), ds.height())
             else:
                 self._render_frame_direct(frame, target)
-
-            # Diagnose: erste 3 Frames loggen
-            _usb_fc = getattr(self, '_usb_diag_count', 0) + 1
-            self._usb_diag_count = _usb_fc
-            if _usb_fc <= 3:
-                h, w = frame.shape[:2]
-                logging.getLogger(__name__).info(
-                    "USB Frame %d empfangen: %dx%d, "
-                    "target_visible=%s, target_size=%dx%d, "
-                    "render_threads=%d",
-                    _usb_fc, w, h,
-                    target.isVisible(),
-                    ds.width() if rts else 0,
-                    ds.height() if rts else 0,
-                    len(rts))
-        except Exception as e:
-            logging.getLogger(__name__).error(
-                "USB Frame Fehler: %s", e)
+        except Exception:
+            pass
 
     def _on_usb_stream_info(self, info: dict):
         """Aktualisiert die USB-Kamera Stream-Info."""
@@ -10096,25 +10108,15 @@ class WiresharkPanel(QWidget):
 
         self._win_ffmpeg_proc = None
 
-    def _on_video_protocol_selected(self, index: int, label: str):
-        """Protokoll-Auswahl im Menü geändert."""
+    def _on_net_proto_toggled(self, index: int, label: str):
+        """Netzwerk-Protokoll gewaehlt (Einzelauswahl: Radio-Logik)."""
+        # Alle anderen Netzwerk-Protokolle abwaehlen
+        for idx, action in self._proto_net_actions.items():
+            action.setChecked(idx == index)
         self._video_protocol_index = index
-        self._video_protocol_btn.setText(label)
+        self._update_protocol_btn_text()
 
-        # USB-Kamera Controls ein-/ausblenden (Index 9 = USB Kamera)
-        is_usb = (index == 9)
-        self._usb_cam_label.setVisible(is_usb)
-        self._usb_cam_name_entry.setVisible(is_usb)
-        # Port-Feld immer anzeigen (beide Plattformen nutzen ffmpeg → UDP)
-        self._usb_port_label.setVisible(is_usb)
-        self._usb_port_entry.setVisible(is_usb)
-
-        # USB-Kamera braucht kein Netzwerk-Capture → Button immer aktivieren
-        if is_usb:
-            self._video_decode_btn.setEnabled(True)
-        elif not self._is_capturing:
-            self._video_decode_btn.setEnabled(False)
-
+        # Laufenden Decoder aktualisieren
         if self._video_decoder:
             proto_map = {
                 0: 'auto', 1: 'tecmp', 2: 'fpdlink', 3: 'tecmp_rtp',
@@ -10122,6 +10124,31 @@ class WiresharkPanel(QWidget):
                 8: 'csi2_0x2090',
             }
             self._video_decoder.set_protocol(proto_map.get(index, 'auto'))
+
+    def _on_usb_proto_toggled(self, checked: bool):
+        """USB Kamera Checkbox umgeschaltet."""
+        is_usb = self._usb_proto_action.isChecked()
+        self._usb_cam_label.setVisible(is_usb)
+        self._usb_cam_name_entry.setVisible(is_usb)
+        self._usb_port_label.setVisible(is_usb and IS_WSL)
+        self._usb_port_entry.setVisible(is_usb and IS_WSL)
+        self._update_protocol_btn_text()
+
+        # Video-Decode Button aktivieren wenn USB gewaehlt (braucht kein Capture)
+        if is_usb:
+            self._video_decode_btn.setEnabled(True)
+        elif not self._is_capturing:
+            self._video_decode_btn.setEnabled(False)
+
+    def _update_protocol_btn_text(self):
+        """Aktualisiert den Button-Text basierend auf aktiven Protokollen."""
+        parts = []
+        for idx, action in self._proto_net_actions.items():
+            if action.isChecked():
+                parts.append(action.text())
+        if self._usb_proto_action.isChecked():
+            parts.append("USB Kamera")
+        self._video_protocol_btn.setText(" + ".join(parts) if parts else "Kein")
 
     # ── Ansicht-Umschalter: Paketanzeige / Video-Einstellungen ──
 
