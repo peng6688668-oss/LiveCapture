@@ -4679,12 +4679,104 @@ class _VideoRenderThread(QThread):
 #  USB-Kamera Capture-Thread: OpenCV VideoCapture
 # ════════════════════════════════════════════════════════════════
 
-class USBCameraCaptureThread(QThread):
-    """Thread fuer USB-Kamera-Capture via OpenCV.
+def _usb_capture_worker(source: str, frame_queue, stop_event):
+    """Eigenstaendiger Prozess fuer V4L2-Capture (isoliert von Qt Event-Loop).
 
-    Unterstuetzt:
-    - UDP-Stream: udp://0.0.0.0:5004  (z.B. von Windows ffmpeg)
-    - Lokale Kamera: /dev/video0 oder numerischer Index
+    Qt's Event-Loop stoert select() in V4L2 → Capture MUSS in
+    eigenem Prozess laufen, nicht in QThread.
+    """
+    import cv2
+    import time
+    import logging
+    log = logging.getLogger("USBCaptureWorker")
+
+    src = source.strip()
+    # /dev/videoN → Index extrahieren
+    if src.startswith('/dev/video'):
+        idx = int(src.replace('/dev/video', ''))
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        backend = "V4L2"
+    elif '://' in src:
+        cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+        backend = "Stream"
+    else:
+        try:
+            idx = int(src)
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            backend = "V4L2"
+        except ValueError:
+            frame_queue.put(('error', f"Ungueltige Quelle: {src}"))
+            return
+
+    if not cap.isOpened():
+        frame_queue.put(('error', f"Quelle '{src}' konnte nicht geoeffnet werden."))
+        if cap:
+            cap.release()
+        return
+
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
+    fourcc_str = "".join([chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)])
+    codec = f"{backend}/{fourcc_str}" if fourcc_str.strip('\x00') else backend
+
+    frame_queue.put(('started', {'resolution': f"{w}x{h}",
+                                  'fps': f"{fps:.0f}", 'codec': codec}))
+
+    frame_count = 0
+    fps_counter = 0
+    fps_last = time.time()
+    current_fps = 0.0
+
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            continue  # V4L2: einfach weiter versuchen
+
+        frame_count += 1
+        fps_counter += 1
+
+        now = time.time()
+        elapsed = now - fps_last
+        if elapsed >= 1.0:
+            current_fps = fps_counter / elapsed
+            fps_counter = 0
+            fps_last = now
+
+        # Frame in Queue legen (maxsize=2 → alte Frames verwerfen)
+        try:
+            if frame_queue.full():
+                try:
+                    frame_queue.get_nowait()
+                except Exception:
+                    pass
+            frame_queue.put_nowait(('frame', frame))
+        except Exception:
+            pass
+
+        if frame_count % 10 == 0:
+            try:
+                frame_queue.put_nowait(('info', {
+                    'resolution': f"{frame.shape[1]}x{frame.shape[0]}",
+                    'fps': f"{current_fps:.1f}",
+                    'codec': codec,
+                    'frames': frame_count,
+                }))
+            except Exception:
+                pass
+
+    cap.release()
+
+
+class USBCameraCaptureThread(QThread):
+    """Bridge zwischen USB-Capture-Prozess und Qt UI.
+
+    V4L2 Capture laeuft in eigenem Prozess (multiprocessing) um
+    Interferenz mit Qt Event-Loop zu vermeiden.
+    Dieser QThread pollt nur die Queue und emittiert Qt-Signale.
     """
 
     frame_ready = pyqtSignal(object)          # numpy BGR-Array
@@ -4696,154 +4788,60 @@ class USBCameraCaptureThread(QThread):
         super().__init__(parent)
         self._source = source
         self._running = True
-        self._frame_count = 0
-        self._fps_counter = 0
-        self._fps_last_time = 0.0
-        self._current_fps = 0.0
-
-    def _open_capture(self):
-        """Oeffnet die Video-Quelle (UDP-Stream oder lokale Kamera)."""
-        src = self._source.strip()
-
-        # UDP/TCP/RTSP Stream — mit Retry (ffmpeg braucht Anlaufzeit,
-        # LI-GW5200 braucht bis zu 30s fuer den ersten Frame)
-        if '://' in src:
-            log = logging.getLogger(__name__)
-            max_retries = 60
-            for attempt in range(max_retries):
-                if not self._running:
-                    return None, src, ""
-                cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-                if cap.isOpened():
-                    log.info("Stream geoeffnet (Versuch %d): %s",
-                             attempt + 1, src)
-                    return cap, src, "Stream"
-                cap.release()
-                if attempt < max_retries - 1:
-                    if attempt % 5 == 0:
-                        log.info("Warte auf Stream (Versuch %d/%d)... %s",
-                                 attempt + 1, max_retries, src)
-                    self.stream_info_updated.emit({
-                        'resolution': '?',
-                        'fps': '?',
-                        'codec': 'Verbinde...',
-                        'frames': 0,
-                    })
-                    time.sleep(1)
-            # Letzter Versuch ohne explizites Backend
-            cap = cv2.VideoCapture(src)
-            if cap.isOpened():
-                return cap, src, "Stream"
-            return cap, src, "Stream"
-
-        # /dev/videoN
-        if src.startswith('/dev/video'):
-            idx = int(src.replace('/dev/video', ''))
-            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            return cap, src, "V4L2"
-
-        # Numerischer Index
-        try:
-            idx = int(src)
-            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            return cap, f"/dev/video{idx}", "V4L2"
-        except ValueError:
-            pass
-
-        return None, src, ""
+        self._process = None
+        self._stop_event = None
 
     def run(self):
+        import multiprocessing
         log = logging.getLogger(__name__)
 
         if not CV2_AVAILABLE:
             self.error.emit("OpenCV (cv2) ist nicht installiert.")
             return
 
-        cap, source_name, backend = self._open_capture()
-        if cap is None or not cap.isOpened():
-            self.error.emit(
-                f"Quelle '{self._source}' konnte nicht geoeffnet werden.")
-            if cap:
-                cap.release()
-            return
+        # Capture-Prozess starten (isoliert von Qt)
+        self._stop_event = multiprocessing.Event()
+        frame_queue = multiprocessing.Queue(maxsize=3)
 
-        # Kamera-Parameter lesen
-        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        actual_fps = cap.get(cv2.CAP_PROP_FPS)
-        fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
-        fourcc_str = "".join(
-            [chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)])
+        self._process = multiprocessing.Process(
+            target=_usb_capture_worker,
+            args=(self._source, frame_queue, self._stop_event),
+            daemon=True, name='USBCapture')
+        self._process.start()
+        log.info("USB-Capture Prozess gestartet (PID %d): %s",
+                 self._process.pid, self._source)
 
-        codec_str = (f"{backend}/{fourcc_str}"
-                     if fourcc_str.strip('\x00') else backend)
-        is_v4l2 = (backend == "V4L2")
-        is_stream = '://' in self._source
+        # Queue pollen und Qt-Signale emittieren
+        while self._running and self._process.is_alive():
+            try:
+                msg = frame_queue.get(timeout=0.1)
+            except Exception:
+                continue
 
-        log.info(
-            "USB-Kamera gestartet: %s  %dx%d  %.1f FPS  %s",
-            source_name, actual_w, actual_h, actual_fps, codec_str)
-
-        self.started_capture.emit()
-        self.stream_info_updated.emit({
-            'resolution': f"{actual_w}x{actual_h}",
-            'fps': f"{actual_fps:.0f}",
-            'codec': codec_str,
-            'frames': 0,
-        })
-
-        self._fps_last_time = time.time()
-        fail_count = 0
-        # V4L2-Kameras mit hoher Aufloesung (z.B. LI-GW5200 2880x1860 YUYV)
-        # liefern oft leere Frames wegen USB-Bandbreite → tolerant sein
-        max_fails = 500 if is_v4l2 else (50 if is_stream else 5)
-
-        while self._running:
-            ret, frame = cap.read()
-            if not ret:
-                fail_count += 1
-                if fail_count <= max_fails:
-                    continue
-                if self._running:
-                    self.error.emit(
-                        f"Kein Frame nach {fail_count} Versuchen. "
-                        f"Kamera liefert keine Daten.")
+            msg_type = msg[0]
+            if msg_type == 'frame':
+                self.frame_ready.emit(msg[1])
+            elif msg_type == 'info':
+                self.stream_info_updated.emit(msg[1])
+            elif msg_type == 'started':
+                self.started_capture.emit()
+                self.stream_info_updated.emit(msg[1])
+            elif msg_type == 'error':
+                self.error.emit(msg[1])
                 break
-            fail_count = 0
 
-            self._frame_count += 1
-            self._fps_counter += 1
-
-            # Aufloesung beim ersten echten Frame aktualisieren
-            if self._frame_count == 1:
-                actual_h, actual_w = frame.shape[:2]
-                log.info("Erster Frame empfangen: %dx%d", actual_w, actual_h)
-
-            now = time.time()
-            elapsed = now - self._fps_last_time
-            if elapsed >= 1.0:
-                self._current_fps = self._fps_counter / elapsed
-                self._fps_counter = 0
-                self._fps_last_time = now
-
-            self.frame_ready.emit(frame)
-
-            if self._frame_count % 10 == 0:
-                self.stream_info_updated.emit({
-                    'resolution': f"{actual_w}x{actual_h}",
-                    'fps': f"{self._current_fps:.1f}",
-                    'codec': codec_str,
-                    'frames': self._frame_count,
-                })
-
-        cap.release()
-        log.info("USB-Kamera gestoppt: %s  (%d Frames)",
-                 source_name, self._frame_count)
+        # Aufraemen
+        if self._process and self._process.is_alive():
+            self._stop_event.set()
+            self._process.join(timeout=3)
+            if self._process.is_alive():
+                self._process.kill()
+        log.info("USB-Capture Prozess beendet")
 
     def stop(self):
         self._running = False
+        if self._stop_event:
+            self._stop_event.set()
 
 
 # ════════════════════════════════════════════════════════════════
