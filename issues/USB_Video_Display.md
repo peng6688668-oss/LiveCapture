@@ -102,5 +102,36 @@ spawn 虽然不继承 Qt 状态，但可能继承了某些内核层面的 socket
 
 ## 待尝试
 
-### 尝试 8: guvcview / leopard_cam (备选)
-Leopard 文档推荐的 Linux 工具，如果 spawn 方案失败可以分析其 V4L2 配置。
+### 尝试 8: subprocess.Popen + Unix Socket (完全独立进程)
+**方法:** `core/usb_capture_worker.py` 独立脚本，通过 Unix Domain Socket 传 JPEG 帧
+**结果:** ⚠️ 部分成功 — subprocess 正确隔离(无 select timeout 错误)，帧到达 RenderThread
+但 UVC 驱动仍在数秒后崩溃，/dev/video0 消失。subprocess CPU 65.7% (空转)。
+
+### 发现: UVC 驱动崩溃是硬件/固件层面问题
+- USB 重置 + 模块重载后仍然 0 帧 select timeout
+- 摄像头可能进入了需要完整电源循环才能恢复的坏状态
+- Leopard 文档要求: **12V 电源必须在 USB 之前连接** (步骤不可逆)
+- 之前 22fps 的独立测试是在摄像头新鲜连接时进行的
+
+### 待尝试: 完整电源循环后重新测试
+1. 拔 USB → 拔 12V → 等 5 秒 → 接 12V → 接 USB
+2. 验证独立脚本是否仍能 22fps
+3. 如果是，用 subprocess 方案在 LiveCapture 中测试
+
+### 尝试 9: CPU 绑定 (taskset)
+**方法:** 把 worker 绑定到 USB 中断所在的 CPU 10
+**结果:** ❌ 无效
+
+### 尝试 10: 决定性测试 — LiveCapture 运行时独立脚本
+**方法:** 杀掉 worker 后手动运行独立 Python 脚本（LiveCapture 主进程仍在运行）
+**结果:** ❌ 独立脚本也超时！证明主进程在系统层面干扰 USB
+
+### 根因确认: llvmpipe 软件渲染吃光 CPU
+**发现:** `top -H` 显示 12 个 `llvmpipe` 线程各占 10% CPU = 120% 总 CPU
+- llvmpipe = Mesa 软件 OpenGL（远程机器没有 GPU）
+- Qt WebEngine 的 Chromium 渲染器触发了软件 OpenGL
+- 系统负载 11.0（16 核机器），USB 中断无法及时处理
+
+### 修复: LP_NUM_THREADS=2
+**方法:** 在 `run.py` 中设置 `os.environ.setdefault('LP_NUM_THREADS', '2')`
+**预期:** llvmpipe 从 12 线程降到 2 线程，释放 ~100% CPU，USB 中断恢复正常

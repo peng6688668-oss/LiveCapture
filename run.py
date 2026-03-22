@@ -17,6 +17,11 @@ setup_qt_platform()
 import os
 if os.geteuid() == 0:
     os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--no-sandbox'
+
+# Mesa llvmpipe Software-Renderer: Thread-Anzahl begrenzen
+# Ohne GPU erstellt Mesa 12+ Threads die ~120% CPU verbrauchen
+# und USB-Interrupt-Verarbeitung blockieren (→ V4L2 select timeout)
+os.environ.setdefault('LP_NUM_THREADS', '2')
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
 except ImportError:
