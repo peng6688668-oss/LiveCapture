@@ -9359,12 +9359,18 @@ class WiresharkPanel(QWidget):
             self._pending_counter_ifaces = None
 
         # ── Render-Threads starten (4 Slots, je 1 Thread) ──
-        self._render_threads: list = []
+        # Bestehende Threads (z.B. von USB-Kamera) beibehalten
+        rts = getattr(self, '_render_threads', [])
         for idx in range(4):
+            if idx < len(rts) and rts[idx].isRunning():
+                continue  # Bereits laufender Thread (z.B. USB Slot 3)
+            while len(rts) <= idx:
+                rts.append(None)
             rt = _VideoRenderThread(idx, parent=self)
             rt.image_ready.connect(self._on_render_ready)
             rt.start()
-            self._render_threads.append(rt)
+            rts[idx] = rt
+        self._render_threads = rts
 
         # ── FrameDispatchThread starten (ersetzt QSocketNotifier) ──
         if self._afpacket_workers and self._afpacket_conns:
@@ -10133,6 +10139,14 @@ class WiresharkPanel(QWidget):
         self._usb_port_label.setVisible(is_usb and IS_WSL)
         self._usb_port_entry.setVisible(is_usb and IS_WSL)
         self._update_protocol_btn_text()
+
+        # Auto-Erkennung: Kameraname eintragen wenn leer
+        if is_usb and not IS_WSL:
+            current = self._usb_cam_name_entry.text().strip()
+            if not current:
+                cameras = self._detect_usb_cameras()
+                if cameras:
+                    self._usb_cam_name_entry.setText(cameras[0][2])
 
         # Video-Decode Button aktivieren wenn USB gewaehlt (braucht kein Capture)
         if is_usb:
