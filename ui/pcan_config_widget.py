@@ -155,9 +155,9 @@ class PcanCanPage(QWidget):
         self._sim_dbc_name = ''
         self._sim_seq_index = 0
         self._sim_pattern_counter = 0
-        self._sim_cca_enabled = False
-        self._sim_cca_socket: Optional[socket.socket] = None
-        self._sim_cca_counter = 0
+        self._sim_send_enabled = False
+        self._sim_send_socket: Optional[socket.socket] = None
+        self._sim_send_counter = 0
         # RTT: can_id → deque of (send_time, sim_frame_nr)
         self._sim_rtt_sent: Dict[int, deque] = {}
         self._init_ui()
@@ -761,7 +761,7 @@ class PcanCanPage(QWidget):
         clayout.setContentsMargins(8, 4, 8, 4)
         clayout.setSpacing(4)
 
-        # Zeile 0: DBC + Pattern
+        # Zeile 0: DBC + Pattern + Protokoll + Netzwerk + senden + RTT
         row0 = QHBoxLayout()
         row0.setSpacing(6)
 
@@ -784,47 +784,45 @@ class PcanCanPage(QWidget):
             "Sinus: Sinuswelle im ersten Byte")
         row0.addWidget(self._sim_pattern_combo)
 
-        row0.addStretch()
-        clayout.addLayout(row0)
+        row0.addWidget(QLabel("Protokoll:"))
+        self._sim_proto_combo = QComboBox()
+        self._sim_proto_combo.addItems(["PLP", "TECMP", "CMP"])
+        self._sim_proto_combo.setMinimumWidth(90)
+        self._sim_proto_combo.setToolTip(
+            "PLP: EtherType 0x2090 (ViGEM Logger)\n"
+            "TECMP: EtherType 0x99FE (Technica CM)\n"
+            "CMP: EtherType 0x99FE (ASAM Standard)")
+        row0.addWidget(self._sim_proto_combo)
 
-        # Zeile 0b: CCA Senden + RTT
-        row_cca = QHBoxLayout()
-        row_cca.setSpacing(6)
+        row0.addWidget(QLabel("Netzwerk:"))
+        self._sim_iface_combo = QComboBox()
+        self._sim_iface_combo.setMinimumWidth(120)
+        self._sim_iface_combo.setToolTip(
+            "Netzwerk-Interface fuer Raw-Ethernet Senden")
+        self._sim_refresh_ifaces()
+        row0.addWidget(self._sim_iface_combo)
 
-        self._sim_cca_toggle = QPushButton("\u2192 CCA senden")
-        self._sim_cca_toggle.setCheckable(True)
-        self._sim_cca_toggle.setMinimumWidth(120)
-        self._sim_cca_toggle.setStyleSheet(
+        self._sim_send_toggle = QPushButton("senden")
+        self._sim_send_toggle.setCheckable(True)
+        self._sim_send_toggle.setMinimumWidth(90)
+        self._sim_send_toggle.setStyleSheet(
             "QPushButton { background: #dcdce5; color: #555;"
             "  border: 1px solid #c0c0c8; border-radius: 3px;"
             "  padding: 3px 8px; font-weight: bold; }"
             "QPushButton:checked { background: #2E7D32;"
             "  color: white; }"
             "QPushButton:hover { background: #d0d0dc; }")
-        self._sim_cca_toggle.toggled.connect(self._sim_toggle_cca)
-        row_cca.addWidget(self._sim_cca_toggle)
-
-        row_cca.addWidget(QLabel("CCA IP:"))
-        self._sim_cca_ip = QLineEdit("192.168.178.254")
-        self._sim_cca_ip.setMaximumWidth(140)
-        self._sim_cca_ip.setFont(_MONO)
-        row_cca.addWidget(self._sim_cca_ip)
-
-        row_cca.addWidget(QLabel("Port:"))
-        self._sim_cca_port = QSpinBox()
-        self._sim_cca_port.setRange(1, 65535)
-        self._sim_cca_port.setValue(50000)
-        self._sim_cca_port.setMaximumWidth(80)
-        row_cca.addWidget(self._sim_cca_port)
+        self._sim_send_toggle.toggled.connect(self._sim_toggle_send)
+        row0.addWidget(self._sim_send_toggle)
 
         self._sim_rtt_label = QLabel("RTT: ---")
         self._sim_rtt_label.setStyleSheet(
             "color: #6A1B9A; font-weight: bold; font-size: 11px;")
         self._sim_rtt_label.setMinimumWidth(120)
-        row_cca.addWidget(self._sim_rtt_label)
+        row0.addWidget(self._sim_rtt_label)
 
-        row_cca.addStretch()
-        clayout.addLayout(row_cca)
+        row0.addStretch()
+        clayout.addLayout(row0)
 
         # Zeile 1: Modus + Intervall + Anzahl
         row1 = QHBoxLayout()
@@ -1100,14 +1098,17 @@ class PcanCanPage(QWidget):
         data_bytes = self._sim_apply_pattern(data_bytes, dlc)
         is_ext = self._sim_ext.isChecked()
 
-        # An CCA senden (TECMP/UDP)
-        self._sim_send_to_cca(can_id, dlc, data_bytes, is_ext)
+        # An Netzwerk senden (PLP/TECMP/CMP)
+        self._sim_send_frame(can_id, dlc, data_bytes, is_ext)
 
         self._sim_frame_count += 1
         elapsed = time.time() - self._sim_start_time
         data_str = ' '.join(f'{b:02X}' for b in data_bytes)
         name = self._sim_dbc_lookup(can_id)
-        cca_tag = "SIM \u2192 CCA" if self._sim_cca_enabled else "SIM"
+        proto = self._sim_proto_combo.currentText() if \
+            self._sim_send_enabled else ""
+        cca_tag = f"SIM \u2192 {proto}" if self._sim_send_enabled \
+            else "SIM"
 
         # 写入 SIM 表格 (循环覆盖预填充行, 淡紫/白 交替)
         row = (self._sim_frame_count - 1) % 30
@@ -1166,14 +1167,16 @@ class PcanCanPage(QWidget):
         # Pattern anwenden
         data_bytes = self._sim_apply_pattern(data_bytes, dlc)
 
-        # An CCA senden (TECMP/UDP)
-        self._sim_send_to_cca(can_id, dlc, data_bytes)
+        # An Netzwerk senden (PLP/TECMP/CMP)
+        self._sim_send_frame(can_id, dlc, data_bytes)
 
         self._sim_frame_count += 1
         elapsed = time.time() - self._sim_start_time
         data_str = ' '.join(f'{b:02X}' for b in data_bytes)
         name = self._sim_dbc_lookup(can_id)
-        cca_tag = f"SEQ[{r}] \u2192 CCA" if self._sim_cca_enabled \
+        proto = self._sim_proto_combo.currentText() if \
+            self._sim_send_enabled else ""
+        cca_tag = f"SEQ[{r}] \u2192 {proto}" if self._sim_send_enabled \
             else f"SEQ[{r}]"
 
         # 写入 SIM 表格 (循环覆盖, 淡紫/白 交替)
@@ -1314,90 +1317,140 @@ class PcanCanPage(QWidget):
                 if item is not None:
                     item.setText("")
 
-    # ── CCA Senden (TECMP/UDP) ────────────────────────────────────────
+    # ── Netzwerk-Interfaces ──────────────────────────────────────────
 
-    def _sim_toggle_cca(self, checked: bool):
-        """Aktiviert/deaktiviert TECMP-UDP Senden an CCA."""
-        self._sim_cca_enabled = checked
+    def _sim_refresh_ifaces(self):
+        """Liest verfuegbare Netzwerk-Interfaces aus /sys/class/net."""
+        self._sim_iface_combo.clear()
+        try:
+            ifaces = sorted(os.listdir('/sys/class/net/'))
+            self._sim_iface_combo.addItems(ifaces)
+        except OSError:
+            self._sim_iface_combo.addItem("eth0")
+
+    @staticmethod
+    def _get_mac(iface: str) -> bytes:
+        """Liest die MAC-Adresse eines Interfaces."""
+        try:
+            with open(f'/sys/class/net/{iface}/address') as f:
+                mac_str = f.read().strip()
+            return bytes.fromhex(mac_str.replace(':', ''))
+        except Exception:
+            return b'\x00\x00\x00\x00\x00\x00'
+
+    # ── Senden (PLP/TECMP/CMP ueber AF_PACKET) ───────────────────────
+
+    def _sim_toggle_send(self, checked: bool):
+        """Aktiviert/deaktiviert Raw-Ethernet Senden."""
+        self._sim_send_enabled = checked
         if checked:
+            iface = self._sim_iface_combo.currentText()
+            proto = self._sim_proto_combo.currentText()
+            ether = 0x2090 if proto == "PLP" else 0x99FE
             try:
-                self._sim_cca_socket = socket.socket(
-                    socket.AF_INET, socket.SOCK_DGRAM)
-                _log.info("CCA UDP-Socket geoeffnet -> %s:%d",
-                          self._sim_cca_ip.text(),
-                          self._sim_cca_port.value())
+                sock = socket.socket(
+                    socket.AF_PACKET, socket.SOCK_RAW,
+                    socket.htons(ether))
+                sock.bind((iface, 0))
+                self._sim_send_socket = sock
+                _log.info("Raw-Socket geoeffnet: %s (EtherType 0x%04X)",
+                          iface, ether)
+            except PermissionError:
+                _log.error("Raw-Socket benoetigt Root-Rechte (CAP_NET_RAW)")
+                QMessageBox.warning(
+                    self, "Berechtigung",
+                    "Raw-Socket benoetigt Root-Rechte.\n"
+                    "Starten Sie LiveCapture mit sudo oder setzen\n"
+                    "Sie CAP_NET_RAW auf das Python-Binary.")
+                self._sim_send_enabled = False
+                self._sim_send_toggle.setChecked(False)
             except Exception as e:
-                _log.error("CCA Socket-Fehler: %s", e)
-                self._sim_cca_enabled = False
-                self._sim_cca_toggle.setChecked(False)
+                _log.error("Socket-Fehler: %s", e)
+                self._sim_send_enabled = False
+                self._sim_send_toggle.setChecked(False)
         else:
-            if self._sim_cca_socket:
-                self._sim_cca_socket.close()
-                self._sim_cca_socket = None
+            if self._sim_send_socket:
+                self._sim_send_socket.close()
+                self._sim_send_socket = None
 
-    def _sim_build_tecmp_can(self, can_id: int, dlc: int,
-                             data_bytes: bytes,
-                             is_ext: bool = False) -> bytes:
-        """Baut ein TECMP-Paket mit CAN-Frame Payload.
+    def _sim_build_can_payload(self, can_id: int, dlc: int,
+                               data_bytes: bytes,
+                               is_ext: bool = False) -> bytes:
+        """Baut den CAN-Frame Payload (gemeinsam fuer alle Protokolle)."""
+        id_raw = can_id | (0x80000000 if is_ext else 0)
+        return struct.pack('>IB', id_raw, dlc) + data_bytes[:dlc]
 
-        TECMP Header (12 Bytes):
-          DeviceID(2) + Counter(2) + Version(1) + MsgType(1)
-          + DataType(2) + Flags(4)
+    def _sim_build_plp_tecmp(self, can_payload: bytes) -> bytes:
+        """Baut PLP/TECMP Protokoll-Daten (Header 12B + Entry 16B + Payload).
 
-        Entry Header (16 Bytes):
-          CM_ID(2) + InterfaceID(2) + Timestamp(8)
-          + DataLength(2) + DataFlags(2)
-
-        CAN Payload:
-          CAN_ID(4) + DLC(1) + Data(DLC)
+        PLP (0x2090) und TECMP (0x99FE) verwenden das gleiche Format.
         """
-        self._sim_cca_counter = (self._sim_cca_counter + 1) & 0xFFFF
-
-        # TECMP Header
+        self._sim_send_counter = (self._sim_send_counter + 1) & 0xFFFF
         device_id = 0xFFFF  # Simulator
         version = 3
         msg_type = 0x0A     # Replay Data
         data_type = 0x0002  # CAN Data
         header = struct.pack('>HH BB HI',
-                             device_id, self._sim_cca_counter,
+                             device_id, self._sim_send_counter,
                              version, msg_type,
                              data_type, 0)
-
-        # CAN Payload
-        id_raw = can_id | (0x80000000 if is_ext else 0)
-        can_payload = struct.pack('>IB', id_raw, dlc) + data_bytes[:dlc]
-
-        # Entry Header
         ts_ns = int(time.time() * 1_000_000_000) & 0xFFFFFFFFFFFFFFFF
         entry = struct.pack('>HH QH H',
-                            0x0000,             # CM_ID
-                            0x0001,             # InterfaceID (CAN-1)
-                            ts_ns,
-                            len(can_payload),   # DataLength
-                            0x0000)             # DataFlags
-
+                            0x0000, 0x0001, ts_ns,
+                            len(can_payload), 0x0000)
         return header + entry + can_payload
 
-    def _sim_send_to_cca(self, can_id: int, dlc: int,
-                         data_bytes: bytes, is_ext: bool = False):
-        """Sendet einen CAN-Frame als TECMP/UDP an die CCA."""
-        if not self._sim_cca_enabled or not self._sim_cca_socket:
+    def _sim_build_cmp(self, can_payload: bytes) -> bytes:
+        """Baut ASAM CMP Protokoll-Daten (Header 8B + Payload).
+
+        Header: CmpVersion(1) + Reserved(1) + DeviceId(2)
+                + MessageType(1) + StreamId(1) + SeqCounter(2)
+        """
+        self._sim_send_counter = (self._sim_send_counter + 1) & 0xFFFF
+        header = struct.pack('>BB HB BH',
+                             0x01,    # CmpVersion
+                             0x00,    # Reserved
+                             0xFFFF,  # DeviceId (Simulator)
+                             0x01,    # MessageType = Data
+                             0x01,    # StreamId
+                             self._sim_send_counter)
+        return header + can_payload
+
+    def _sim_send_frame(self, can_id: int, dlc: int,
+                        data_bytes: bytes, is_ext: bool = False):
+        """Sendet einen CAN-Frame als PLP/TECMP/CMP ueber Raw-Ethernet."""
+        if not self._sim_send_enabled or not self._sim_send_socket:
             return
         try:
-            packet = self._sim_build_tecmp_can(
+            proto = self._sim_proto_combo.currentText()
+            iface = self._sim_iface_combo.currentText()
+            can_payload = self._sim_build_can_payload(
                 can_id, dlc, data_bytes, is_ext)
-            ip = self._sim_cca_ip.text().strip()
-            port = self._sim_cca_port.value()
-            self._sim_cca_socket.sendto(packet, (ip, port))
 
-            # RTT: Zeitstempel fuer diesen CAN-ID merken
+            if proto == "CMP":
+                ether_type = 0x99FE
+                payload = self._sim_build_cmp(can_payload)
+            else:  # PLP oder TECMP
+                ether_type = 0x2090 if proto == "PLP" else 0x99FE
+                payload = self._sim_build_plp_tecmp(can_payload)
+
+            # Ethernet-Frame: dst(6) + src(6) + EtherType(2) + payload
+            src_mac = self._get_mac(iface)
+            dst_mac = b'\xff\xff\xff\xff\xff\xff'  # Broadcast
+            eth_frame = (dst_mac + src_mac
+                         + struct.pack('>H', ether_type)
+                         + payload)
+
+            self._sim_send_socket.send(eth_frame)
+
+            # RTT: Zeitstempel merken
             send_time = time.monotonic()
             if can_id not in self._sim_rtt_sent:
                 self._sim_rtt_sent[can_id] = deque(maxlen=100)
             self._sim_rtt_sent[can_id].append(
                 (send_time, self._sim_frame_count))
         except Exception as e:
-            _log.error("CCA-Senden: %s", e)
+            _log.error("Netzwerk-Senden: %s", e)
 
     # ── RTT Tracking ──────────────────────────────────────────────────
 
