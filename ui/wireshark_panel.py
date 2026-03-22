@@ -9411,25 +9411,85 @@ class WiresharkPanel(QWidget):
             pass
         return cameras
 
+    def _start_linux_ffmpeg(self, device: str, port: int) -> bool:
+        """Startet ffmpeg auf Linux fuer V4L2 → H.264 → UDP Streaming."""
+        log = logging.getLogger(__name__)
+
+        self._stop_win_ffmpeg()  # Wiederverwendung: stoppt auch Linux ffmpeg
+
+        ffmpeg_bin = shutil.which('ffmpeg')
+        if not ffmpeg_bin:
+            QMessageBox.critical(
+                self, "Fehler",
+                "ffmpeg ist nicht installiert.\n\n"
+                "sudo apt install ffmpeg")
+            return False
+
+        cmd = [
+            ffmpeg_bin,
+            '-f', 'v4l2',
+            '-input_format', 'yuyv422',
+            '-i', device,
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-tune', 'zerolatency',
+            '-b:v', '8M',
+            '-g', '10',
+            '-bsf:v', 'dump_extra',
+            '-f', 'mpegts',
+            f'udp://127.0.0.1:{port}?pkt_size=1316',
+        ]
+
+        log.info("Starte Linux ffmpeg: %s", ' '.join(cmd))
+        self._video_info_label.setText("Live Video  —  Starte ffmpeg...")
+
+        try:
+            self._win_ffmpeg_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Fehler",
+                f"ffmpeg konnte nicht gestartet werden:\n{e}")
+            return False
+
+        # Kurz warten bis ffmpeg initialisiert ist
+        time.sleep(2)
+
+        if self._win_ffmpeg_proc.poll() is not None:
+            stderr = self._win_ffmpeg_proc.stderr.read().decode(
+                errors='replace')[-500:]
+            QMessageBox.critical(
+                self, "Fehler",
+                f"ffmpeg wurde sofort beendet.\n\n"
+                f"Geraet '{device}' nicht lesbar?\n\n"
+                f"Fehler:\n{stderr}")
+            self._win_ffmpeg_proc = None
+            return False
+
+        log.info("Linux ffmpeg laeuft (PID %d)", self._win_ffmpeg_proc.pid)
+        return True
+
     def _start_usb_camera_decode(self):
-        """Startet USB-Kamera Capture — Native Linux (V4L2) oder WSL2 (ffmpeg Bridge)."""
+        """Startet USB-Kamera Capture — ffmpeg Bridge (WSL2 + natives Linux)."""
         log = logging.getLogger(__name__)
 
         cam_name = self._usb_cam_name_entry.text().strip()
-        port_str = self._usb_port_entry.text().strip()
+        port_str = self._usb_port_entry.text().strip() or "5004"
+
+        try:
+            port = int(port_str)
+        except ValueError:
+            port = 5004
 
         if IS_WSL:
-            # ── WSL2: ffmpeg.exe DirectShow Bridge ──
+            # ── WSL2: ffmpeg.exe DirectShow → UDP ──
             if not cam_name:
                 QMessageBox.warning(self, "Fehler",
                                     "Bitte einen Kamera-Namen eingeben.")
-                self._video_decode_btn.setChecked(False)
-                return
-            try:
-                port = int(port_str)
-            except ValueError:
-                QMessageBox.warning(self, "Fehler",
-                                    "Ungueltige Port-Nummer.")
                 self._video_decode_btn.setChecked(False)
                 return
 
@@ -9439,7 +9499,7 @@ class WiresharkPanel(QWidget):
             source = f"udp://0.0.0.0:{port}"
             display_name = cam_name
         else:
-            # ── Natives Linux: V4L2 direkt via OpenCV ──
+            # ── Natives Linux: ffmpeg V4L2 → H.264 → UDP ──
             cameras = self._detect_usb_cameras()
             if not cameras:
                 QMessageBox.warning(
@@ -9450,7 +9510,7 @@ class WiresharkPanel(QWidget):
                 self._video_decode_btn.setChecked(False)
                 return
 
-            # Erste Kamera verwenden oder passende suchen
+            # Passende Kamera suchen
             matched = None
             if cam_name:
                 for dev, idx, name in cameras:
@@ -9460,9 +9520,14 @@ class WiresharkPanel(QWidget):
             if matched is None:
                 matched = cameras[0]
 
-            source = matched[0]  # /dev/videoN
+            device = matched[0]  # /dev/videoN
             display_name = matched[2]
-            log.info("V4L2 Kamera erkannt: %s (%s)", display_name, source)
+            log.info("V4L2 Kamera erkannt: %s (%s)", display_name, device)
+
+            if not self._start_linux_ffmpeg(device, port):
+                self._video_decode_btn.setChecked(False)
+                return
+            source = f"udp://127.0.0.1:{port}"
 
         # Render-Threads starten (1 Slot fuer USB-Kamera)
         self._render_threads = []
