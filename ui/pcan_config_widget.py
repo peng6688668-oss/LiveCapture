@@ -862,7 +862,16 @@ class PcanCanPage(QWidget):
         row2 = QHBoxLayout()
         row2.setSpacing(6)
 
-        row2.addWidget(QLabel("ID:"))
+        row2.addWidget(QLabel("Device ID:"))
+        self._sim_device_id = QLineEdit("0xFFFF")
+        self._sim_device_id.setMaximumWidth(70)
+        self._sim_device_id.setFont(_MONO)
+        self._sim_device_id.setToolTip(
+            "PLP/TECMP/CMP Geraete-ID\n"
+            "(wird im Protokoll-Header verwendet)")
+        row2.addWidget(self._sim_device_id)
+
+        row2.addWidget(QLabel("CAN ID:"))
         self._sim_id = QLineEdit("0x100")
         self._sim_id.setMaximumWidth(90)
         self._sim_id.setFont(_MONO)
@@ -1378,6 +1387,15 @@ class PcanCanPage(QWidget):
                 self._sim_send_socket.close()
                 self._sim_send_socket = None
 
+    def _sim_get_device_id(self) -> int:
+        """Liest die Device ID aus dem Eingabefeld."""
+        try:
+            text = self._sim_device_id.text().strip()
+            return int(text, 16) if text.lower().startswith(
+                '0x') else int(text)
+        except (ValueError, Exception):
+            return 0xFFFF
+
     def _sim_build_can_payload(self, can_id: int, dlc: int,
                                data_bytes: bytes,
                                is_ext: bool = False) -> bytes:
@@ -1391,7 +1409,7 @@ class PcanCanPage(QWidget):
         PLP (0x2090) und TECMP (0x99FE) verwenden das gleiche Format.
         """
         self._sim_send_counter = (self._sim_send_counter + 1) & 0xFFFF
-        device_id = 0xFFFF  # Simulator
+        device_id = self._sim_get_device_id()
         version = 3
         msg_type = 0x0A     # Replay Data
         data_type = 0x0002  # CAN Data
@@ -1412,10 +1430,11 @@ class PcanCanPage(QWidget):
                 + MessageType(1) + StreamId(1) + SeqCounter(2)
         """
         self._sim_send_counter = (self._sim_send_counter + 1) & 0xFFFF
+        device_id = self._sim_get_device_id()
         header = struct.pack('>BB HB BH',
                              0x01,    # CmpVersion
                              0x00,    # Reserved
-                             0xFFFF,  # DeviceId (Simulator)
+                             device_id,
                              0x01,    # MessageType = Data
                              0x01,    # StreamId
                              self._sim_send_counter)
