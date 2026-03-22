@@ -236,9 +236,173 @@ BusType = 0x4302 (可能随CAN配置变化，之前是0x3DDE)
 3. 关闭 Raw Socket
 ```
 
-## 7. 待验证 (更新)
+## 7. 实现的 UI 布局
+
+### 7.1 CAN Simulator 界面
+
+```
+Row 0: [DBC] | Pattern:[▼] | Protokoll:[PLP▼] | Netzwerk:[eno3▼] | ☑Echo-Filter | RTT:---
+Row 1: Modus:[Zyklisch▼] | Intervall:[100ms] | Anzahl:[Endlos]
+Row 2: DevID:[0x0041] | CM:[0x000F] | IF:[0x0013] | CAN ID:[0x069] | Ext | DLC:[8] | Daten:[...] | [▶ Generieren] | [▶ Start] | [⬛ Stop]
+```
+
+### 7.2 控件说明
+
+| 控件 | 默认值 | 来源 | 说明 |
+|------|--------|------|------|
+| DevID | 0x0041 | PLP Header [0:2] | 设备标识 (CM CAN Combo = 0x0041) |
+| CM | 0x000F | Entry Header [0:2] | Capture Module ID (Status消息中使用) |
+| IF | 0x0013 | Entry Header [2:4] | Interface ID = CAN通道号 (= CCA bus_id) |
+| CAN ID | 0x069 | CAN Payload [0:4] | CAN帧的Arbitration ID |
+| Protokoll | PLP | — | PLP(0x2090) / TECMP(0x99FE) / CMP(0x99FE) |
+| Netzwerk | eno3 | — | 发送用的网口 |
+| Echo-Filter | ☑ | — | 过滤RX中自发帧 (Src MAC = 本机) |
+
+## 8. Start/Stop 完整流程
+
+### 8.1 Start 流程
+
+```
+用户点击 [▶ Start]:
+  │
+  ├── 1. 打开 Raw Socket (AF_PACKET, eno3, EtherType=0x2090)
+  │
+  ├── 2. 启动 Status Timer (每1秒):
+  │     ├── 发送 Status Device (MsgType=0x01)
+  │     │     DevID=0x0041, CM_ID=0x000F, InterfaceID=0xFF02
+  │     │     DataLen=46, DataFlags=0x0F00
+  │     │     → CCA 识别设备
+  │     │
+  │     └── 发送 Status Bus (MsgType=0x02)
+  │           DevID=0x0041, CM_ID=0x000F, InterfaceID=0xFF00
+  │           DataLen=120, DataFlags=0x0000
+  │           Payload 包含 Bus 列表: IF=0x0013, BusType=0x4302
+  │           → CCA 创建 PLP 接口, bus 出现在 Interfaces > PLP
+  │
+  ├── 3. 立即发送第一组 Status (不等1秒)
+  │
+  └── 4. 启动 Data Timer (按用户设定的间隔):
+        └── 每N ms 发送 Log Stream (MsgType=0x03)
+              DevID=0x0041, DataType=0x0002 (CAN Data)
+              CM_ID=0x0000, InterfaceID=0x0013
+              DataFlags=0x0001, Flags=0x00000007
+              CAN Payload: CAN_ID + DLC + Data
+              目标 MAC: 01:00:5e:00:00:00 (组播)
+```
+
+### 8.2 Stop 流程
+
+```
+用户点击 [⬛ Stop]:
+  │
+  ├── 1. 停止 Data Timer
+  ├── 2. 停止 Status Timer
+  └── 3. 关闭 Raw Socket
+```
+
+### 8.3 Generieren (单次发送)
+
+```
+用户点击 [▶ Generieren]:
+  │
+  ├── 1. 临时打开 Raw Socket
+  ├── 2. 发送一帧 Log Stream CAN Data
+  └── 3. 关闭 Raw Socket
+  注: 单次发送不发 Status 消息
+```
+
+## 9. 数据流全链路
+
+### 9.1 发送链路 (Simulator → CCA)
+
+```
+LiveCapture CAN Simulator
+  │ [Start]
+  ▼
+eno3 (Raw Socket, AF_PACKET, 0x2090)
+  │ PLP Status Device + Status Bus (每秒)
+  │ PLP Log Stream CAN Data (每N ms)
+  ▼
+CCA E23 (plp_enabled=true)
+  │
+  ├── plp_processing 1 (解析PLP帧)
+  │     plp_bus_ids 包含 Simulator 注册的 bus (IF=0x0013)
+  │
+  └── plp stream 0 (转发)
+        bus_ids = 0x0013
+        eth_port = E22
+  │
+  ▼
+CCA E22 (输出)
+  │
+  ▼
+eno4 (接收)
+  │ dumpcap 抓包
+  ▼
+LiveCapture RX 表格 (Live CAN)
+  显示 CCA 回传的 CAN 数据帧
+```
+
+### 9.2 对比视图
+
+```
+┌─────────────────────────────┐
+│ SIM — Simulierte CAN-Frames │  ← 本地生成的帧 (淡紫/白 交替行)
+│ Nr.  Zeit    CAN ID  Data   │
+│ 1    0.100   0x069   ...    │
+│ 2    0.200   0x069   ...    │
+├─────────────────────────────┤
+│ RX — Empfangene Daten       │  ← CCA 回传的帧 (从 eno4 接收)
+│ Nr.  Zeit    IF-19   0x069  │
+│ 1    0.105   IF-19   ...    │  ← RTT ≈ 5ms
+│ 2    0.205   IF-19   ...    │
+└─────────────────────────────┘
+```
+
+## 10. CCA 侧配置清单
+
+### 10.1 接收端口 (E23)
+
+```
+Konfiguration > Schnittstellen > E23 > Port:
+  enable = ✓
+  plp_enabled = ✓
+
+Konfiguration > Schnittstellen > E23 > Raw Eth (Sniffer):
+  (可选, 用于调试)
+```
+
+### 10.2 PLP Processing
+
+```
+Konfiguration > Verarbeitung > plp_processing 1:
+  plp_processing_enable = ✓
+  plp_bus_ids = [Simulator注册的bus]  ← Start后出现在列表中
+```
+
+### 10.3 PLP Stream
+
+```
+Konfiguration > Verarbeitung > plp stream 0:
+  enable = ✓
+  bus_ids = [同一个bus]
+  eth_port = E22 (1G)
+```
+
+### 10.4 输出端口 (E22)
+
+```
+Konfiguration > Schnittstellen > E22 > Port:
+  enable = ✓
+  (plp_enabled 可以关闭, E22 只做输出)
+```
+
+## 11. 待验证
 
 - [ ] 模拟的 Status Device/Bus 发送后 CCA 是否创建 PLP 接口
-- [ ] Log Stream 帧 DataLen=15 中最后2字节是否是padding
+- [ ] Status Bus Payload 前14字节的精确结构 (当前简化实现)
+- [ ] Log Stream 帧 DataLen=15 中是否有padding
 - [ ] DataFlags=0x0001 的含义
 - [ ] BusType 0x4302 vs 0x3DDE 的区别 (CAN配置相关?)
+- [ ] 单次 Generieren 不发 Status 消息时 CCA 能否处理
+- [ ] CCA REST API 是否可以自动查询 PLP 接口注册状态
