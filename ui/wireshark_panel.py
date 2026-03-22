@@ -902,7 +902,7 @@ except ImportError:
     SCAPY_AVAILABLE = False
 
 # Pfad zu dumpcap — plattformabhaengig ermittelt
-from core.platform import find_dumpcap as _find_dumpcap
+from core.platform import find_dumpcap as _find_dumpcap, IS_WSL
 DUMPCAP_PATH = _find_dumpcap() or "/mnt/c/Program Files/Wireshark/dumpcap.exe"
 
 
@@ -5699,11 +5699,17 @@ class WiresharkPanel(QWidget):
         live_capture_layout.addWidget(self._usb_cam_label)
 
         self._usb_cam_name_entry = QLineEdit()
-        self._usb_cam_name_entry.setText("LI-GW5200")
-        self._usb_cam_name_entry.setMinimumWidth(120)
-        self._usb_cam_name_entry.setToolTip(
-            "DirectShow-Geraetename der Kamera in Windows.\n"
-            "Tipp: ffmpeg -list_devices true -f dshow -i dummy")
+        if IS_WSL:
+            self._usb_cam_name_entry.setText("LI-GW5200")
+            self._usb_cam_name_entry.setToolTip(
+                "DirectShow-Geraetename der Kamera in Windows.\n"
+                "Tipp: ffmpeg -list_devices true -f dshow -i dummy")
+        else:
+            self._usb_cam_name_entry.setPlaceholderText("Auto-Erkennung")
+            self._usb_cam_name_entry.setToolTip(
+                "Kameraname oder /dev/videoN Index.\n"
+                "Leer lassen fuer Auto-Erkennung der ersten Kamera.")
+        self._usb_cam_name_entry.setMinimumWidth(140)
         live_capture_layout.addWidget(self._usb_cam_name_entry)
 
         self._usb_port_label = QLabel("Port:")
@@ -9370,31 +9376,81 @@ class WiresharkPanel(QWidget):
         backend = "AF_PACKET/MMAP" if self._afpacket_workers else "Software"
         self._video_info_label.setText(f"Live Video [{backend}]  —  Warte auf Signal...")
 
+    def _detect_usb_cameras(self) -> list:
+        """Erkennt angeschlossene USB-Kameras via V4L2."""
+        cameras = []
+        try:
+            import glob
+            for dev in sorted(glob.glob('/dev/video*')):
+                idx_str = dev.replace('/dev/video', '')
+                try:
+                    idx = int(idx_str)
+                except ValueError:
+                    continue
+                # Kameraname aus V4L2 lesen
+                name_path = f'/sys/class/video4linux/video{idx}/name'
+                try:
+                    with open(name_path) as f:
+                        name = f.read().strip()
+                except (OSError, IOError):
+                    name = f"video{idx}"
+                cameras.append((dev, idx, name))
+        except Exception:
+            pass
+        return cameras
+
     def _start_usb_camera_decode(self):
-        """Startet USB-Kamera Capture via Windows ffmpeg → UDP → OpenCV."""
+        """Startet USB-Kamera Capture — Native Linux (V4L2) oder WSL2 (ffmpeg Bridge)."""
         log = logging.getLogger(__name__)
 
         cam_name = self._usb_cam_name_entry.text().strip()
         port_str = self._usb_port_entry.text().strip()
 
-        if not cam_name:
-            QMessageBox.warning(self, "Fehler",
-                                "Bitte einen Kamera-Namen eingeben.")
-            self._video_decode_btn.setChecked(False)
-            return
+        if IS_WSL:
+            # ── WSL2: ffmpeg.exe DirectShow Bridge ──
+            if not cam_name:
+                QMessageBox.warning(self, "Fehler",
+                                    "Bitte einen Kamera-Namen eingeben.")
+                self._video_decode_btn.setChecked(False)
+                return
+            try:
+                port = int(port_str)
+            except ValueError:
+                QMessageBox.warning(self, "Fehler",
+                                    "Ungueltige Port-Nummer.")
+                self._video_decode_btn.setChecked(False)
+                return
 
-        try:
-            port = int(port_str)
-        except ValueError:
-            QMessageBox.warning(self, "Fehler",
-                                "Ungueltige Port-Nummer.")
-            self._video_decode_btn.setChecked(False)
-            return
+            if not self._start_win_ffmpeg(cam_name, port):
+                self._video_decode_btn.setChecked(False)
+                return
+            source = f"udp://0.0.0.0:{port}"
+            display_name = cam_name
+        else:
+            # ── Natives Linux: V4L2 direkt via OpenCV ──
+            cameras = self._detect_usb_cameras()
+            if not cameras:
+                QMessageBox.warning(
+                    self, "Fehler",
+                    "Keine USB-Kamera gefunden.\n\n"
+                    "Bitte sicherstellen, dass eine Kamera "
+                    "angeschlossen ist (/dev/video*).")
+                self._video_decode_btn.setChecked(False)
+                return
 
-        # Windows ffmpeg starten (DirectShow → UDP Stream)
-        if not self._start_win_ffmpeg(cam_name, port):
-            self._video_decode_btn.setChecked(False)
-            return
+            # Erste Kamera verwenden oder passende suchen
+            matched = None
+            if cam_name:
+                for dev, idx, name in cameras:
+                    if cam_name.lower() in name.lower() or cam_name == str(idx):
+                        matched = (dev, idx, name)
+                        break
+            if matched is None:
+                matched = cameras[0]
+
+            source = matched[0]  # /dev/videoN
+            display_name = matched[2]
+            log.info("V4L2 Kamera erkannt: %s (%s)", display_name, source)
 
         # Render-Threads starten (1 Slot fuer USB-Kamera)
         self._render_threads = []
@@ -9404,15 +9460,14 @@ class WiresharkPanel(QWidget):
         self._render_threads.append(rt)
 
         # USB Capture Thread starten
-        source = f"udp://0.0.0.0:{port}"
         self._usb_capture_thread = USBCameraCaptureThread(source, parent=self)
         self._usb_capture_thread.frame_ready.connect(self._on_usb_frame_received)
         self._usb_capture_thread.stream_info_updated.connect(
             self._on_usb_stream_info)
         self._usb_capture_thread.error.connect(self._on_usb_capture_error)
         self._usb_capture_thread.started_capture.connect(
-            lambda: self._video_info_label.setText(
-                f"USB Kamera: {cam_name}  —  Verbunden"))
+            lambda dn=display_name: self._video_info_label.setText(
+                f"USB Kamera: {dn}  —  Verbunden"))
         self._usb_capture_thread.start()
 
         self._video_decode_active = True
@@ -9431,10 +9486,10 @@ class WiresharkPanel(QWidget):
         self._bottom_splitter.hide()
         self._main_splitter.setSizes([360, 540, 0])
         self._video_panels[0].setVisible(True)
-        self._video_id_labels[0].setText(f"USB: {cam_name}")
+        self._video_id_labels[0].setText(f"USB: {display_name}")
         self._video_display.setText("Warte auf USB-Kamera...")
         self._video_info_label.setText(
-            f"USB Kamera: {cam_name}  —  Starte Stream...")
+            f"USB Kamera: {display_name}  —  Starte Stream...")
 
         # Controls deaktivieren
         self._usb_cam_name_entry.setEnabled(False)
@@ -9902,8 +9957,9 @@ class WiresharkPanel(QWidget):
         is_usb = (index == 9)
         self._usb_cam_label.setVisible(is_usb)
         self._usb_cam_name_entry.setVisible(is_usb)
-        self._usb_port_label.setVisible(is_usb)
-        self._usb_port_entry.setVisible(is_usb)
+        # Port-Feld nur auf WSL2 (ffmpeg Bridge), nicht auf nativem Linux
+        self._usb_port_label.setVisible(is_usb and IS_WSL)
+        self._usb_port_entry.setVisible(is_usb and IS_WSL)
 
         # USB-Kamera braucht kein Netzwerk-Capture → Button immer aktivieren
         if is_usb:
