@@ -10524,17 +10524,30 @@ class WiresharkPanel(QWidget):
         self._add_video_settings_stream(stream_id)
 
     def _rearrange_video_grid(self, count: int):
-        """Video-Panels im Grid neu anordnen."""
+        """Video-Panels im Grid neu anordnen.
+
+        Zeigt Netzwerk-Streams (Slot 0..count-1) UND USB-Kamera (Slot 3)
+        wenn diese aktiv ist. Alle sichtbaren Panels nebeneinander.
+        """
         # Alle Panels aus Grid entfernen
         for panel in self._video_panels:
             self._video_grid_layout.removeWidget(panel)
             panel.setVisible(False)
 
-        # Immer 1×N horizontal nebeneinander (eine Zeile)
-        for i in range(min(count, len(self._video_panels))):
-            self._video_grid_layout.addWidget(
-                self._video_panels[i], 0, i)
-            self._video_panels[i].setVisible(True)
+        # Sichtbare Slots sammeln: Netzwerk (0..count-1) + USB (3 wenn aktiv)
+        visible_slots = list(range(min(count, 3)))
+        usb_active = (self._usb_capture_thread is not None
+                      or getattr(self, '_usb_proto_action', None)
+                      and self._usb_proto_action.isChecked())
+        if usb_active and 3 not in visible_slots:
+            visible_slots.append(3)
+
+        # Nebeneinander anordnen
+        for col, slot in enumerate(visible_slots):
+            if slot < len(self._video_panels):
+                self._video_grid_layout.addWidget(
+                    self._video_panels[slot], 0, col)
+                self._video_panels[slot].setVisible(True)
 
     def _save_video_snapshot(self):
         """Speichert den aktuellen Video-Frame als PNG."""
