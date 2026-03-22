@@ -9538,7 +9538,7 @@ class WiresharkPanel(QWidget):
         return True
 
     def _start_usb_camera_decode(self):
-        """Startet USB-Kamera Capture — ffmpeg Bridge (WSL2 + natives Linux)."""
+        """Startet USB-Kamera Capture — WSL2 (ffmpeg Bridge) / Linux (V4L2 direkt)."""
         log = logging.getLogger(__name__)
 
         cam_name = self._usb_cam_name_entry.text().strip()
@@ -9563,7 +9563,7 @@ class WiresharkPanel(QWidget):
             source = f"udp://0.0.0.0:{port}"
             display_name = cam_name
         else:
-            # ── Natives Linux: ffmpeg V4L2 → H.264 → UDP ──
+            # ── Natives Linux: OpenCV V4L2 direkt ──
             cameras = self._detect_usb_cameras()
             if not cameras:
                 QMessageBox.warning(
@@ -9584,14 +9584,9 @@ class WiresharkPanel(QWidget):
             if matched is None:
                 matched = cameras[0]
 
-            device = matched[0]  # /dev/videoN
+            source = matched[0]  # /dev/videoN
             display_name = matched[2]
-            log.info("V4L2 Kamera erkannt: %s (%s)", display_name, device)
-
-            if not self._start_linux_ffmpeg(device, port):
-                self._video_decode_btn.setChecked(False)
-                return
-            source = f"udp://127.0.0.1:{port}"
+            log.info("V4L2 Kamera erkannt: %s (%s)", display_name, source)
 
         # Render-Threads starten (1 Slot fuer USB-Kamera)
         self._render_threads = []
