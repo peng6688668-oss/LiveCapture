@@ -804,19 +804,6 @@ class PcanCanPage(QWidget):
         self._sim_refresh_ifaces()
         row0.addWidget(self._sim_iface_combo)
 
-        self._sim_send_toggle = QPushButton("senden")
-        self._sim_send_toggle.setCheckable(True)
-        self._sim_send_toggle.setMinimumWidth(90)
-        self._sim_send_toggle.setStyleSheet(
-            "QPushButton { background: #dcdce5; color: #555;"
-            "  border: 1px solid #c0c0c8; border-radius: 3px;"
-            "  padding: 3px 8px; font-weight: bold; }"
-            "QPushButton:checked { background: #2E7D32;"
-            "  color: white; }"
-            "QPushButton:hover { background: #d0d0dc; }")
-        self._sim_send_toggle.toggled.connect(self._sim_toggle_send)
-        row0.addWidget(self._sim_send_toggle)
-
         self._sim_rtt_label = QLabel("RTT: ---")
         self._sim_rtt_label.setStyleSheet(
             "color: #6A1B9A; font-weight: bold; font-size: 11px;")
@@ -895,7 +882,7 @@ class PcanCanPage(QWidget):
 
         self._sim_send_btn = QPushButton("\u25b6 Generieren")
         self._sim_send_btn.setMinimumWidth(110)
-        self._sim_send_btn.clicked.connect(self._sim_generate_frame)
+        self._sim_send_btn.clicked.connect(self._sim_generate_single)
         row2.addWidget(self._sim_send_btn)
 
         self._sim_start_btn = QPushButton("\u25b6 Start")
@@ -1092,6 +1079,12 @@ class PcanCanPage(QWidget):
         except Exception:
             return ""
 
+    def _sim_generate_single(self):
+        """Einzelner Frame: Socket oeffnen, senden, schliessen."""
+        self._sim_open_socket()
+        self._sim_generate_frame()
+        self._sim_close_socket()
+
     def _sim_generate_frame(self):
         """Generiert einen CAN-Frame und zeigt ihn in der SIM-Tabelle."""
         try:
@@ -1232,9 +1225,12 @@ class PcanCanPage(QWidget):
             self._sim_stop_periodic()
 
     def _sim_start_periodic(self):
-        """Startet periodische / Sequenz Frame-Generierung."""
+        """Startet periodische Frame-Generierung + Raw-Socket Senden."""
         self._sim_pattern_counter = 0
         mode = self._sim_mode_combo.currentText()
+
+        # Raw-Socket oeffnen fuer Netzwerk-Senden
+        self._sim_open_socket()
 
         self._sim_periodic_timer = QTimer(self)
 
@@ -1256,10 +1252,12 @@ class PcanCanPage(QWidget):
         self._sim_send_btn.setEnabled(False)
 
     def _sim_stop_periodic(self):
-        """Stoppt periodische Frame-Generierung."""
+        """Stoppt periodische Frame-Generierung + schliesst Socket."""
         if self._sim_periodic_timer:
             self._sim_periodic_timer.stop()
             self._sim_periodic_timer = None
+        # Raw-Socket schliessen
+        self._sim_close_socket()
         self._sim_start_btn.setEnabled(True)
         self._sim_stop_btn.setEnabled(False)
         self._sim_send_btn.setEnabled(True)
@@ -1354,38 +1352,45 @@ class PcanCanPage(QWidget):
 
     # ── Senden (PLP/TECMP/CMP ueber AF_PACKET) ───────────────────────
 
-    def _sim_toggle_send(self, checked: bool):
-        """Aktiviert/deaktiviert Raw-Ethernet Senden."""
-        self._sim_send_enabled = checked
-        if checked:
-            iface = self._sim_iface_combo.currentText()
-            proto = self._sim_proto_combo.currentText()
-            ether = 0x2090 if proto == "PLP" else 0x99FE
-            try:
-                sock = socket.socket(
-                    socket.AF_PACKET, socket.SOCK_RAW,
-                    socket.htons(ether))
-                sock.bind((iface, 0))
-                self._sim_send_socket = sock
-                _log.info("Raw-Socket geoeffnet: %s (EtherType 0x%04X)",
-                          iface, ether)
-            except PermissionError:
-                _log.error("Raw-Socket benoetigt Root-Rechte (CAP_NET_RAW)")
-                QMessageBox.warning(
-                    self, "Berechtigung",
-                    "Raw-Socket benoetigt Root-Rechte.\n"
-                    "Starten Sie LiveCapture mit sudo oder setzen\n"
-                    "Sie CAP_NET_RAW auf das Python-Binary.")
-                self._sim_send_enabled = False
-                self._sim_send_toggle.setChecked(False)
-            except Exception as e:
-                _log.error("Socket-Fehler: %s", e)
-                self._sim_send_enabled = False
-                self._sim_send_toggle.setChecked(False)
-        else:
-            if self._sim_send_socket:
-                self._sim_send_socket.close()
-                self._sim_send_socket = None
+    @staticmethod
+    def _sim_dbg(msg: str):
+        """Debug-Log in /tmp/sim_debug.log."""
+        try:
+            with open('/tmp/sim_debug.log', 'a') as f:
+                f.write(f"{time.time():.3f} {msg}\n")
+        except Exception:
+            pass
+
+    def _sim_open_socket(self):
+        """Oeffnet Raw-Socket fuer das gewaehlte Interface/Protokoll."""
+        iface = self._sim_iface_combo.currentText()
+        proto = self._sim_proto_combo.currentText()
+        ether = 0x2090 if proto == "PLP" else 0x99FE
+        try:
+            sock = socket.socket(
+                socket.AF_PACKET, socket.SOCK_RAW,
+                socket.htons(ether))
+            sock.bind((iface, 0))
+            self._sim_send_socket = sock
+            self._sim_send_enabled = True
+            self._sim_dbg(f"Socket OK: {iface} 0x{ether:04X}")
+        except PermissionError:
+            _log.error("Raw-Socket benoetigt Root-Rechte")
+            QMessageBox.warning(
+                self, "Berechtigung",
+                "Raw-Socket benoetigt Root-Rechte.\n"
+                "Starten Sie LiveCapture mit sudo.")
+            self._sim_send_enabled = False
+        except Exception as e:
+            _log.error("Socket-Fehler: %s", e)
+            self._sim_send_enabled = False
+
+    def _sim_close_socket(self):
+        """Schliesst den Raw-Socket."""
+        self._sim_send_enabled = False
+        if self._sim_send_socket:
+            self._sim_send_socket.close()
+            self._sim_send_socket = None
 
     def _sim_get_device_id(self) -> int:
         """Liest die Device ID aus dem Eingabefeld."""
@@ -1445,6 +1450,7 @@ class PcanCanPage(QWidget):
         """Sendet einen CAN-Frame als PLP/TECMP/CMP ueber Raw-Ethernet."""
         if not self._sim_send_enabled or not self._sim_send_socket:
             return
+        self._sim_dbg(f"send_frame CAN=0x{can_id:03X} dlc={dlc}")
         try:
             proto = self._sim_proto_combo.currentText()
             iface = self._sim_iface_combo.currentText()
@@ -1465,7 +1471,10 @@ class PcanCanPage(QWidget):
                          + struct.pack('>H', ether_type)
                          + payload)
 
-            self._sim_send_socket.send(eth_frame)
+            sent = self._sim_send_socket.send(eth_frame)
+            print(f"[SIM] TX: {sent}B via {iface} "
+                  f"{proto}(0x{ether_type:04X}) "
+                  f"CAN=0x{can_id:03X}", flush=True)
 
             # RTT: Zeitstempel merken
             send_time = time.monotonic()
