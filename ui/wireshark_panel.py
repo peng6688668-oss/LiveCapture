@@ -4712,12 +4712,17 @@ class USBCameraCaptureThread(QThread):
         # /dev/videoN
         if src.startswith('/dev/video'):
             idx = int(src.replace('/dev/video', ''))
-            return cv2.VideoCapture(idx), src, "V4L2"
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            # Buffer-Groesse minimieren fuer niedrigste Latenz
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            return cap, src, "V4L2"
 
         # Numerischer Index
         try:
             idx = int(src)
-            return cv2.VideoCapture(idx), f"/dev/video{idx}", "V4L2"
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            return cap, f"/dev/video{idx}", "V4L2"
         except ValueError:
             pass
 
@@ -4748,6 +4753,8 @@ class USBCameraCaptureThread(QThread):
 
         codec_str = (f"{backend}/{fourcc_str}"
                      if fourcc_str.strip('\x00') else backend)
+        is_v4l2 = (backend == "V4L2")
+        is_stream = '://' in self._source
 
         log.info(
             "USB-Kamera gestartet: %s  %dx%d  %.1f FPS  %s",
@@ -4763,17 +4770,20 @@ class USBCameraCaptureThread(QThread):
 
         self._fps_last_time = time.time()
         fail_count = 0
-        is_stream = '://' in self._source
+        # V4L2-Kameras mit hoher Aufloesung (z.B. LI-GW5200 2880x1860 YUYV)
+        # liefern oft leere Frames wegen USB-Bandbreite → tolerant sein
+        max_fails = 500 if is_v4l2 else (50 if is_stream else 5)
 
         while self._running:
             ret, frame = cap.read()
             if not ret:
                 fail_count += 1
-                # Bei Streams: Initiale Sync-Phase tolerieren
-                if is_stream and fail_count <= 50:
+                if fail_count <= max_fails:
                     continue
                 if self._running:
-                    self.error.emit("Frame konnte nicht gelesen werden.")
+                    self.error.emit(
+                        f"Kein Frame nach {fail_count} Versuchen. "
+                        f"Kamera liefert keine Daten.")
                 break
             fail_count = 0
 
@@ -4783,6 +4793,7 @@ class USBCameraCaptureThread(QThread):
             # Aufloesung beim ersten echten Frame aktualisieren
             if self._frame_count == 1:
                 actual_h, actual_w = frame.shape[:2]
+                log.info("Erster Frame empfangen: %dx%d", actual_w, actual_h)
 
             now = time.time()
             elapsed = now - self._fps_last_time
@@ -4802,7 +4813,8 @@ class USBCameraCaptureThread(QThread):
                 })
 
         cap.release()
-        log.info("USB-Kamera gestoppt: %s", source_name)
+        log.info("USB-Kamera gestoppt: %s  (%d Frames)",
+                 source_name, self._frame_count)
 
     def stop(self):
         self._running = False
