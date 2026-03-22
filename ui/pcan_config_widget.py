@@ -804,6 +804,13 @@ class PcanCanPage(QWidget):
         self._sim_refresh_ifaces()
         row0.addWidget(self._sim_iface_combo)
 
+        self._sim_echo_filter = QCheckBox("Echo-Filter")
+        self._sim_echo_filter.setChecked(True)
+        self._sim_echo_filter.setToolTip(
+            "Eigene Frames in RX herausfiltern\n"
+            "(Src MAC = lokales Interface)")
+        row0.addWidget(self._sim_echo_filter)
+
         self._sim_rtt_label = QLabel("RTT: ---")
         self._sim_rtt_label.setStyleSheet(
             "color: #6A1B9A; font-weight: bold; font-size: 11px;")
@@ -1484,6 +1491,22 @@ class PcanCanPage(QWidget):
                 (send_time, self._sim_frame_count))
         except Exception as e:
             _log.error("Netzwerk-Senden: %s", e)
+
+    # ── Echo-Filter ────────────────────────────────────────────────────
+
+    def should_filter_echo(self, src_mac_bytes: bytes) -> bool:
+        """Prueft ob ein Frame mit dieser Src-MAC gefiltert werden soll.
+
+        Gibt True zurueck wenn Echo-Filter aktiv UND src_mac
+        dem aktuellen Sende-Interface entspricht.
+        """
+        if not self._sim_echo_filter.isChecked():
+            return False
+        if not self._sim_send_enabled:
+            return False
+        iface = self._sim_iface_combo.currentText()
+        our_mac = self._get_mac(iface)
+        return src_mac_bytes == our_mac
 
     # ── RTT Tracking ──────────────────────────────────────────────────
 

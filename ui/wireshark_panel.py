@@ -8845,6 +8845,12 @@ class WiresharkPanel(QWidget):
     def _route_cmp_to_bus_tables(self, pkt):
         """Extrahiert Bus-Daten aus ASAM CMP-Paketen und routet sie in die Bus-Tabellen."""
         try:
+            # Echo-Filter: eigene Frames herausfiltern
+            if hasattr(self, '_pcan_page') and Ether in pkt:
+                src_mac = bytes.fromhex(pkt[Ether].src.replace(':', ''))
+                if self._pcan_page.should_filter_echo(src_mac):
+                    return
+
             raw = self._extract_tecmp_payload(pkt)
             if raw is None or len(raw) < 8:
                 return
@@ -9052,6 +9058,12 @@ class WiresharkPanel(QWidget):
     def _route_tecmp_to_bus_tables(self, pkt):
         """Extrahiert Bus-Daten aus TECMP-Paketen und routet sie in die Bus-Tabellen."""
         try:
+            # Echo-Filter: eigene Frames herausfiltern
+            if hasattr(self, '_pcan_page') and Ether in pkt:
+                src_mac = bytes.fromhex(pkt[Ether].src.replace(':', ''))
+                if self._pcan_page.should_filter_echo(src_mac):
+                    return
+
             tecmp_data = self._extract_tecmp_payload(pkt)
             if tecmp_data is None:
                 return
