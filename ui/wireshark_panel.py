@@ -4705,20 +4705,30 @@ class USBCameraCaptureThread(QThread):
         """Oeffnet die Video-Quelle (UDP-Stream oder lokale Kamera)."""
         src = self._source.strip()
 
-        # UDP/TCP/RTSP Stream — mit Retry (ffmpeg braucht Anlaufzeit)
+        # UDP/TCP/RTSP Stream — mit Retry (ffmpeg braucht Anlaufzeit,
+        # LI-GW5200 braucht bis zu 30s fuer den ersten Frame)
         if '://' in src:
             log = logging.getLogger(__name__)
-            for attempt in range(10):
-                # Zuerst mit FFMPEG-Backend, dann ohne
+            max_retries = 60
+            for attempt in range(max_retries):
+                if not self._running:
+                    return None, src, ""
                 cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
                 if cap.isOpened():
                     log.info("Stream geoeffnet (Versuch %d): %s",
                              attempt + 1, src)
                     return cap, src, "Stream"
                 cap.release()
-                if attempt < 9:
-                    log.info("Stream noch nicht bereit (Versuch %d/10), "
-                             "warte 1s...", attempt + 1)
+                if attempt < max_retries - 1:
+                    if attempt % 5 == 0:
+                        log.info("Warte auf Stream (Versuch %d/%d)... %s",
+                                 attempt + 1, max_retries, src)
+                    self.stream_info_updated.emit({
+                        'resolution': '?',
+                        'fps': '?',
+                        'codec': 'Verbinde...',
+                        'frames': 0,
+                    })
                     time.sleep(1)
             # Letzter Versuch ohne explizites Backend
             cap = cv2.VideoCapture(src)
@@ -9466,10 +9476,12 @@ class WiresharkPanel(QWidget):
                 "sudo apt install ffmpeg")
             return False
 
+        # -thread_queue_size: groesserer V4L2-Eingabepuffer
+        # Kein -input_format: ffmpeg soll selbst verhandeln
         cmd = [
             ffmpeg_bin,
             '-f', 'v4l2',
-            '-input_format', 'yuyv422',
+            '-thread_queue_size', '1024',
             '-i', device,
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
@@ -9482,27 +9494,38 @@ class WiresharkPanel(QWidget):
         ]
 
         log.info("Starte Linux ffmpeg: %s", ' '.join(cmd))
-        self._video_info_label.setText("Live Video  —  Starte ffmpeg...")
+        self._video_info_label.setText(
+            "Live Video  —  Starte ffmpeg (Kamera-Sync kann 15-30s dauern)...")
+
+        # stderr in Logdatei umleiten fuer Diagnose
+        self._ffmpeg_log = open('/tmp/livecapture_ffmpeg.log', 'w')
 
         try:
             self._win_ffmpeg_proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stderr=self._ffmpeg_log,
                 stdin=subprocess.PIPE,
             )
         except Exception as e:
+            self._ffmpeg_log.close()
             QMessageBox.critical(
                 self, "Fehler",
                 f"ffmpeg konnte nicht gestartet werden:\n{e}")
             return False
 
-        # Kurz warten bis ffmpeg initialisiert ist
-        time.sleep(2)
+        # Nur kurz pruefen ob ffmpeg sofort abstuerzt (nicht lange blockieren)
+        time.sleep(1)
 
         if self._win_ffmpeg_proc.poll() is not None:
-            stderr = self._win_ffmpeg_proc.stderr.read().decode(
-                errors='replace')[-500:]
+            # stderr aus Logdatei lesen
+            self._ffmpeg_log.close()
+            self._ffmpeg_log = None
+            try:
+                with open('/tmp/livecapture_ffmpeg.log') as f:
+                    stderr = f.read()[-500:]
+            except Exception:
+                stderr = "(kein Log)"
             QMessageBox.critical(
                 self, "Fehler",
                 f"ffmpeg wurde sofort beendet.\n\n"
@@ -10043,7 +10066,16 @@ class WiresharkPanel(QWidget):
         return True
 
     def _stop_win_ffmpeg(self):
-        """Stoppt den Windows ffmpeg-Prozess."""
+        """Stoppt den ffmpeg-Prozess (Windows oder Linux)."""
+        # Logdatei schliessen
+        _flog = getattr(self, '_ffmpeg_log', None)
+        if _flog:
+            try:
+                _flog.close()
+            except Exception:
+                pass
+            self._ffmpeg_log = None
+
         if self._win_ffmpeg_proc is None:
             return
 
@@ -10054,15 +10086,15 @@ class WiresharkPanel(QWidget):
                 self._win_ffmpeg_proc.stdin.write(b'q')
                 self._win_ffmpeg_proc.stdin.flush()
             self._win_ffmpeg_proc.wait(timeout=3)
-            log.info("Windows ffmpeg sauber beendet")
+            log.info("ffmpeg sauber beendet")
         except Exception:
             try:
                 self._win_ffmpeg_proc.terminate()
                 self._win_ffmpeg_proc.wait(timeout=2)
-                log.info("Windows ffmpeg terminiert")
+                log.info("ffmpeg terminiert")
             except Exception:
                 self._win_ffmpeg_proc.kill()
-                log.warning("Windows ffmpeg gekillt")
+                log.warning("ffmpeg gekillt")
 
         self._win_ffmpeg_proc = None
 
