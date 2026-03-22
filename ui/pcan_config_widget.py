@@ -8,7 +8,9 @@ Integriert sich in die bestehende Live CAN Seite des WiresharkPanels:
 """
 
 import logging
+import math
 import os
+import random
 import re
 import subprocess
 import time
@@ -144,6 +146,10 @@ class PcanCanPage(QWidget):
         self._sim_frame_count = 0
         self._sim_start_time = time.time()
         self._sim_periodic_timer: Optional[QTimer] = None
+        self._sim_dbc = None
+        self._sim_dbc_name = ''
+        self._sim_seq_index = 0
+        self._sim_pattern_counter = 0
         self._init_ui()
 
     def _init_ui(self):
@@ -745,14 +751,43 @@ class PcanCanPage(QWidget):
         clayout.setContentsMargins(8, 4, 8, 4)
         clayout.setSpacing(4)
 
-        # Zeile 1: Modus + Intervall
+        # Zeile 0: DBC + Pattern
+        row0 = QHBoxLayout()
+        row0.setSpacing(6)
+
+        self._sim_dbc_btn = QPushButton('DBC...')
+        self._sim_dbc_btn.setToolTip(
+            'DBC-Datei laden fuer Signal-Encoding')
+        self._sim_dbc_btn.setMinimumWidth(65)
+        self._sim_dbc_btn.clicked.connect(self._sim_load_dbc)
+        row0.addWidget(self._sim_dbc_btn)
+
+        row0.addWidget(QLabel("Pattern:"))
+        self._sim_pattern_combo = QComboBox()
+        self._sim_pattern_combo.addItems(
+            ["Statisch", "Inkrement", "Zufall", "Sinus"])
+        self._sim_pattern_combo.setMinimumWidth(110)
+        self._sim_pattern_combo.setToolTip(
+            "Statisch: Daten unveraendert\n"
+            "Inkrement: Byte-Zaehler +1 pro Frame\n"
+            "Zufall: Zufaellige Daten pro Frame\n"
+            "Sinus: Sinuswelle im ersten Byte")
+        row0.addWidget(self._sim_pattern_combo)
+
+        row0.addStretch()
+        clayout.addLayout(row0)
+
+        # Zeile 1: Modus + Intervall + Anzahl
         row1 = QHBoxLayout()
         row1.setSpacing(6)
 
         row1.addWidget(QLabel("Modus:"))
         self._sim_mode_combo = QComboBox()
-        self._sim_mode_combo.addItems(["Einzeln", "Zyklisch", "Sequenz"])
+        self._sim_mode_combo.addItems(
+            ["Einzeln", "Zyklisch", "Sequenz"])
         self._sim_mode_combo.setMinimumWidth(100)
+        self._sim_mode_combo.currentIndexChanged.connect(
+            self._sim_on_mode_changed)
         row1.addWidget(self._sim_mode_combo)
 
         row1.addWidget(QLabel("Intervall:"))
@@ -829,17 +864,69 @@ class PcanCanPage(QWidget):
         clayout.addLayout(row2)
         page_layout.addWidget(config)
 
+        # ── Sequenz-Tabelle (nur bei Modus "Sequenz" sichtbar) ──
+        self._sim_seq_widget = QWidget()
+        seq_layout = QVBoxLayout(self._sim_seq_widget)
+        seq_layout.setContentsMargins(8, 0, 8, 4)
+        seq_layout.setSpacing(2)
+
+        seq_btn_row = QHBoxLayout()
+        seq_btn_row.setSpacing(4)
+
+        seq_add_btn = QPushButton("+ Zeile")
+        seq_add_btn.setMinimumWidth(80)
+        seq_add_btn.clicked.connect(self._sim_add_seq_row)
+        seq_btn_row.addWidget(seq_add_btn)
+
+        seq_rem_btn = QPushButton("\u2212 Zeile")
+        seq_rem_btn.setMinimumWidth(80)
+        seq_rem_btn.clicked.connect(self._sim_remove_seq_row)
+        seq_btn_row.addWidget(seq_rem_btn)
+
+        seq_btn_row.addStretch()
+        seq_layout.addLayout(seq_btn_row)
+
+        self._sim_seq_table = QTableWidget()
+        self._sim_seq_table.setColumnCount(4)
+        self._sim_seq_table.setHorizontalHeaderLabels(
+            ["ID", "DLC", "Daten", "Delay (ms)"])
+        self._sim_seq_table.setFont(_MONO)
+        self._sim_seq_table.verticalHeader().setVisible(False)
+        self._sim_seq_table.verticalHeader().setDefaultSectionSize(22)
+        self._sim_seq_table.setMaximumHeight(150)
+        sh_seq = self._sim_seq_table.horizontalHeader()
+        sh_seq.setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Stretch)
+        self._sim_seq_table.setColumnWidth(0, 80)
+        self._sim_seq_table.setColumnWidth(1, 50)
+        self._sim_seq_table.setColumnWidth(3, 90)
+        self._sim_seq_table.setStyleSheet(
+            "QTableWidget { background-color: #ffffff; color: #1a1a1a;"
+            "  gridline-color: #ce93d8; }"
+            "QHeaderView::section { background: #f5f5f7; color: #0d0d17;"
+            "  padding: 4px 6px; border: none;"
+            "  border-right: 1px solid #d0d0d8;"
+            "  border-bottom: 1px solid #333333;"
+            "  font-weight: bold; }")
+        self._sim_add_seq_row()  # eine Startzeile
+        seq_layout.addWidget(self._sim_seq_table)
+
+        self._sim_seq_widget.hide()
+        page_layout.addWidget(self._sim_seq_widget)
+
         # ── Simulator TX Header ──
         sim_header = QWidget()
         sim_header.setFixedHeight(22)
-        sim_header.setStyleSheet("background-color: #6A1B9A; color: white;")
+        sim_header.setStyleSheet(
+            "background-color: #6A1B9A; color: white;")
         sim_h = QHBoxLayout(sim_header)
         sim_h.setContentsMargins(4, 0, 4, 0)
         sim_h.setSpacing(8)
 
         sim_title = QLabel("SIM \u2014 Simulierte CAN-Frames")
         sim_title.setStyleSheet(
-            "font-weight: bold; font-size: 11px; background: transparent;")
+            "font-weight: bold; font-size: 11px;"
+            " background: transparent;")
         sim_h.addWidget(sim_title)
         sim_h.addStretch()
 
@@ -857,7 +944,7 @@ class PcanCanPage(QWidget):
 
         page_layout.addWidget(sim_header)
 
-        # ── Simulator Tabelle ──
+        # ── Simulator Tabelle (淡紫/白 交替行) ──
         self._sim_table = QTableWidget()
         self._sim_table.setColumnCount(7)
         self._sim_table.setHorizontalHeaderLabels(
@@ -870,9 +957,11 @@ class PcanCanPage(QWidget):
         self._sim_table.verticalHeader().setVisible(False)
         self._sim_table.verticalHeader().setDefaultSectionSize(22)
         self._sim_table.setShowGrid(True)
+        self._sim_table.setAlternatingRowColors(True)
         self._sim_table.setStyleSheet(
-            "QTableWidget { background-color: #ffffff; color: #1a1a1a;"
-            "  gridline-color: #ce93d8; }"
+            "QTableWidget { background-color: #ffffff;"
+            "  alternate-background-color: #F3E5F5;"
+            "  color: #1a1a1a; gridline-color: #ce93d8; }"
             "QTableWidget::item:selected { background-color: #6A1B9A;"
             "  color: #ffffff; }"
             "QHeaderView::section { background: #f5f5f7; color: #0d0d17;"
@@ -891,8 +980,41 @@ class PcanCanPage(QWidget):
         page_layout.addWidget(self._sim_table, 1)
         return page
 
+    def _sim_apply_pattern(self, data_bytes: bytes, dlc: int) -> bytes:
+        """Wendet das gewaehlte Daten-Pattern auf die Basisdaten an."""
+        pattern = self._sim_pattern_combo.currentText()
+        if pattern == "Statisch":
+            return data_bytes
+        if pattern == "Inkrement":
+            self._sim_pattern_counter += 1
+            c = self._sim_pattern_counter & 0xFF
+            return bytes([(b + c) & 0xFF for b in data_bytes])
+        if pattern == "Zufall":
+            return bytes(random.randint(0, 255) for _ in range(dlc))
+        if pattern == "Sinus":
+            self._sim_pattern_counter += 1
+            # Sinuswelle (Periode 256 Frames) im ersten Byte
+            val = int(127.5 + 127.5 * math.sin(
+                2 * math.pi * self._sim_pattern_counter / 256))
+            out = bytearray(data_bytes)
+            if out:
+                out[0] = val & 0xFF
+            return bytes(out)
+        return data_bytes
+
+    def _sim_dbc_lookup(self, can_id: int) -> str:
+        """Sucht den Nachrichtennamen in der Simulator-DBC."""
+        dbc = self._sim_dbc or self._dbc
+        if dbc is None:
+            return ""
+        try:
+            msg = dbc.get_message_by_frame_id(can_id)
+            return msg.name if msg else ""
+        except Exception:
+            return ""
+
     def _sim_generate_frame(self):
-        """Generiert einen einzelnen CAN-Frame und speist ihn in bus_queues."""
+        """Generiert einen CAN-Frame und zeigt ihn in der SIM-Tabelle."""
         try:
             id_text = self._sim_id.text().strip()
             can_id = int(id_text, 16) if id_text.lower().startswith(
@@ -904,11 +1026,15 @@ class PcanCanPage(QWidget):
             _log.error("CAN Simulator Eingabefehler: %s", e)
             return
 
+        # Pattern anwenden
+        data_bytes = self._sim_apply_pattern(data_bytes, dlc)
+
         self._sim_frame_count += 1
         elapsed = time.time() - self._sim_start_time
         data_str = ' '.join(f'{b:02X}' for b in data_bytes)
+        name = self._sim_dbc_lookup(can_id)
 
-        # In Simulator-Tabelle einfuegen
+        # In Simulator-Tabelle einfuegen (淡紫/白 交替)
         row = self._sim_table.rowCount()
         if row >= _MAX_TX_ROWS:
             self._sim_table.removeRow(0)
@@ -919,7 +1045,7 @@ class PcanCanPage(QWidget):
             str(self._sim_frame_count),
             f"{elapsed:.6f}",
             f"0x{can_id:03X}",
-            "",
+            name,
             str(len(data_bytes)),
             data_str,
             "SIM",
@@ -932,23 +1058,103 @@ class PcanCanPage(QWidget):
         self._sim_table.scrollToBottom()
         self._sim_count_label.setText(f"{self._sim_frame_count} Frames")
 
-        # Frame in gemeinsamen RX-Stream einspeisen
-        row_tuple = (
+        # Anzahl-Limit pruefen (zyklischer Modus)
+        limit = self._sim_count_spin.value()
+        if limit > 0 and self._sim_frame_count >= limit:
+            self._sim_stop_periodic()
+
+    def _sim_generate_seq_frame(self):
+        """Generiert den naechsten Frame aus der Sequenz-Tabelle."""
+        table = self._sim_seq_table
+        if table.rowCount() == 0:
+            self._sim_stop_periodic()
+            return
+
+        r = self._sim_seq_index % table.rowCount()
+        try:
+            id_text = (table.item(r, 0).text().strip()
+                       if table.item(r, 0) else "0x100")
+            can_id = int(id_text, 16) if id_text.lower().startswith(
+                '0x') else int(id_text)
+            dlc = int(table.item(r, 1).text().strip()
+                      if table.item(r, 1) else "8")
+            raw = (table.item(r, 2).text().strip().replace(' ', '')
+                   if table.item(r, 2) else "00" * dlc)
+            data_bytes = bytes.fromhex(raw)[:dlc]
+            delay = int(table.item(r, 3).text().strip()
+                        if table.item(r, 3) else "100")
+        except (ValueError, Exception) as e:
+            _log.error("Sequenz Zeile %d Fehler: %s", r, e)
+            self._sim_seq_index += 1
+            return
+
+        # Pattern anwenden
+        data_bytes = self._sim_apply_pattern(data_bytes, dlc)
+
+        self._sim_frame_count += 1
+        elapsed = time.time() - self._sim_start_time
+        data_str = ' '.join(f'{b:02X}' for b in data_bytes)
+        name = self._sim_dbc_lookup(can_id)
+
+        row = self._sim_table.rowCount()
+        if row >= _MAX_TX_ROWS:
+            self._sim_table.removeRow(0)
+            row = self._sim_table.rowCount()
+        self._sim_table.insertRow(row)
+
+        items = [
+            str(self._sim_frame_count),
             f"{elapsed:.6f}",
-            "SIM",
             f"0x{can_id:03X}",
-            "",
+            name,
             str(len(data_bytes)),
             data_str,
-            "SIM CAN",
-        )
-        self.frame_for_bus_queue.emit(row_tuple)
+            f"SEQ[{r}]",
+        ]
+        for col, text in enumerate(items):
+            item = QTableWidgetItem(text)
+            item.setFont(_MONO)
+            self._sim_table.setItem(row, col, item)
+
+        self._sim_table.scrollToBottom()
+        self._sim_count_label.setText(f"{self._sim_frame_count} Frames")
+
+        self._sim_seq_index += 1
+
+        # Naechsten Delay setzen
+        if self._sim_periodic_timer:
+            next_r = self._sim_seq_index % table.rowCount()
+            try:
+                next_delay = int(table.item(next_r, 3).text().strip()
+                                 if table.item(next_r, 3) else "100")
+            except (ValueError, Exception):
+                next_delay = 100
+            self._sim_periodic_timer.setInterval(next_delay)
+
+        # Anzahl-Limit pruefen
+        limit = self._sim_count_spin.value()
+        if limit > 0 and self._sim_frame_count >= limit:
+            self._sim_stop_periodic()
 
     def _sim_start_periodic(self):
-        """Startet periodische Frame-Generierung."""
+        """Startet periodische / Sequenz Frame-Generierung."""
+        self._sim_pattern_counter = 0
+        mode = self._sim_mode_combo.currentText()
+
         self._sim_periodic_timer = QTimer(self)
-        self._sim_periodic_timer.setInterval(self._sim_interval.value())
-        self._sim_periodic_timer.timeout.connect(self._sim_generate_frame)
+
+        if mode == "Sequenz":
+            self._sim_seq_index = 0
+            self._sim_periodic_timer.setInterval(
+                self._sim_interval.value())
+            self._sim_periodic_timer.timeout.connect(
+                self._sim_generate_seq_frame)
+        else:
+            self._sim_periodic_timer.setInterval(
+                self._sim_interval.value())
+            self._sim_periodic_timer.timeout.connect(
+                self._sim_generate_frame)
+
         self._sim_periodic_timer.start()
         self._sim_start_btn.setEnabled(False)
         self._sim_stop_btn.setEnabled(True)
@@ -962,6 +1168,55 @@ class PcanCanPage(QWidget):
         self._sim_start_btn.setEnabled(True)
         self._sim_stop_btn.setEnabled(False)
         self._sim_send_btn.setEnabled(True)
+
+    def _sim_load_dbc(self):
+        """DBC-Datei laden fuer CAN Simulator Signal-Encoding."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "DBC-Datei laden (Simulator)", "",
+            "DBC-Dateien (*.dbc);;Alle Dateien (*)")
+        if not path:
+            return
+        try:
+            import cantools
+            self._sim_dbc = cantools.database.load_file(path)
+            self._sim_dbc_name = path.rsplit('/', 1)[-1].rsplit(
+                '\\', 1)[-1]
+            self._sim_dbc_btn.setText(f'DBC \u2714')
+            self._sim_dbc_btn.setToolTip(
+                f'{self._sim_dbc_name}\n'
+                f'{len(self._sim_dbc.messages)} Nachrichten\n'
+                'Erneut klicken zum Wechseln')
+            _log.info("Simulator DBC: %s (%d Nachrichten)",
+                       self._sim_dbc_name,
+                       len(self._sim_dbc.messages))
+        except Exception as e:
+            QMessageBox.warning(
+                self, "DBC-Fehler", f"Fehler: {e}")
+
+    def _sim_on_mode_changed(self, index: int):
+        """Zeigt/versteckt Sequenz-Tabelle je nach Modus."""
+        is_seq = (index == 2)  # "Sequenz"
+        self._sim_seq_widget.setVisible(is_seq)
+
+    def _sim_add_seq_row(self):
+        """Fuegt eine Zeile zur Sequenz-Tabelle hinzu."""
+        table = self._sim_seq_table
+        r = table.rowCount()
+        table.insertRow(r)
+        table.setItem(r, 0, QTableWidgetItem("0x100"))
+        table.setItem(r, 1, QTableWidgetItem("8"))
+        table.setItem(r, 2, QTableWidgetItem(
+            "00 00 00 00 00 00 00 00"))
+        table.setItem(r, 3, QTableWidgetItem("100"))
+
+    def _sim_remove_seq_row(self):
+        """Entfernt die ausgewaehlte Zeile aus der Sequenz-Tabelle."""
+        table = self._sim_seq_table
+        row = table.currentRow()
+        if row >= 0:
+            table.removeRow(row)
+        elif table.rowCount() > 0:
+            table.removeRow(table.rowCount() - 1)
 
 
     def _load_dbc(self):
