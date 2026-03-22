@@ -158,6 +158,7 @@ class PcanCanPage(QWidget):
         self._sim_send_enabled = False
         self._sim_send_socket: Optional[socket.socket] = None
         self._sim_send_counter = 0
+        self._sim_status_timer: Optional[QTimer] = None
         self._sim_last_frame_count = 0
         self._smoothed_sim_rate = 0.0
         # RTT: can_id → deque of (send_time, sim_frame_nr)
@@ -856,14 +857,34 @@ class PcanCanPage(QWidget):
         row2 = QHBoxLayout()
         row2.setSpacing(6)
 
-        row2.addWidget(QLabel("Device ID:"))
-        self._sim_device_id = QLineEdit("0xFFFF")
-        self._sim_device_id.setMaximumWidth(70)
+        row2.addWidget(QLabel("DevID:"))
+        self._sim_device_id = QLineEdit("0x0041")
+        self._sim_device_id.setMaximumWidth(65)
         self._sim_device_id.setFont(_MONO)
         self._sim_device_id.setToolTip(
-            "PLP/TECMP/CMP Geraete-ID\n"
-            "(wird im Protokoll-Header verwendet)")
+            "PLP Device ID (Header Byte 0-1)\n"
+            "CM CAN Combo: 0x0041")
         row2.addWidget(self._sim_device_id)
+
+        row2.addWidget(QLabel("CM:"))
+        self._sim_cm_id = QLineEdit("0x000F")
+        self._sim_cm_id.setMaximumWidth(65)
+        self._sim_cm_id.setFont(_MONO)
+        self._sim_cm_id.setToolTip(
+            "Capture Module ID (Entry Header)\n"
+            "Status-Nachrichten: CM_ID\n"
+            "CM CAN Combo: 0x000F")
+        row2.addWidget(self._sim_cm_id)
+
+        row2.addWidget(QLabel("IF:"))
+        self._sim_iface_id = QLineEdit("0x0013")
+        self._sim_iface_id.setMaximumWidth(65)
+        self._sim_iface_id.setFont(_MONO)
+        self._sim_iface_id.setToolTip(
+            "Interface ID = CAN-Kanal\n"
+            "CM CAN Combo: 0x11-0x16\n"
+            "Muss in CCA plp_stream bus_ids stehen")
+        row2.addWidget(self._sim_iface_id)
 
         row2.addWidget(QLabel("CAN ID:"))
         self._sim_id = QLineEdit("0x100")
@@ -1232,13 +1253,29 @@ class PcanCanPage(QWidget):
             self._sim_stop_periodic()
 
     def _sim_start_periodic(self):
-        """Startet periodische Frame-Generierung + Raw-Socket Senden."""
+        """Startet CM CAN Combo Simulation:
+        1. Raw-Socket oeffnen
+        2. Status Timer starten (1x/Sek: Status Device + Bus)
+        3. Daten Timer starten (CAN Log Stream)
+        """
         self._sim_pattern_counter = 0
         mode = self._sim_mode_combo.currentText()
 
-        # Raw-Socket oeffnen fuer Netzwerk-Senden
+        # Raw-Socket oeffnen
         self._sim_open_socket()
 
+        # Status Timer: Status Device + Status Bus jede Sekunde
+        proto = self._sim_proto_combo.currentText()
+        if proto == "PLP" and self._sim_send_enabled:
+            self._sim_status_timer = QTimer(self)
+            self._sim_status_timer.setInterval(1000)
+            self._sim_status_timer.timeout.connect(
+                self._sim_send_status)
+            self._sim_status_timer.start()
+            # Sofort erste Status-Nachricht senden
+            self._sim_send_status()
+
+        # Daten Timer
         self._sim_periodic_timer = QTimer(self)
 
         if mode == "Sequenz":
@@ -1259,11 +1296,13 @@ class PcanCanPage(QWidget):
         self._sim_send_btn.setEnabled(False)
 
     def _sim_stop_periodic(self):
-        """Stoppt periodische Frame-Generierung + schliesst Socket."""
+        """Stoppt CM CAN Combo Simulation + schliesst Socket."""
         if self._sim_periodic_timer:
             self._sim_periodic_timer.stop()
             self._sim_periodic_timer = None
-        # Raw-Socket schliessen
+        if self._sim_status_timer:
+            self._sim_status_timer.stop()
+            self._sim_status_timer = None
         self._sim_close_socket()
         self._sim_start_btn.setEnabled(True)
         self._sim_stop_btn.setEnabled(False)
@@ -1408,6 +1447,24 @@ class PcanCanPage(QWidget):
         except (ValueError, Exception):
             return 0xFFFF
 
+    def _sim_get_cm_id(self) -> int:
+        """Liest die CM ID aus dem Eingabefeld."""
+        try:
+            text = self._sim_cm_id.text().strip()
+            return int(text, 16) if text.lower().startswith(
+                '0x') else int(text)
+        except (ValueError, Exception):
+            return 0x000F
+
+    def _sim_get_iface_id(self) -> int:
+        """Liest die Interface ID aus dem Eingabefeld."""
+        try:
+            text = self._sim_iface_id.text().strip()
+            return int(text, 16) if text.lower().startswith(
+                '0x') else int(text)
+        except (ValueError, Exception):
+            return 0x0013
+
     def _sim_build_can_payload(self, can_id: int, dlc: int,
                                data_bytes: bytes,
                                is_ext: bool = False) -> bytes:
@@ -1415,40 +1472,150 @@ class PcanCanPage(QWidget):
         id_raw = can_id | (0x80000000 if is_ext else 0)
         return struct.pack('>IB', id_raw, dlc) + data_bytes[:dlc]
 
-    def _sim_build_plp_tecmp(self, can_payload: bytes) -> bytes:
-        """Baut PLP/TECMP Protokoll-Daten (Header 12B + Entry 16B + Payload).
+    # ── PLP Log Stream (CM CAN Combo Format) ─────────────────────────
 
-        PLP (0x2090) und TECMP (0x99FE) verwenden das gleiche Format.
+    def _sim_build_plp_tecmp(self, can_payload: bytes) -> bytes:
+        """Baut PLP Log Stream CAN Data (CM CAN Combo Format).
+
+        Exakt wie ein echter CM CAN Combo:
+        - MsgType=0x03 (Log Stream), DataType=0x0002 (CAN Data)
+        - Flags=0x00000007, DataFlags=0x0001
+        - CM_ID=0x0000 im Entry (bei Log Stream)
         """
         self._sim_send_counter = (self._sim_send_counter + 1) & 0xFFFF
         device_id = self._sim_get_device_id()
-        version = 3
-        msg_type = 0x0A     # Replay Data
-        data_type = 0x0002  # CAN Data
+        iface_id = self._sim_get_iface_id()
+
         header = struct.pack('>HH BB HI',
-                             device_id, self._sim_send_counter,
-                             version, msg_type,
-                             data_type, 0)
+                             device_id,
+                             self._sim_send_counter,
+                             3,       # Version
+                             0x03,    # MsgType = Log Stream
+                             0x0002,  # DataType = CAN Data
+                             0x00000007)  # Flags
+
         ts_ns = int(time.time() * 1_000_000_000) & 0xFFFFFFFFFFFFFFFF
         entry = struct.pack('>HH QH H',
-                            0x0000, 0x0001, ts_ns,
-                            len(can_payload), 0x0000)
+                            0x0000,          # CM_ID (0 bei Log Stream)
+                            iface_id,        # InterfaceID
+                            ts_ns,
+                            len(can_payload),
+                            0x0001)          # DataFlags
         return header + entry + can_payload
 
-    def _sim_build_cmp(self, can_payload: bytes) -> bytes:
-        """Baut ASAM CMP Protokoll-Daten (Header 8B + Payload).
+    # ── PLP Status Device (MsgType=0x01) ─────────────────────────────
 
-        Header: CmpVersion(1) + Reserved(1) + DeviceId(2)
-                + MessageType(1) + StreamId(1) + SeqCounter(2)
+    def _sim_build_status_device(self) -> bytes:
+        """Baut PLP Status Device Nachricht (wie CM CAN Combo).
+
+        Registriert den Simulator als Capture Module beim CCA.
         """
+        self._sim_send_counter = (self._sim_send_counter + 1) & 0xFFFF
+        device_id = self._sim_get_device_id()
+        cm_id = self._sim_get_cm_id()
+
+        header = struct.pack('>HH BB HI',
+                             device_id,
+                             self._sim_send_counter,
+                             3,       # Version
+                             0x01,    # MsgType = Status Device
+                             0x0000,  # DataType = None
+                             0x00000007)  # Flags
+
+        # Status Device Payload (46 bytes, vereinfacht)
+        # Byte 0-1: HW-Version (0x0C01)
+        # Byte 2-3: FW-Version (0x0400)
+        # Byte 6-7: DeviceID echo
+        # Rest: Seriennummer etc.
+        status_payload = bytearray(46)
+        status_payload[0:2] = b'\x0C\x01'  # HW version
+        status_payload[2:4] = b'\x04\x00'  # FW version
+        status_payload[6] = (device_id >> 8) & 0xFF
+        status_payload[7] = device_id & 0xFF
+
+        ts_ns = int(time.time() * 1_000_000_000) & 0xFFFFFFFFFFFFFFFF
+        entry = struct.pack('>HH QH H',
+                            cm_id,     # CM_ID (0x000F bei Status)
+                            0xFF02,    # InterfaceID (Status Device)
+                            ts_ns,
+                            len(status_payload),
+                            0x0F00)    # DataFlags
+        return header + entry + bytes(status_payload)
+
+    # ── PLP Status Bus (MsgType=0x02) ────────────────────────────────
+
+    def _sim_build_status_bus(self) -> bytes:
+        """Baut PLP Status Bus Nachricht (wie CM CAN Combo).
+
+        Registriert die CAN-Kanaele beim CCA.
+        Jeder Kanal wird als 8-Byte Eintrag gemeldet:
+          InterfaceID(4) + BusType(2) + Flags(2)
+        """
+        self._sim_send_counter = (self._sim_send_counter + 1) & 0xFFFF
+        device_id = self._sim_get_device_id()
+        cm_id = self._sim_get_cm_id()
+        iface_id = self._sim_get_iface_id()
+
+        header = struct.pack('>HH BB HI',
+                             device_id,
+                             self._sim_send_counter,
+                             3,       # Version
+                             0x02,    # MsgType = Status Bus
+                             0x0000,  # DataType = None
+                             0x00000007)  # Flags
+
+        # Status Bus Payload (120 bytes)
+        # Byte 0-13: Geraete-Info (wie Status Device)
+        # Ab Byte 14: Bus-Liste (je 8 Bytes pro Kanal)
+        status_payload = bytearray(120)
+        status_payload[0:2] = b'\x0C\x01'  # HW version
+        status_payload[2:4] = b'\x04\x00'  # FW version
+        status_payload[6] = (device_id >> 8) & 0xFF
+        status_payload[7] = device_id & 0xFF
+
+        # Bus-Eintraege ab Offset 14
+        # Einen CAN-Kanal registrieren (den vom Benutzer gewaehlten)
+        bus_offset = 14
+        struct.pack_into('>I', status_payload, bus_offset, iface_id)
+        struct.pack_into('>H', status_payload, bus_offset + 4, 0x4302)
+        struct.pack_into('>H', status_payload, bus_offset + 6, 0x0004)
+
+        ts_ns = int(time.time() * 1_000_000_000) & 0xFFFFFFFFFFFFFFFF
+        entry = struct.pack('>HH QH H',
+                            cm_id,     # CM_ID (0x000F bei Status)
+                            0xFF00,    # InterfaceID (Status Bus)
+                            ts_ns,
+                            len(status_payload),
+                            0x0000)    # DataFlags
+        return header + entry + bytes(status_payload)
+
+    def _sim_send_status(self):
+        """Sendet Status Device + Status Bus (periodisch, 1x/Sekunde)."""
+        if not self._sim_send_enabled or not self._sim_send_socket:
+            return
+        try:
+            iface = self._sim_iface_combo.currentText()
+            src_mac = self._get_mac(iface)
+            dst_mac = b'\x01\x00\x5e\x00\x00\x00'  # Multicast
+
+            for payload in (self._sim_build_status_device(),
+                            self._sim_build_status_bus()):
+                eth_frame = (dst_mac + src_mac
+                             + struct.pack('>H', 0x2090)
+                             + payload)
+                self._sim_send_socket.send(eth_frame)
+        except Exception as e:
+            _log.error("Status-Senden: %s", e)
+
+    # ── ASAM CMP ─────────────────────────────────────────────────────
+
+    def _sim_build_cmp(self, can_payload: bytes) -> bytes:
+        """Baut ASAM CMP Protokoll-Daten (Header 8B + Payload)."""
         self._sim_send_counter = (self._sim_send_counter + 1) & 0xFFFF
         device_id = self._sim_get_device_id()
         header = struct.pack('>BB HB BH',
-                             0x01,    # CmpVersion
-                             0x00,    # Reserved
-                             device_id,
-                             0x01,    # MessageType = Data
-                             0x01,    # StreamId
+                             0x01, 0x00, device_id,
+                             0x01, 0x01,
                              self._sim_send_counter)
         return header + can_payload
 
@@ -1473,7 +1640,7 @@ class PcanCanPage(QWidget):
 
             # Ethernet-Frame: dst(6) + src(6) + EtherType(2) + payload
             src_mac = self._get_mac(iface)
-            dst_mac = b'\xff\xff\xff\xff\xff\xff'  # Broadcast
+            dst_mac = b'\x01\x00\x5e\x00\x00\x00'  # Multicast
             eth_frame = (dst_mac + src_mac
                          + struct.pack('>H', ether_type)
                          + payload)
